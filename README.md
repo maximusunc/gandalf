@@ -1,0 +1,77 @@
+# GANDALF
+
+Graph Analysis Navigator for Discovery And Link Finding
+
+## Features
+- **Compressed Sparse Row (CSR)** graph representation for memory efficiency
+- **Bidirectional search** for optimal performance
+- **O(1) property lookups** via hash indexing
+- **Predicate filtering** to reduce path explosion
+- **Batch property enrichment** for fast results
+- **Diagnostic tools** to understand path counts
+
+## Installation
+```bash
+pip install -e .
+```
+
+## Quick Start
+
+### Build a graph from JSONL
+```python
+from gandalf import build_graph_from_jsonl
+
+# Build with ontology filtering
+graph = build_graph_from_jsonl(
+    edges_path="data/raw/edges.jsonl",
+    nodes_path="data/raw/nodes.jsonl",
+    excluded_predicates={'biolink:subclass_of'}
+)
+
+# Save for fast loading
+graph.save("data/processed/graph_filtered.pkl")
+```
+
+### Query paths
+```python
+from gandalf import CSRGraph, find_paths
+
+# Load graph (takes ~1-2 seconds)
+graph = CSRGraph.load("data/processed/graph.pkl")
+
+# Find paths
+paths = find_paths(
+    graph,
+    start_id="CHEBI:45783",
+    end_id="MONDO:0004979"
+)
+
+print(f"Found {len(paths)} paths")
+```
+
+### Filter by predicates
+```python
+from gandalf import find_paths_filtered
+
+# Only mechanistic relationships
+paths = find_paths_filtered(
+    graph,
+    start_id="CHEBI:45783",
+    end_id="MONDO:0004979",
+    allowed_predicates={
+        'biolink:treats',
+        'biolink:affects',
+        'biolink:has_metabolite'
+    }
+)
+```
+
+## Architecture
+
+The package uses a three-stage pipeline:
+
+1. **Topology Search** (fast) - Find all paths using indices only
+2. **Filtering** (medium) - Apply business logic on necessary node or edge properties
+3. **Enrichment** (batch) - Load all properties for final paths only
+
+This separation allows filtering millions of paths before expensive property lookups.

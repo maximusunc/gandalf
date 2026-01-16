@@ -1,0 +1,6 @@
+# Development dependencies
+pytest>=7.0
+pytest-cov>=3.0
+black>=22.0
+ipython>=8.0
+jupyter>=1.0
