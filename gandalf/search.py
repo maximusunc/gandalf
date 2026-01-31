@@ -1083,34 +1083,42 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
     col_to_qnode = {v: k for k, v in qnode_to_col.items()}
     col_to_qedge = {v: k for k, v in qedge_to_col.items()}
 
-    enriched_paths = []
-    for path_idx in range(num_paths):
-        nodes = {}
-        for col in range(num_node_cols):
-            qnode_id = col_to_qnode[col]
-            node_idx = paths_nodes[path_idx, col]
-            nodes[qnode_id] = node_cache[node_idx]
+    # Disable GC during enrichment to prevent stochastic pauses
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
 
-        edges = {}
-        for col in range(num_edges):
-            qedge_id = col_to_qedge[col]
-            pred_idx = paths_preds[path_idx, col]
-            predicate = idx_to_predicate[pred_idx]
+    try:
+        enriched_paths = []
+        for path_idx in range(num_paths):
+            nodes = {}
+            for col in range(num_node_cols):
+                qnode_id = col_to_qnode[col]
+                node_idx = paths_nodes[path_idx, col]
+                nodes[qnode_id] = node_cache[node_idx]
 
-            # Get subject and object from query graph structure
-            edge_def = query_graph["edges"][qedge_id]
-            subj_qnode = edge_def["subject"]
-            obj_qnode = edge_def["object"]
-            subj_col = qnode_to_col[subj_qnode]
-            obj_col = qnode_to_col[obj_qnode]
+            edges = {}
+            for col in range(num_edges):
+                qedge_id = col_to_qedge[col]
+                pred_idx = paths_preds[path_idx, col]
+                predicate = idx_to_predicate[pred_idx]
 
-            edges[qedge_id] = {
-                "predicate": predicate,
-                "subject": node_cache[paths_nodes[path_idx, subj_col]]["id"],
-                "object": node_cache[paths_nodes[path_idx, obj_col]]["id"],
-            }
+                # Get subject and object from query graph structure
+                edge_def = query_graph["edges"][qedge_id]
+                subj_qnode = edge_def["subject"]
+                obj_qnode = edge_def["object"]
+                subj_col = qnode_to_col[subj_qnode]
+                obj_col = qnode_to_col[obj_qnode]
 
-        enriched_paths.append({"nodes": nodes, "edges": edges})
+                edges[qedge_id] = {
+                    "predicate": predicate,
+                    "subject": node_cache[paths_nodes[path_idx, subj_col]]["id"],
+                    "object": node_cache[paths_nodes[path_idx, obj_col]]["id"],
+                }
+
+            enriched_paths.append({"nodes": nodes, "edges": edges})
+    finally:
+        if gc_was_enabled:
+            gc.enable()
 
     t_enrich_end = time.perf_counter()
     if verbose:
