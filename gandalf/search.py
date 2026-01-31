@@ -648,8 +648,15 @@ def _query_edge(
 
         t0 = time.perf_counter()
 
+        total_neighbors = 0
+        slow_nodes = []  # Track nodes that take > 0.1s
+
         for start_idx in start_idxes:
+            t_node_start = time.perf_counter()
+            node_neighbors = 0
+
             for obj_idx, predicate, _ in graph.neighbors_with_properties(start_idx):
+                node_neighbors += 1
                 # Check predicate
                 if allowed_predicates and predicate not in allowed_predicates:
                     continue
@@ -662,9 +669,21 @@ def _query_edge(
 
                 matches.append((start_idx, predicate, obj_idx))
 
+            t_node_end = time.perf_counter()
+            node_time = t_node_end - t_node_start
+            total_neighbors += node_neighbors
+
+            if node_time > 0.1:  # Track slow nodes
+                slow_nodes.append((start_idx, node_neighbors, node_time))
+
         t1 = time.perf_counter()
         if verbose:
-            print(f"  Found {len(matches)} matches in {t1 - t0:.3f}s")
+            print(f"  Traversed {total_neighbors:,} total neighbors")
+            if slow_nodes:
+                print(f"  Slow nodes (>0.1s): {len(slow_nodes)}")
+                for node_idx, neighbors, node_time in slow_nodes[:5]:  # Show top 5
+                    print(f"    Node {node_idx}: {neighbors:,} neighbors, {node_time:.2f}s")
+            print(f"  Found {len(matches):,} matches in {t1 - t0:.3f}s")
 
     # Case 2: Start unpinned, end pinned
     elif start_idxes is None and end_idxes is not None:
@@ -673,10 +692,17 @@ def _query_edge(
 
         t0 = time.perf_counter()
 
-        for end_idx in end_idxes:
+        total_neighbors = 0
+        slow_nodes = []  # Track nodes that take > 0.1s
+
+        for i, end_idx in enumerate(end_idxes):
+            t_node_start = time.perf_counter()
+            node_neighbors = 0
+
             for subj_idx, predicate, _ in graph.incoming_neighbors_with_properties(
                 end_idx
             ):
+                node_neighbors += 1
                 # Check predicate
                 if allowed_predicates and predicate not in allowed_predicates:
                     continue
@@ -689,9 +715,21 @@ def _query_edge(
 
                 matches.append((subj_idx, predicate, end_idx))
 
+            t_node_end = time.perf_counter()
+            node_time = t_node_end - t_node_start
+            total_neighbors += node_neighbors
+
+            if node_time > 0.1:  # Track slow nodes
+                slow_nodes.append((end_idx, node_neighbors, node_time))
+
         t1 = time.perf_counter()
         if verbose:
-            print(f"  Found {len(matches)} matches in {t1 - t0:.3f}s")
+            print(f"  Traversed {total_neighbors:,} total incoming neighbors")
+            if slow_nodes:
+                print(f"  Slow nodes (>0.1s): {len(slow_nodes)}")
+                for node_idx, neighbors, node_time in slow_nodes[:5]:  # Show top 5
+                    print(f"    Node {node_idx}: {neighbors:,} neighbors, {node_time:.2f}s")
+            print(f"  Found {len(matches):,} matches in {t1 - t0:.3f}s")
 
     # Case 3: Both pinned
     elif start_idxes is not None and end_idxes is not None:
