@@ -543,6 +543,8 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
     if verbose:
         print(f"Found {len(paths):,} complete paths")
 
+    t_post_start = time.perf_counter()
+
     response = {
         "message": {
             "query_graph": query_graph,
@@ -565,6 +567,10 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
             sorted((qnode_id, node["id"]) for qnode_id, node in path["nodes"].items())
         )
         node_binding_groups[node_key].append(path)
+
+    t_grouped = time.perf_counter()
+    if verbose:
+        print(f"  Grouped into {len(node_binding_groups):,} unique node paths ({t_grouped - t_post_start:.2f}s)")
 
     # Build results - one per unique node binding combination
     for node_key, grouped_paths in node_binding_groups.items():
@@ -620,6 +626,11 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
                 )
 
         response["message"]["results"].append(result)
+
+    t_built = time.perf_counter()
+    if verbose:
+        print(f"  Built {len(response['message']['results']):,} results ({t_built - t_grouped:.2f}s)")
+        print(f"  Post-processing total: {t_built - t_post_start:.2f}s")
 
     return response
 
