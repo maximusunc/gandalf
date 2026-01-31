@@ -23,10 +23,11 @@ class TestLookupOneHop:
     """Tests for single-hop queries using the lookup function."""
 
     def test_one_hop_pinned_both_ends_single_result(self, graph):
-        """Query with pinned start and end should return exactly 3 paths.
+        """Query with pinned start and end should return 1 result with multiple edge bindings.
 
         Note: biolink:treats has descendants ameliorates_condition and
         preventative_for_condition, so all 3 Metformin-T2D edges match.
+        Results are aggregated by unique node paths, so we get 1 result.
         """
         query = {
             "message": {
@@ -49,14 +50,18 @@ class TestLookupOneHop:
         response = lookup(graph, query, verbose=False)
         results = response["message"]["results"]
 
-        # biolink:treats includes descendants: ameliorates_condition, preventative_for_condition
-        assert len(results) == 3
-        # Verify all results have the correct node bindings
-        for result in results:
-            assert "n0" in result["node_bindings"]
-            assert "n1" in result["node_bindings"]
-            assert result["node_bindings"]["n0"][0]["id"] == "CHEBI:6801"
-            assert result["node_bindings"]["n1"][0]["id"] == "MONDO:0005148"
+        # Results are aggregated by unique node paths
+        # Same node pair (Metformin -> T2D) = 1 result with 3 edge bindings
+        assert len(results) == 1
+        result = results[0]
+        assert "n0" in result["node_bindings"]
+        assert "n1" in result["node_bindings"]
+        assert result["node_bindings"]["n0"][0]["id"] == "CHEBI:6801"
+        assert result["node_bindings"]["n1"][0]["id"] == "MONDO:0005148"
+
+        # Edge bindings should contain all 3 matching edges
+        edge_bindings = result["analyses"][0]["edge_bindings"]["e0"]
+        assert len(edge_bindings) == 3
 
     def test_one_hop_pinned_start_unpinned_end(self, graph):
         """Query with pinned start should return all matching edges."""
@@ -398,6 +403,12 @@ class TestLookupResponseStructure:
             "biolink:preventative_for_condition",
         }
 
+        # Results should be aggregated: 1 result with all 3 edges in bindings
+        results = response["message"]["results"]
+        assert len(results) == 1
+        edge_bindings = results[0]["analyses"][0]["edge_bindings"]["e0"]
+        assert len(edge_bindings) == 3
+
     def test_results_have_node_and_edge_bindings(self, graph):
         """Each result should have node_bindings and edge_bindings."""
         query = {
@@ -432,15 +443,21 @@ class TestLookupResponseStructure:
         # Check edge bindings map to query graph edges
         assert "e0" in result["analyses"][0]["edge_bindings"]
 
+        # Edge bindings should be a list containing multiple edges
+        edge_bindings = result["analyses"][0]["edge_bindings"]["e0"]
+        assert isinstance(edge_bindings, list)
+        assert len(edge_bindings) == 3  # treats, ameliorates_condition, preventative_for_condition
+
 
 class TestMetforminType2DiabetesEdges:
     """Tests specifically for Metformin to Type 2 Diabetes edges."""
 
     def test_metformin_treats_type2_diabetes(self, graph):
-        """Query for exact biolink:treats predicate returns all 3 treatment edges.
+        """Query for biolink:treats returns 1 result with 3 edge bindings.
 
         Note: biolink:treats is a parent predicate that includes descendants
         ameliorates_condition and preventative_for_condition.
+        Results are aggregated by unique node paths.
         """
         query = {
             "message": {
@@ -463,11 +480,15 @@ class TestMetforminType2DiabetesEdges:
         response = lookup(graph, query, verbose=False)
         results = response["message"]["results"]
 
-        # biolink:treats includes descendants, so returns all 3 Metformin-T2D edges
-        assert len(results) == 3
+        # Results aggregated by node path: 1 result with 3 edge bindings
+        assert len(results) == 1
         kg_edges = response["message"]["knowledge_graph"]["edges"]
         predicates = {edge["predicate"] for edge in kg_edges.values()}
         assert "biolink:treats" in predicates
+
+        # Verify edge bindings contain all 3 edges
+        edge_bindings = results[0]["analyses"][0]["edge_bindings"]["e0"]
+        assert len(edge_bindings) == 3
 
     def test_metformin_ameliorates_type2_diabetes(self, graph):
         """Query for Metformin ameliorates_condition Type 2 Diabetes edge."""
@@ -528,7 +549,7 @@ class TestMetforminType2DiabetesEdges:
         assert edge["object"] == "MONDO:0005148"
 
     def test_all_metformin_to_type2_diabetes_edges(self, graph):
-        """Query for all edges from Metformin to Type 2 Diabetes using multiple predicates."""
+        """Query for all edges from Metformin to Type 2 Diabetes returns 1 result with 3 edge bindings."""
         query = {
             "message": {
                 "query_graph": {
@@ -554,10 +575,10 @@ class TestMetforminType2DiabetesEdges:
         response = lookup(graph, query, verbose=False)
         results = response["message"]["results"]
 
-        # Should return 3 results: treats, ameliorates_condition, preventative_for_condition
-        assert len(results) == 3
+        # Results aggregated by node path: 1 result with 3 edge bindings
+        assert len(results) == 1
 
-        # Collect all predicates from results
+        # Collect all predicates from knowledge graph
         kg_edges = response["message"]["knowledge_graph"]["edges"]
         predicates = {edge["predicate"] for edge in kg_edges.values()}
         assert predicates == {
@@ -565,3 +586,7 @@ class TestMetforminType2DiabetesEdges:
             "biolink:ameliorates_condition",
             "biolink:preventative_for_condition",
         }
+
+        # Verify edge bindings contain all 3 edges
+        edge_bindings = results[0]["analyses"][0]["edge_bindings"]["e0"]
+        assert len(edge_bindings) == 3

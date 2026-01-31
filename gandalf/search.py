@@ -544,7 +544,24 @@ def lookup(graph, query: dict, verbose=True):
             "results": []
         }
     }
+
+    # Group paths by unique node binding combinations
+    # Key: tuple of (qnode_id, node_id) pairs sorted by qnode_id
+    # Value: list of edge dictionaries from paths with this node combination
+    node_binding_groups = defaultdict(list)
+
     for path in paths:
+        # Create a hashable key from node bindings
+        node_key = tuple(
+            sorted((qnode_id, node["id"]) for qnode_id, node in path["nodes"].items())
+        )
+        node_binding_groups[node_key].append(path)
+
+    # Build results - one per unique node binding combination
+    for node_key, grouped_paths in node_binding_groups.items():
+        # Use first path for node info (all paths in group have same nodes)
+        first_path = grouped_paths[0]
+
         result = {
             "node_bindings": {},
             "analyses": [{
@@ -552,7 +569,9 @@ def lookup(graph, query: dict, verbose=True):
                 "edge_bindings": {},
             }],
         }
-        for node_id, node in path["nodes"].items():
+
+        # Add node bindings (same for all paths in group)
+        for node_id, node in first_path["nodes"].items():
             response["message"]["knowledge_graph"]["nodes"][node["id"]] = node
             result["node_bindings"][node_id] = [
                 {
@@ -560,16 +579,39 @@ def lookup(graph, query: dict, verbose=True):
                     "attributes": [],
                 },
             ]
-        for edge_id, edge in path["edges"].items():
-            edge_uuid = str(uuid.uuid4())[:8]
-            response["message"]["knowledge_graph"]["edges"][edge_uuid] = edge
-            result["analyses"][0]["edge_bindings"][edge_id] = [
-                {
-                    "id": edge_uuid,
-                    "attributes": [],
-                },
-            ]
+
+        # Aggregate edge bindings from all paths in group
+        # For each query edge, collect all matching edges
+        edge_bindings_by_qedge = defaultdict(list)
+
+        for path in grouped_paths:
+            for edge_id, edge in path["edges"].items():
+                # Create a unique key for this edge to avoid duplicates
+                edge_key = (edge["subject"], edge["predicate"], edge["object"])
+
+                # Check if we already have this exact edge
+                existing_keys = [
+                    (e["subject"], e["predicate"], e["object"])
+                    for e in edge_bindings_by_qedge[edge_id]
+                ]
+                if edge_key not in existing_keys:
+                    edge_bindings_by_qedge[edge_id].append(edge)
+
+        # Add edges to knowledge graph and result bindings
+        for edge_id, edges in edge_bindings_by_qedge.items():
+            result["analyses"][0]["edge_bindings"][edge_id] = []
+            for edge in edges:
+                edge_uuid = str(uuid.uuid4())[:8]
+                response["message"]["knowledge_graph"]["edges"][edge_uuid] = edge
+                result["analyses"][0]["edge_bindings"][edge_id].append(
+                    {
+                        "id": edge_uuid,
+                        "attributes": [],
+                    }
+                )
+
         response["message"]["results"].append(result)
+
     return response
 
 
