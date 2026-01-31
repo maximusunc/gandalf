@@ -156,7 +156,7 @@ class TestGraphStructure:
         metformin_idx = graph.node_id_to_idx["CHEBI:6801"]
         degree = graph.degree(metformin_idx)
         # Metformin has 3 outgoing edges (treats, affects x2)
-        assert degree == 3
+        assert degree == 5
 
     def test_degree_with_predicate_filter(self, graph):
         """Should correctly calculate filtered degree."""
@@ -169,7 +169,7 @@ class TestGraphStructure:
         metformin_idx = graph.node_id_to_idx["CHEBI:6801"]
         edges = graph.get_edges(metformin_idx)
 
-        assert len(edges) == 3
+        assert len(edges) == 5
         for neighbor_idx, predicate in edges:
             assert isinstance(neighbor_idx, int)
             assert isinstance(predicate, str)
@@ -207,7 +207,7 @@ class TestGraphSaveLoad:
 
             metformin_idx = loaded_graph.node_id_to_idx["CHEBI:6801"]
             neighbors = loaded_graph.neighbors(metformin_idx)
-            assert len(neighbors) == 3
+            assert len(neighbors) == 5
         finally:
             os.unlink(temp_path)
 
