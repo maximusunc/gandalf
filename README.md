@@ -17,6 +17,10 @@ pip install -e .
 
 ## Quick Start
 
+### Unzipping a full translator kgx
+- `tar -xvf translator_kg.tar.zst`
+This will output a nodes.jsonl and edges.jsonl file
+
 ### Build a graph from JSONL
 ```python
 from gandalf import build_graph_from_jsonl

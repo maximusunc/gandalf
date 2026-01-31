@@ -1,0 +1,116 @@
+"""GANDALF."""
+
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import (
+    get_swagger_ui_html,
+)
+from fastapi.staticfiles import StaticFiles
+from starlette.responses import HTMLResponse
+
+from gandalf import CSRGraph, lookup
+
+GRAPH = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handle db connection."""
+    global GRAPH
+    GRAPH = CSRGraph.load("../12_17_2025/gandalf_12_17_2025.pkl")
+    yield
+    GRAPH = None
+
+
+APP = FastAPI(
+    title="GANDALF",
+    lifespan=lifespan,
+    docs_url=None,
+)
+
+APP.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+APP.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@APP.get("/docs", include_in_schema=False)
+async def custom_swagger_ui_html(req: Request) -> HTMLResponse:
+    """Customize Swagger UI."""
+    root_path = req.scope.get("root_path", "").rstrip("/")
+    openapi_url = root_path + APP.openapi_url
+    swagger_favicon_url = root_path + "/static/favicon.png"
+    return get_swagger_ui_html(
+        openapi_url=openapi_url,
+        title=APP.title + " - Swagger UI",
+        swagger_favicon_url=swagger_favicon_url,
+    )
+
+@APP.post("/query")
+def sync_lookup(request: dict):
+    """Do a lookup."""
+    response = lookup(GRAPH, request)
+
+    return response
+
+
+def async_lookup(callback_url: str, query: dict):
+    """Do an async lookup."""
+    response = lookup(GRAPH, query)
+
+    try:
+        with httpx.Client(
+            timeout=httpx.Timeout(timeout=600.0)
+        ) as client:
+            res = client.post(callback_url, json=response)
+            res.raise_for_status()
+            print(f"Posted to {callback_url} with code {res.status_code}")
+    except Exception as e:
+        print(f"Callback to {callback_url} failed with: {e}")
+
+
+@APP.post("/asyncquery")
+def async_query(
+    background_tasks: BackgroundTasks,
+    query: dict,
+):
+    """Handle asynchronous query."""
+    # parse requested workflow
+    callback = query["callback"]
+    workflow = query.get("workflow", None) or [{"id": "lookup"}]
+    if not isinstance(workflow, list):
+        raise HTTPException(400, "workflow must be a list")
+    if not len(workflow) == 1:
+        raise HTTPException(400, "workflow must contain exactly 1 operation")
+    if "id" not in workflow[0]:
+        raise HTTPException(400, "workflow must have property 'id'")
+    if workflow[0]["id"] == "filter_results_top_n":
+        max_results = workflow[0]["parameters"]["max_results"]
+        if max_results < len(query["message"]["results"]):
+            query["message"]["results"] = query["message"]["results"][
+                :max_results
+            ]
+        return query
+    if not workflow[0]["id"] == "lookup":
+        raise HTTPException(400, "operations must have id 'lookup'")
+
+    if (query.get("set_interpretation", None) or "BATCH") == "MANY":
+        raise HTTPException(422, "set_interpretation MANY not supported.")
+
+    print(f"Doing async lookup for {callback}")
+    background_tasks.add_task(async_lookup, callback, query)
+
+    return
+
+# APP.openapi_schema = construct_open_api_schema(
+#     APP,
+#     infores="infores:shepherd",
+# )

@@ -1,42 +1,40 @@
 """Load nodes and edges into Gandalf."""
+
 import json
 
+from bmt.toolkit import Toolkit
 import numpy as np
 
 from gandalf.graph import CSRGraph
 
 
 def build_graph_from_jsonl(
-    jsonl_path,
-    undirected=True,
-    remove_duplicates=True,
-    remove_self_loops=True,
-    node_jsonl_path=None,
+    edge_jsonl_path,
+    node_jsonl_path,
 ):
     """
     Build a CSR graph from a JSONL file of edges.
 
     Args:
-        jsonl_path: Path to JSONL file where each line has 'subject' and 'object' fields
-        undirected: If True, treat graph as undirected (add reverse edges)
-        remove_duplicates: If True, remove duplicate edges
-        remove_self_loops: If True, remove self-loop edges
-        node_jsonl_path: Optional path to JSONL file with node properties
+        edge_jsonl_path: Path to JSONL file where each line has 'subject', 'predicate', and 'object' fields
+        node_jsonl_path: Path to JSONL file with node properties
 
     Returns:
         CSRGraph object with the loaded graph
     """
-    print(f"Reading edges from {jsonl_path}...")
+    print(f"Reading edges from {edge_jsonl_path}...")
+    bmt = Toolkit()
 
     # First pass: collect all unique node IDs and edges with properties
     node_ids = set()
-    edge_dict = {}  # (subject, object) -> properties
+    edge_list = []  # List of (subject, predicate, object, properties) tuples
+    edge_set = set()  # For duplicate detection: (subject, predicate, object)
 
     line_count = 0
     duplicates = 0
     self_loops = 0
 
-    with open(jsonl_path, "r", encoding="utf-8") as f:
+    with open(edge_jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
             if line_count % 1_000_000 == 0 and line_count > 0:
                 print(f"  Processed {line_count:,} edges...")
@@ -44,43 +42,39 @@ def build_graph_from_jsonl(
             data = json.loads(line)
             subject = data["subject"]
             obj = data["object"]
-
-            # Check for self-loops
-            if subject == obj:
-                self_loops += 1
-                if remove_self_loops:
-                    line_count += 1
-                    continue
+            predicate = data["predicate"]
 
             node_ids.add(subject)
             node_ids.add(obj)
 
-            # For undirected graphs, normalize edge representation
-            if undirected:
-                edge = tuple(sorted([subject, obj]))
-            else:
-                edge = (subject, obj)
+            # Create edge identifier (subject, predicate, object) - predicates make edges unique
+            edge_id = (subject, predicate, obj)
 
-            if edge in edge_dict:
-                duplicates += 1
-                if remove_duplicates:
-                    line_count += 1
-                    continue
+            edge_set.add(edge_id)
 
-            # Store edge with its predicate
-            edge_dict[edge] = {
-                "predicate": data.get("predicate", None),
+            # Store edge with its properties
+            edge_props = {
+                "predicate": predicate,
+                "category": data.get("category", []),
                 "publications": data.get("publications", []),
-                "knowledge_source": data.get("primary_knowledge_source", None),
+                "sources": [
+                   {
+                       "resource_role": "primary_knowledge_source",
+                       "resource_id": data.get("primary_knowledge_source", "infores:gandalf"),
+                   },
+                ],
+                "knowledge_level": data.get("knowledge_level", ""),
+                "agent_type": data.get("agent_type", ""),
+                "original_subject": data.get("original_subject", ""),
+                "original_object": data.get("original_object", ""),
+                "qualifiers": data.get("qualifiers", []),
             }
+
+            edge_list.append((subject, predicate, obj, edge_props))
 
             line_count += 1
 
-    print(f"Found {len(node_ids):,} unique nodes and {len(edge_dict):,} unique edges")
-    if duplicates > 0:
-        print(f"  Removed {duplicates:,} duplicate edges")
-    if self_loops > 0:
-        print(f"  Removed {self_loops:,} self-loops")
+    print(f"Found {len(node_ids):,} unique nodes and {len(edge_list):,} edges")
 
     # Load node properties if provided
     node_props_by_id = {}
@@ -92,14 +86,23 @@ def build_graph_from_jsonl(
                 node_id = node_data.get("id")
                 if node_id:
                     node_props_by_id[node_id] = {
+                        "id": node_data.get("id", ""),
                         "category": node_data.get("category", []),
                         "name": node_data.get("name", None),
+                        "equivalent_identifiers": node_data.get("equivalent_identifiers", []),
+                        "information_content": node_data.get("information_content", 0.0),
                     }
         print(f"  Loaded properties for {len(node_props_by_id):,} nodes")
 
     # Create mapping from node IDs to integer indices
     print("Building node index mapping...")
     node_id_to_idx = {node_id: idx for idx, node_id in enumerate(sorted(node_ids))}
+
+    # Build predicate vocabulary
+    print("Building predicate vocabulary...")
+    unique_predicates = sorted(set(pred for _, pred, _, _ in edge_list))
+    predicate_to_idx = {pred: idx for idx, pred in enumerate(unique_predicates)}
+    print(f"  Found {len(unique_predicates):,} unique predicates")
 
     # Convert node properties to use indices
     node_properties = {}
@@ -110,33 +113,40 @@ def build_graph_from_jsonl(
 
     # Convert edges to integer indices with properties
     print("Converting edges to indices...")
-    edges = []
-    edge_properties = {}
+    edges = []  # List of (src_idx, dst_idx) tuples
+    edge_predicates = []  # Parallel list of predicate IDs
+    edge_properties = {}  # Dict: (src_idx, dst_idx, pred_idx) -> properties
 
-    for edge, props in edge_dict.items():
-        if undirected:
-            subject, obj = edge
-        else:
-            subject, obj = edge
-
+    for subject, predicate, obj, props in edge_list:
         src_idx = node_id_to_idx[subject]
         dst_idx = node_id_to_idx[obj]
+        pred_idx = predicate_to_idx[predicate]
 
         edges.append((src_idx, dst_idx))
-        edge_properties[(src_idx, dst_idx)] = props
+        edge_predicates.append(pred_idx)
+        edge_properties[(src_idx, dst_idx, pred_idx)] = props
 
-        # Add reverse edge for undirected graph
-        if undirected and src_idx != dst_idx:
+        if bmt.is_symmetric(predicate):
+            # symmetric predicate, add reverse edge
+            # This allows an incoming symmetric predicate edge to return in the same
+            # direction it was asked in
             edges.append((dst_idx, src_idx))
+            edge_predicates.append(pred_idx)
             # Reverse edge has same properties
-            edge_properties[(dst_idx, src_idx)] = props
+            edge_properties[(dst_idx, src_idx, pred_idx)] = props
 
-    print(f"Total edges (with reverse if undirected): {len(edges):,}")
+    print(f"Total edges (with symmetric predicates): {len(edges):,}")
 
     # Build CSR structure
     print("Building CSR structure...")
     graph = CSRGraph(
-        len(node_ids), edges, node_id_to_idx, edge_properties, node_properties
+        num_nodes=len(node_ids),
+        edges=edges,
+        edge_predicates=edge_predicates,
+        node_id_to_idx=node_id_to_idx,
+        predicate_to_idx=predicate_to_idx,
+        edge_properties=edge_properties,
+        node_properties=node_properties,
     )
 
     # Print statistics
@@ -144,11 +154,19 @@ def build_graph_from_jsonl(
     if degrees:
         print("\nGraph statistics:")
         print(f"  Nodes: {graph.num_nodes:,}")
-        print(f"  Edges: {len(graph.edge_dst):,}")
+        print(f"  Edges: {len(graph.fwd_targets):,}")
+        print(f"  Unique predicates: {len(predicate_to_idx):,}")
         print(f"  Avg degree (sampled): {np.mean(degrees):.1f}")
         print(f"  Max degree (sampled): {np.max(degrees)}")
-        print(
-            f"  Memory usage: ~{(graph.edge_dst.nbytes + graph.offsets.nbytes) / 1024 / 1024:.1f} MB"
+        memory_mb = (
+            (
+                graph.fwd_targets.nbytes
+                + graph.fwd_offsets.nbytes
+                + graph.fwd_predicates.nbytes
+            )
+            / 1024
+            / 1024
         )
+        print(f"  Memory usage: ~{memory_mb:.1f} MB")
 
     return graph
