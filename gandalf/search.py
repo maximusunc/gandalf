@@ -1,6 +1,7 @@
 """General graph search functions."""
 
 import copy
+import gc
 import time
 import uuid
 from collections import defaultdict
@@ -572,60 +573,70 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
     if verbose:
         print(f"  Grouped into {len(node_binding_groups):,} unique node paths ({t_grouped - t_post_start:.2f}s)")
 
-    # Build results - one per unique node binding combination
-    for node_key, grouped_paths in node_binding_groups.items():
-        # Use first path for node info (all paths in group have same nodes)
-        first_path = grouped_paths[0]
+    # Disable GC during result building to prevent stochastic pauses
+    # GC can cause 30+ second delays when triggered during this loop
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
 
-        result = {
-            "node_bindings": {},
-            "analyses": [{
-                "resource_id": "infores:gandalf",
-                "edge_bindings": {},
-            }],
-        }
+    try:
+        # Build results - one per unique node binding combination
+        for node_key, grouped_paths in node_binding_groups.items():
+            # Use first path for node info (all paths in group have same nodes)
+            first_path = grouped_paths[0]
 
-        # Add node bindings (same for all paths in group)
-        for node_id, node in first_path["nodes"].items():
-            response["message"]["knowledge_graph"]["nodes"][node["id"]] = node
-            result["node_bindings"][node_id] = [
-                {
-                    "id": node["id"],
-                    "attributes": [],
-                },
-            ]
+            result = {
+                "node_bindings": {},
+                "analyses": [{
+                    "resource_id": "infores:gandalf",
+                    "edge_bindings": {},
+                }],
+            }
 
-        # Aggregate edge bindings from all paths in group
-        # For each query edge, collect all matching edges
-        edge_bindings_by_qedge = defaultdict(list)
-
-        for path in grouped_paths:
-            for edge_id, edge in path["edges"].items():
-                # Create a unique key for this edge to avoid duplicates
-                edge_key = (edge["subject"], edge["predicate"], edge["object"])
-
-                # Check if we already have this exact edge
-                existing_keys = [
-                    (e["subject"], e["predicate"], e["object"])
-                    for e in edge_bindings_by_qedge[edge_id]
-                ]
-                if edge_key not in existing_keys:
-                    edge_bindings_by_qedge[edge_id].append(edge)
-
-        # Add edges to knowledge graph and result bindings
-        for edge_id, edges in edge_bindings_by_qedge.items():
-            result["analyses"][0]["edge_bindings"][edge_id] = []
-            for edge in edges:
-                edge_uuid = str(uuid.uuid4())[:8]
-                response["message"]["knowledge_graph"]["edges"][edge_uuid] = edge
-                result["analyses"][0]["edge_bindings"][edge_id].append(
+            # Add node bindings (same for all paths in group)
+            for node_id, node in first_path["nodes"].items():
+                response["message"]["knowledge_graph"]["nodes"][node["id"]] = node
+                result["node_bindings"][node_id] = [
                     {
-                        "id": edge_uuid,
+                        "id": node["id"],
                         "attributes": [],
-                    }
-                )
+                    },
+                ]
 
-        response["message"]["results"].append(result)
+            # Aggregate edge bindings from all paths in group
+            # For each query edge, collect all matching edges
+            edge_bindings_by_qedge = defaultdict(list)
+
+            for path in grouped_paths:
+                for edge_id, edge in path["edges"].items():
+                    # Create a unique key for this edge to avoid duplicates
+                    edge_key = (edge["subject"], edge["predicate"], edge["object"])
+
+                    # Check if we already have this exact edge
+                    existing_keys = [
+                        (e["subject"], e["predicate"], e["object"])
+                        for e in edge_bindings_by_qedge[edge_id]
+                    ]
+                    if edge_key not in existing_keys:
+                        edge_bindings_by_qedge[edge_id].append(edge)
+
+            # Add edges to knowledge graph and result bindings
+            for edge_id, edges in edge_bindings_by_qedge.items():
+                result["analyses"][0]["edge_bindings"][edge_id] = []
+                for edge in edges:
+                    edge_uuid = str(uuid.uuid4())[:8]
+                    response["message"]["knowledge_graph"]["edges"][edge_uuid] = edge
+                    result["analyses"][0]["edge_bindings"][edge_id].append(
+                        {
+                            "id": edge_uuid,
+                            "attributes": [],
+                        }
+                    )
+
+            response["message"]["results"].append(result)
+    finally:
+        # Re-enable GC if it was enabled before
+        if gc_was_enabled:
+            gc.enable()
 
     t_built = time.perf_counter()
     if verbose:
