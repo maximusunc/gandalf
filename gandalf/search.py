@@ -669,6 +669,7 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
     Reconstruct complete paths by iteratively joining edge results.
 
     Uses a fast iterative join strategy instead of recursion.
+    Optimized to use tuples during joining for better performance.
 
     Args:
         graph: CSRGraph instance
@@ -694,14 +695,21 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
     # Start with the first edge results
     first_edge_id = join_order[0]
     first_edge = query_graph["edges"][first_edge_id]
+    subj_qnode = first_edge["subject"]
+    obj_qnode = first_edge["object"]
 
-    # Initialize partial paths: each is a dict {qnode_id -> node_idx, qedge_id -> (subj, pred, obj)}
-    partial_paths = []
-    for subj_idx, predicate, obj_idx in edge_results[first_edge_id]:
-        partial_paths.append({
-            "nodes": {first_edge["subject"]: subj_idx, first_edge["object"]: obj_idx},
-            "edges": {first_edge_id: (subj_idx, predicate, obj_idx)},
-        })
+    # Use tuple-based representation for efficiency during joining:
+    # Each path is: (nodes_tuple, edges_tuple)
+    # nodes_tuple: ((qnode_id, node_idx), ...)
+    # edges_tuple: ((qedge_id, subj_idx, predicate, obj_idx), ...)
+    # Tuples are immutable and much faster to create than dicts
+    partial_paths = [
+        (
+            ((subj_qnode, subj_idx), (obj_qnode, obj_idx)),
+            ((first_edge_id, subj_idx, predicate, obj_idx),),
+        )
+        for subj_idx, predicate, obj_idx in edge_results[first_edge_id]
+    ]
 
     if verbose:
         print(
@@ -722,31 +730,36 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
 
         t_join_start = time.perf_counter()
 
-        # Build index for fast joining
-        # Determine which node(s) are already in partial paths (join keys)
-        subj_in_paths = any(
-            subj_qnode in p["nodes"] for p in partial_paths if partial_paths
-        )
-        obj_in_paths = any(
-            obj_qnode in p["nodes"] for p in partial_paths if partial_paths
-        )
+        # Check which nodes are already in paths (check first path as representative)
+        if partial_paths:
+            first_path_nodes = {qn: idx for qn, idx in partial_paths[0][0]}
+            subj_in_paths = subj_qnode in first_path_nodes
+            obj_in_paths = obj_qnode in first_path_nodes
+        else:
+            subj_in_paths = False
+            obj_in_paths = False
 
         new_paths = []
 
         if subj_in_paths and obj_in_paths:
-            # Both nodes already in path - just validate consistency
-            for path in partial_paths:
-                expected_subj = path["nodes"].get(subj_qnode)
-                expected_obj = path["nodes"].get(obj_qnode)
+            # Both nodes already in path - validate consistency using index
+            # Build index: (subj_idx, obj_idx) -> [predicates]
+            edge_index = defaultdict(list)
+            for subj_idx, predicate, obj_idx in edge_results[edge_id]:
+                edge_index[(subj_idx, obj_idx)].append(predicate)
 
-                for subj_idx, predicate, obj_idx in edge_results[edge_id]:
-                    if subj_idx == expected_subj and obj_idx == expected_obj:
-                        new_path = {
-                            "nodes": path["nodes"].copy(),
-                            "edges": path["edges"].copy(),
-                        }
-                        new_path["edges"][edge_id] = (subj_idx, predicate, obj_idx)
-                        new_paths.append(new_path)
+            for nodes_tuple, edges_tuple in partial_paths:
+                nodes_dict = {qn: idx for qn, idx in nodes_tuple}
+                expected_subj = nodes_dict.get(subj_qnode)
+                expected_obj = nodes_dict.get(obj_qnode)
+                key = (expected_subj, expected_obj)
+
+                if key in edge_index:
+                    for predicate in edge_index[key]:
+                        new_edges = edges_tuple + (
+                            (edge_id, expected_subj, predicate, expected_obj),
+                        )
+                        new_paths.append((nodes_tuple, new_edges))
 
         elif subj_in_paths:
             # Join on subject node
@@ -755,17 +768,17 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
             for subj_idx, predicate, obj_idx in edge_results[edge_id]:
                 edge_index[subj_idx].append((predicate, obj_idx))
 
-            for path in partial_paths:
-                subj_idx = path["nodes"].get(subj_qnode)
+            for nodes_tuple, edges_tuple in partial_paths:
+                nodes_dict = {qn: idx for qn, idx in nodes_tuple}
+                subj_idx = nodes_dict.get(subj_qnode)
+
                 if subj_idx in edge_index:
                     for predicate, obj_idx in edge_index[subj_idx]:
-                        new_path = {
-                            "nodes": path["nodes"].copy(),
-                            "edges": path["edges"].copy(),
-                        }
-                        new_path["nodes"][obj_qnode] = obj_idx
-                        new_path["edges"][edge_id] = (subj_idx, predicate, obj_idx)
-                        new_paths.append(new_path)
+                        new_nodes = nodes_tuple + ((obj_qnode, obj_idx),)
+                        new_edges = edges_tuple + (
+                            (edge_id, subj_idx, predicate, obj_idx),
+                        )
+                        new_paths.append((new_nodes, new_edges))
 
         elif obj_in_paths:
             # Join on object node
@@ -774,33 +787,33 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
             for subj_idx, predicate, obj_idx in edge_results[edge_id]:
                 edge_index[obj_idx].append((subj_idx, predicate))
 
-            for path in partial_paths:
-                obj_idx = path["nodes"].get(obj_qnode)
+            for nodes_tuple, edges_tuple in partial_paths:
+                nodes_dict = {qn: idx for qn, idx in nodes_tuple}
+                obj_idx = nodes_dict.get(obj_qnode)
+
                 if obj_idx in edge_index:
                     for subj_idx, predicate in edge_index[obj_idx]:
-                        new_path = {
-                            "nodes": path["nodes"].copy(),
-                            "edges": path["edges"].copy(),
-                        }
-                        new_path["nodes"][subj_qnode] = subj_idx
-                        new_path["edges"][edge_id] = (subj_idx, predicate, obj_idx)
-                        new_paths.append(new_path)
+                        new_nodes = nodes_tuple + ((subj_qnode, subj_idx),)
+                        new_edges = edges_tuple + (
+                            (edge_id, subj_idx, predicate, obj_idx),
+                        )
+                        new_paths.append((new_nodes, new_edges))
 
         else:
             # Neither node in paths - cartesian product (should be rare with good join order)
             if verbose:
                 print(f"\n    Warning: Cartesian product needed for edge '{edge_id}'")
 
-            for path in partial_paths:
+            for nodes_tuple, edges_tuple in partial_paths:
                 for subj_idx, predicate, obj_idx in edge_results[edge_id]:
-                    new_path = {
-                        "nodes": path["nodes"].copy(),
-                        "edges": path["edges"].copy(),
-                    }
-                    new_path["nodes"][subj_qnode] = subj_idx
-                    new_path["nodes"][obj_qnode] = obj_idx
-                    new_path["edges"][edge_id] = (subj_idx, predicate, obj_idx)
-                    new_paths.append(new_path)
+                    new_nodes = nodes_tuple + (
+                        (subj_qnode, subj_idx),
+                        (obj_qnode, obj_idx),
+                    )
+                    new_edges = edges_tuple + (
+                        (edge_id, subj_idx, predicate, obj_idx),
+                    )
+                    new_paths.append((new_nodes, new_edges))
 
         partial_paths = new_paths
 
@@ -820,14 +833,37 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
     if verbose:
         print(f"  Path reconstruction took {t1 - t0:.2f}s")
 
-    # Convert to enriched format
+    # Build node property cache directly from tuple-based paths
     if verbose:
         print(f"  Enriching {len(partial_paths):,} paths...")
 
-    enriched_paths = []
-    for path_dict in partial_paths:
-        enriched = _enrich_path(graph, query_graph, path_dict, edge_order)
-        enriched_paths.append(enriched)
+    t_cache_start = time.perf_counter()
+    unique_node_indices = set()
+    for nodes_tuple, edges_tuple in partial_paths:
+        for qn, idx in nodes_tuple:
+            unique_node_indices.add(idx)
+
+    # Fetch properties for each unique node once
+    node_cache = {}
+    for node_idx in unique_node_indices:
+        node_cache[node_idx] = {
+            "id": graph.get_node_id(node_idx),
+            "category": graph.get_node_property(node_idx, "category", []),
+            "name": graph.get_node_property(node_idx, "name"),
+        }
+
+    t_cache_end = time.perf_counter()
+    if verbose:
+        print(
+            f"  Cached properties for {len(unique_node_indices):,} unique nodes "
+            f"({t_cache_end - t_cache_start:.2f}s)"
+        )
+
+    # Enrich paths directly from tuples (no dict conversion needed)
+    enriched_paths = [
+        _enrich_path_from_tuples(query_graph, nodes_tuple, edges_tuple, node_cache)
+        for nodes_tuple, edges_tuple in partial_paths
+    ]
 
     return enriched_paths
 
@@ -893,39 +929,30 @@ def _compute_join_order(query_graph, edge_results, edge_order, verbose):
     return join_order
 
 
-def _enrich_path(graph, query_graph, path_dict, edge_order):
+def _enrich_path_from_tuples(query_graph, nodes_tuple, edges_tuple, node_cache):
     """
-    Convert path dictionary to enriched format with node/edge properties.
+    Convert tuple-based path to enriched format with node/edge properties.
 
     Args:
-        path_dict: {"nodes": {qnode_id -> idx}, "edges": {qedge_id -> (subj, pred, obj)}}
+        query_graph: Original query graph
+        nodes_tuple: ((qnode_id, node_idx), ...)
+        edges_tuple: ((qedge_id, subj_idx, predicate, obj_idx), ...)
+        node_cache: Dict mapping node_idx -> {id, category, name} for cached lookups
 
     Returns:
         Enriched path dictionary matching query graph structure
     """
-    result = {
-        "nodes": {},
-        "edges": {},
+    # Build nodes dict directly from tuple
+    nodes = {qnode_id: node_cache[node_idx] for qnode_id, node_idx in nodes_tuple}
+
+    # Build edges dict directly from tuple
+    edges = {
+        qedge_id: {
+            "predicate": predicate,
+            "subject": node_cache[subj_idx]["id"],
+            "object": node_cache[obj_idx]["id"],
+        }
+        for qedge_id, subj_idx, predicate, obj_idx in edges_tuple
     }
 
-    # Add nodes in query graph order
-    for qnode_id in query_graph["nodes"].keys():
-        if qnode_id in path_dict["nodes"]:
-            node_idx = path_dict["nodes"][qnode_id]
-            result["nodes"][qnode_id] = {
-                "id": graph.get_node_id(node_idx),
-                "category": graph.get_node_property(node_idx, "category", []),
-                "name": graph.get_node_property(node_idx, "name"),
-            }
-
-    # Add edges in query graph order
-    for qedge_id in edge_order:
-        if qedge_id in path_dict["edges"]:
-            subj_idx, predicate, obj_idx = path_dict["edges"][qedge_id]
-            result["edges"][qedge_id] = {
-                "predicate": predicate,
-                "subject": graph.get_node_id(subj_idx),
-                "object": graph.get_node_id(obj_idx),
-            }
-
-    return result
+    return {"nodes": nodes, "edges": edges}
