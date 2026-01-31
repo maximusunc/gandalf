@@ -473,9 +473,9 @@ def lookup(graph, query: dict, verbose=True):
         allowed_predicates = [
             predicate
             for edge_predicate in next_edge["predicates"]
+            if bmt.get_element(edge_predicate) is not None
             for predicate in bmt.get_descendants(edge_predicate, formatted=True)
         ]
-        print(allowed_predicates)
         # allowed_predicates = next_edge["predicates"]
 
         # Query for matching edges
@@ -595,6 +595,8 @@ def _query_edge(
         if verbose:
             print(f"  Forward search from {len(start_idxes)} pinned nodes")
 
+        t0 = time.perf_counter()
+
         for start_idx in start_idxes:
             for obj_idx, predicate, _ in graph.neighbors_with_properties(start_idx):
                 # Check predicate
@@ -609,10 +611,16 @@ def _query_edge(
 
                 matches.append((start_idx, predicate, obj_idx))
 
+        t1 = time.perf_counter()
+        if verbose:
+            print(f"  Found {len(matches)} matches in {t1 - t0:.3f}s")
+
     # Case 2: Start unpinned, end pinned
     elif start_idxes is None and end_idxes is not None:
         if verbose:
             print(f"  Backward search from {len(end_idxes)} pinned nodes")
+
+        t0 = time.perf_counter()
 
         for end_idx in end_idxes:
             for subj_idx, predicate, _ in graph.incoming_neighbors_with_properties(
@@ -629,6 +637,10 @@ def _query_edge(
                         continue
 
                 matches.append((subj_idx, predicate, end_idx))
+
+        t1 = time.perf_counter()
+        if verbose:
+            print(f"  Found {len(matches)} matches in {t1 - t0:.3f}s")
 
     # Case 3: Both pinned
     elif start_idxes is not None and end_idxes is not None:
@@ -897,11 +909,9 @@ def _compute_join_order(query_graph, edge_results, edge_order, verbose):
         best_score = -1
 
         for edge_id in remaining_edges:
-            print(edge_id)
             edge = query_graph["edges"][edge_id]
             subj = edge["subject"]
             obj = edge["object"]
-            print(subj, obj)
 
             # Score based on:
             # - How many nodes are already in path (higher is better for joining)
@@ -911,10 +921,8 @@ def _compute_join_order(query_graph, edge_results, edge_order, verbose):
 
             # Prefer edges with shared nodes, then smaller result sets
             score = nodes_shared * 1000000000 - result_size
-            print(score)
 
             if score > best_score:
-                print("setting the new best score")
                 best_score = score
                 best_edge = edge_id
 
