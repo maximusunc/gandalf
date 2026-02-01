@@ -120,3 +120,4 @@ pytest --cov=gandalf --cov-report=html
 - Avoid repeating chunks of code, but also avoid premature over-abstraction
 - Declarative principles are favored
 - Always use type hints, always document methods and classes
+- DO NOT FORCE PUSH TO GITHUB
