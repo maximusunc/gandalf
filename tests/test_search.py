@@ -5,7 +5,7 @@ import os
 import pytest
 
 from gandalf.loader import build_graph_from_jsonl
-from gandalf.search import lookup
+from gandalf.search import lookup, _edge_matches_qualifier_constraints
 
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -86,10 +86,11 @@ class TestLookupOneHop:
         response = lookup(graph, query, verbose=False)
         results = response["message"]["results"]
 
-        # CHEBI:6801 (Metformin) affects NCBIGene:5468 (PPARG)
-        # Should return 1 path to a Gene
-        assert len(results) == 1
-        assert results[0]["node_bindings"]["n1"][0]["id"] == "NCBIGene:5468"
+        # CHEBI:6801 (Metformin) affects 4 genes:
+        # NCBIGene:5468 (PPARG), NCBIGene:3643 (INSR), NCBIGene:2645 (GCK), NCBIGene:7124 (TNF)
+        assert len(results) == 4
+        gene_ids = {r["node_bindings"]["n1"][0]["id"] for r in results}
+        assert gene_ids == {"NCBIGene:5468", "NCBIGene:3643", "NCBIGene:2645", "NCBIGene:7124"}
 
     def test_one_hop_no_matching_predicate(self, graph):
         """Query with non-matching predicate should return 0 paths."""
@@ -180,11 +181,17 @@ class TestLookupTwoHop:
         response = lookup(graph, query, verbose=False)
         results = response["message"]["results"]
 
-        # Path: CHEBI:6801 --affects--> NCBIGene:5468 --gene_associated--> MONDO:0005148
-        assert len(results) == 1
-        assert results[0]["node_bindings"]["n0"][0]["id"] == "CHEBI:6801"
-        assert results[0]["node_bindings"]["n1"][0]["id"] == "NCBIGene:5468"
-        assert results[0]["node_bindings"]["n2"][0]["id"] == "MONDO:0005148"
+        # Three paths from Metformin through genes to Type 2 Diabetes:
+        # CHEBI:6801 --affects--> NCBIGene:5468 (PPARG) --gene_associated--> MONDO:0005148
+        # CHEBI:6801 --affects--> NCBIGene:3643 (INSR) --gene_associated--> MONDO:0005148
+        # CHEBI:6801 --affects--> NCBIGene:2645 (GCK) --gene_associated--> MONDO:0005148
+        assert len(results) == 3
+        gene_ids = {r["node_bindings"]["n1"][0]["id"] for r in results}
+        assert gene_ids == {"NCBIGene:5468", "NCBIGene:3643", "NCBIGene:2645"}
+        # All paths should start with Metformin and end with Type 2 Diabetes
+        for result in results:
+            assert result["node_bindings"]["n0"][0]["id"] == "CHEBI:6801"
+            assert result["node_bindings"]["n2"][0]["id"] == "MONDO:0005148"
 
     def test_two_hop_multiple_intermediate_nodes(self, graph):
         """Two-hop query with multiple valid intermediate nodes."""
@@ -590,3 +597,338 @@ class TestMetforminType2DiabetesEdges:
         # Verify edge bindings contain all 3 edges
         edge_bindings = results[0]["analyses"][0]["edge_bindings"]["e0"]
         assert len(edge_bindings) == 3
+
+
+class TestQualifierConstraintMatching:
+    """Unit tests for the _edge_matches_qualifier_constraints helper function."""
+
+    def test_no_constraints_returns_true(self):
+        """No qualifier constraints should match any edge."""
+        edge_qualifiers = [
+            {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"}
+        ]
+        assert _edge_matches_qualifier_constraints(edge_qualifiers, None) is True
+        assert _edge_matches_qualifier_constraints(edge_qualifiers, []) is True
+
+    def test_empty_qualifier_set_matches_any_edge(self):
+        """Empty qualifier_set should match any edge."""
+        edge_qualifiers = [
+            {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"}
+        ]
+        constraints = [{"qualifier_set": []}]
+        assert _edge_matches_qualifier_constraints(edge_qualifiers, constraints) is True
+
+    def test_single_qualifier_match(self):
+        """Edge with matching single qualifier should match."""
+        edge_qualifiers = [
+            {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"}
+        ]
+        constraints = [
+            {
+                "qualifier_set": [
+                    {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"}
+                ]
+            }
+        ]
+        assert _edge_matches_qualifier_constraints(edge_qualifiers, constraints) is True
+
+    def test_single_qualifier_no_match(self):
+        """Edge with non-matching qualifier should not match."""
+        edge_qualifiers = [
+            {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"}
+        ]
+        constraints = [
+            {
+                "qualifier_set": [
+                    {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "abundance"}
+                ]
+            }
+        ]
+        assert _edge_matches_qualifier_constraints(edge_qualifiers, constraints) is False
+
+    def test_multiple_qualifiers_all_match(self):
+        """Edge with all required qualifiers should match (AND semantics within set)."""
+        edge_qualifiers = [
+            {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"},
+            {"qualifier_type_id": "biolink:object_direction_qualifier", "qualifier_value": "increased"},
+        ]
+        constraints = [
+            {
+                "qualifier_set": [
+                    {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"},
+                    {"qualifier_type_id": "biolink:object_direction_qualifier", "qualifier_value": "increased"},
+                ]
+            }
+        ]
+        assert _edge_matches_qualifier_constraints(edge_qualifiers, constraints) is True
+
+    def test_multiple_qualifiers_partial_match(self):
+        """Edge with only some required qualifiers should not match."""
+        edge_qualifiers = [
+            {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"},
+        ]
+        constraints = [
+            {
+                "qualifier_set": [
+                    {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"},
+                    {"qualifier_type_id": "biolink:object_direction_qualifier", "qualifier_value": "increased"},
+                ]
+            }
+        ]
+        assert _edge_matches_qualifier_constraints(edge_qualifiers, constraints) is False
+
+    def test_or_semantics_between_qualifier_sets(self):
+        """Edge matching any qualifier_set should match (OR semantics between sets)."""
+        edge_qualifiers = [
+            {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "abundance"},
+        ]
+        constraints = [
+            {
+                "qualifier_set": [
+                    {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"},
+                ]
+            },
+            {
+                "qualifier_set": [
+                    {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "abundance"},
+                ]
+            },
+        ]
+        assert _edge_matches_qualifier_constraints(edge_qualifiers, constraints) is True
+
+    def test_edge_with_no_qualifiers(self):
+        """Edge with no qualifiers should not match constraints requiring qualifiers."""
+        edge_qualifiers = []
+        constraints = [
+            {
+                "qualifier_set": [
+                    {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"},
+                ]
+            }
+        ]
+        assert _edge_matches_qualifier_constraints(edge_qualifiers, constraints) is False
+
+    def test_edge_with_extra_qualifiers_still_matches(self):
+        """Edge with extra qualifiers beyond required should still match."""
+        edge_qualifiers = [
+            {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"},
+            {"qualifier_type_id": "biolink:object_direction_qualifier", "qualifier_value": "increased"},
+            {"qualifier_type_id": "biolink:qualified_predicate", "qualifier_value": "biolink:causes"},
+        ]
+        constraints = [
+            {
+                "qualifier_set": [
+                    {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"},
+                ]
+            }
+        ]
+        assert _edge_matches_qualifier_constraints(edge_qualifiers, constraints) is True
+
+
+class TestLookupWithQualifierConstraints:
+    """Tests for lookup function with qualifier constraints."""
+
+    def test_qualifier_constraint_filters_edges(self, graph):
+        """Qualifier constraints should filter to only matching edges."""
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:affects"],
+                            "qualifier_constraints": [
+                                {
+                                    "qualifier_set": [
+                                        {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"},
+                                        {"qualifier_type_id": "biolink:object_direction_qualifier", "qualifier_value": "increased"},
+                                    ]
+                                }
+                            ],
+                        },
+                    },
+                },
+            },
+        }
+
+        response = lookup(graph, query, verbose=False)
+        results = response["message"]["results"]
+
+        # Only NCBIGene:3643 (INSR) has qualifiers matching activity+increased
+        assert len(results) == 1
+        assert results[0]["node_bindings"]["n1"][0]["id"] == "NCBIGene:3643"
+
+    def test_qualifier_constraint_decreased_direction(self, graph):
+        """Query for edges with decreased direction qualifier."""
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:affects"],
+                            "qualifier_constraints": [
+                                {
+                                    "qualifier_set": [
+                                        {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"},
+                                        {"qualifier_type_id": "biolink:object_direction_qualifier", "qualifier_value": "decreased"},
+                                    ]
+                                }
+                            ],
+                        },
+                    },
+                },
+            },
+        }
+
+        response = lookup(graph, query, verbose=False)
+        results = response["message"]["results"]
+
+        # Only NCBIGene:2645 (GCK) has qualifiers matching activity+decreased
+        assert len(results) == 1
+        assert results[0]["node_bindings"]["n1"][0]["id"] == "NCBIGene:2645"
+
+    def test_qualifier_constraint_abundance_aspect(self, graph):
+        """Query for edges with abundance aspect qualifier."""
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:affects"],
+                            "qualifier_constraints": [
+                                {
+                                    "qualifier_set": [
+                                        {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "abundance"},
+                                    ]
+                                }
+                            ],
+                        },
+                    },
+                },
+            },
+        }
+
+        response = lookup(graph, query, verbose=False)
+        results = response["message"]["results"]
+
+        # Only NCBIGene:7124 (TNF) has abundance qualifier
+        assert len(results) == 1
+        assert results[0]["node_bindings"]["n1"][0]["id"] == "NCBIGene:7124"
+
+    def test_qualifier_constraint_or_semantics(self, graph):
+        """Multiple qualifier sets should use OR semantics."""
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:affects"],
+                            "qualifier_constraints": [
+                                {
+                                    "qualifier_set": [
+                                        {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"},
+                                        {"qualifier_type_id": "biolink:object_direction_qualifier", "qualifier_value": "increased"},
+                                    ]
+                                },
+                                {
+                                    "qualifier_set": [
+                                        {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "abundance"},
+                                    ]
+                                },
+                            ],
+                        },
+                    },
+                },
+            },
+        }
+
+        response = lookup(graph, query, verbose=False)
+        results = response["message"]["results"]
+
+        # Should match both INSR (activity+increased) and TNF (abundance)
+        assert len(results) == 2
+        result_ids = {r["node_bindings"]["n1"][0]["id"] for r in results}
+        assert result_ids == {"NCBIGene:3643", "NCBIGene:7124"}
+
+    def test_no_qualifier_constraints_returns_all(self, graph):
+        """Without qualifier constraints, all edges should match."""
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:affects"],
+                        },
+                    },
+                },
+            },
+        }
+
+        response = lookup(graph, query, verbose=False)
+        results = response["message"]["results"]
+
+        # Should return all 4 affects edges to genes:
+        # PPARG (no qualifiers), INSR (activity+increased), GCK (activity+decreased), TNF (abundance+increased)
+        assert len(results) == 4
+
+    def test_qualifier_constraint_no_matches(self, graph):
+        """Query with non-matching qualifier constraints should return 0 results."""
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:affects"],
+                            "qualifier_constraints": [
+                                {
+                                    "qualifier_set": [
+                                        {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "expression"},
+                                    ]
+                                }
+                            ],
+                        },
+                    },
+                },
+            },
+        }
+
+        response = lookup(graph, query, verbose=False)
+        results = response["message"]["results"]
+
+        # No edges have expression qualifier
+        assert len(results) == 0
