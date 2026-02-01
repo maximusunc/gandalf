@@ -1,15 +1,78 @@
 """General graph search functions."""
 
 import copy
+import gc
 import time
 import uuid
 from collections import defaultdict
+from contextlib import contextmanager
 
 import numpy as np
 from bmt.toolkit import Toolkit
 
 from gandalf.graph import CSRGraph
 from gandalf.query_planner import get_next_qedge, remove_orphaned
+
+
+class GCMonitor:
+    """Monitor garbage collection events and log timing information."""
+
+    def __init__(self, verbose=True):
+        self.verbose = verbose
+        self.gc_events = []
+        self._start_time = None
+
+    def _gc_callback(self, phase, info):
+        """Callback invoked by gc module on collection events."""
+        if phase == "start":
+            self._start_time = time.perf_counter()
+        elif phase == "stop" and self._start_time is not None:
+            duration = time.perf_counter() - self._start_time
+            generation = info.get("generation", "?")
+            collected = info.get("collected", 0)
+            self.gc_events.append({
+                "generation": generation,
+                "duration": duration,
+                "collected": collected,
+            })
+            if self.verbose and duration > 0.1:  # Only log slow GC (>100ms)
+                print(f"  [GC] Gen {generation}: {duration:.2f}s, collected {collected} objects")
+            self._start_time = None
+
+    def start(self):
+        """Start monitoring GC events."""
+        self.gc_events = []
+        gc.callbacks.append(self._gc_callback)
+
+    def stop(self):
+        """Stop monitoring and return summary."""
+        if self._gc_callback in gc.callbacks:
+            gc.callbacks.remove(self._gc_callback)
+        return self.gc_events
+
+    def summary(self):
+        """Return summary of GC activity."""
+        if not self.gc_events:
+            return None
+        total_time = sum(e["duration"] for e in self.gc_events)
+        total_collected = sum(e["collected"] for e in self.gc_events)
+        return {
+            "total_collections": len(self.gc_events),
+            "total_time": total_time,
+            "total_collected": total_collected,
+        }
+
+
+@contextmanager
+def gc_disabled():
+    """Context manager to temporarily disable GC."""
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def _return_with_properties(
@@ -410,20 +473,33 @@ def do_one_hop(graph: CSRGraph, start_id: str, verbose=True):
     return neighbors
 
 
-def lookup(graph, query: dict, verbose=True):
+def lookup(graph, query: dict, bmt=None, verbose=True):
     """
     Take an arbitrary Translator query graph and return all matching paths.
 
     Args:
         graph: CSRGraph instance
         query_graph: Query graph with nodes and edges
-        bmt: Biolink Model Toolkit instance
+        bmt: Biolink Model Toolkit instance (optional, will create if not provided)
         verbose: Print progress information
 
     Returns:
         List of enriched path dictionaries matching the query graph structure
     """
-    bmt = Toolkit()
+    t_start = time.perf_counter()
+
+    # Start GC monitoring to track collection events
+    gc_monitor = GCMonitor(verbose=verbose)
+    gc_monitor.start()
+
+    if bmt is None:
+        bmt = Toolkit()
+        t_bmt = time.perf_counter()
+        if verbose:
+            print(f"BMT initialization: {t_bmt - t_start:.2f}s")
+    elif verbose:
+        print("Using provided BMT instance")
+
     query_graph = query["message"]["query_graph"]
     subqgraph = copy.deepcopy(query_graph)
 
@@ -534,6 +610,8 @@ def lookup(graph, query: dict, verbose=True):
     if verbose:
         print(f"Found {len(paths):,} complete paths")
 
+    t_post_start = time.perf_counter()
+
     response = {
         "message": {
             "query_graph": query_graph,
@@ -557,60 +635,87 @@ def lookup(graph, query: dict, verbose=True):
         )
         node_binding_groups[node_key].append(path)
 
-    # Build results - one per unique node binding combination
-    for node_key, grouped_paths in node_binding_groups.items():
-        # Use first path for node info (all paths in group have same nodes)
-        first_path = grouped_paths[0]
+    t_grouped = time.perf_counter()
+    if verbose:
+        print(f"  Grouped into {len(node_binding_groups):,} unique node paths ({t_grouped - t_post_start:.2f}s)")
 
-        result = {
-            "node_bindings": {},
-            "analyses": [{
-                "resource_id": "infores:gandalf",
-                "edge_bindings": {},
-            }],
-        }
+    # Disable GC during result building to prevent stochastic pauses
+    # GC can cause 30+ second delays when triggered during this loop
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
 
-        # Add node bindings (same for all paths in group)
-        for node_id, node in first_path["nodes"].items():
-            response["message"]["knowledge_graph"]["nodes"][node["id"]] = node
-            result["node_bindings"][node_id] = [
-                {
-                    "id": node["id"],
-                    "attributes": [],
-                },
-            ]
+    try:
+        # Build results - one per unique node binding combination
+        for node_key, grouped_paths in node_binding_groups.items():
+            # Use first path for node info (all paths in group have same nodes)
+            first_path = grouped_paths[0]
 
-        # Aggregate edge bindings from all paths in group
-        # For each query edge, collect all matching edges
-        edge_bindings_by_qedge = defaultdict(list)
+            result = {
+                "node_bindings": {},
+                "analyses": [{
+                    "resource_id": "infores:gandalf",
+                    "edge_bindings": {},
+                }],
+            }
 
-        for path in grouped_paths:
-            for edge_id, edge in path["edges"].items():
-                # Create a unique key for this edge to avoid duplicates
-                edge_key = (edge["subject"], edge["predicate"], edge["object"])
-
-                # Check if we already have this exact edge
-                existing_keys = [
-                    (e["subject"], e["predicate"], e["object"])
-                    for e in edge_bindings_by_qedge[edge_id]
-                ]
-                if edge_key not in existing_keys:
-                    edge_bindings_by_qedge[edge_id].append(edge)
-
-        # Add edges to knowledge graph and result bindings
-        for edge_id, edges in edge_bindings_by_qedge.items():
-            result["analyses"][0]["edge_bindings"][edge_id] = []
-            for edge in edges:
-                edge_uuid = str(uuid.uuid4())[:8]
-                response["message"]["knowledge_graph"]["edges"][edge_uuid] = edge
-                result["analyses"][0]["edge_bindings"][edge_id].append(
+            # Add node bindings (same for all paths in group)
+            for node_id, node in first_path["nodes"].items():
+                response["message"]["knowledge_graph"]["nodes"][node["id"]] = node
+                result["node_bindings"][node_id] = [
                     {
-                        "id": edge_uuid,
+                        "id": node["id"],
                         "attributes": [],
-                    }
-                )
+                    },
+                ]
 
-        response["message"]["results"].append(result)
+            # Aggregate edge bindings from all paths in group
+            # For each query edge, collect all matching edges
+            edge_bindings_by_qedge = defaultdict(list)
+
+            for path in grouped_paths:
+                for edge_id, edge in path["edges"].items():
+                    # Create a unique key for this edge to avoid duplicates
+                    edge_key = (edge["subject"], edge["predicate"], edge["object"])
+
+                    # Check if we already have this exact edge
+                    existing_keys = [
+                        (e["subject"], e["predicate"], e["object"])
+                        for e in edge_bindings_by_qedge[edge_id]
+                    ]
+                    if edge_key not in existing_keys:
+                        edge_bindings_by_qedge[edge_id].append(edge)
+
+            # Add edges to knowledge graph and result bindings
+            for edge_id, edges in edge_bindings_by_qedge.items():
+                result["analyses"][0]["edge_bindings"][edge_id] = []
+                for edge in edges:
+                    edge_uuid = str(uuid.uuid4())[:8]
+                    response["message"]["knowledge_graph"]["edges"][edge_uuid] = edge
+                    result["analyses"][0]["edge_bindings"][edge_id].append(
+                        {
+                            "id": edge_uuid,
+                            "attributes": [],
+                        }
+                    )
+
+            response["message"]["results"].append(result)
+    finally:
+        # Re-enable GC if it was enabled before
+        if gc_was_enabled:
+            gc.enable()
+
+    t_built = time.perf_counter()
+    if verbose:
+        print(f"  Built {len(response['message']['results']):,} results ({t_built - t_grouped:.2f}s)")
+        print(f"  Post-processing total: {t_built - t_post_start:.2f}s")
+
+    # Stop GC monitoring and show summary
+    gc_monitor.stop()
+    gc_summary = gc_monitor.summary()
+    if verbose and gc_summary and gc_summary["total_time"] > 0.1:
+        print(f"  [GC Summary] {gc_summary['total_collections']} collections, "
+              f"{gc_summary['total_time']:.2f}s total, "
+              f"{gc_summary['total_collected']} objects collected")
 
     return response
 
@@ -639,8 +744,15 @@ def _query_edge(
 
         t0 = time.perf_counter()
 
+        total_neighbors = 0
+        slow_nodes = []  # Track nodes that take > 0.1s
+
         for start_idx in start_idxes:
+            t_node_start = time.perf_counter()
+            node_neighbors = 0
+
             for obj_idx, predicate, _ in graph.neighbors_with_properties(start_idx):
+                node_neighbors += 1
                 # Check predicate
                 if allowed_predicates and predicate not in allowed_predicates:
                     continue
@@ -653,9 +765,21 @@ def _query_edge(
 
                 matches.append((start_idx, predicate, obj_idx))
 
+            t_node_end = time.perf_counter()
+            node_time = t_node_end - t_node_start
+            total_neighbors += node_neighbors
+
+            if node_time > 0.1:  # Track slow nodes
+                slow_nodes.append((start_idx, node_neighbors, node_time))
+
         t1 = time.perf_counter()
         if verbose:
-            print(f"  Found {len(matches)} matches in {t1 - t0:.3f}s")
+            print(f"  Traversed {total_neighbors:,} total neighbors")
+            if slow_nodes:
+                print(f"  Slow nodes (>0.1s): {len(slow_nodes)}")
+                for node_idx, neighbors, node_time in slow_nodes[:5]:  # Show top 5
+                    print(f"    Node {node_idx}: {neighbors:,} neighbors, {node_time:.2f}s")
+            print(f"  Found {len(matches):,} matches in {t1 - t0:.3f}s")
 
     # Case 2: Start unpinned, end pinned
     elif start_idxes is None and end_idxes is not None:
@@ -664,10 +788,17 @@ def _query_edge(
 
         t0 = time.perf_counter()
 
-        for end_idx in end_idxes:
+        total_neighbors = 0
+        slow_nodes = []  # Track nodes that take > 0.1s
+
+        for i, end_idx in enumerate(end_idxes):
+            t_node_start = time.perf_counter()
+            node_neighbors = 0
+
             for subj_idx, predicate, _ in graph.incoming_neighbors_with_properties(
                 end_idx
             ):
+                node_neighbors += 1
                 # Check predicate
                 if allowed_predicates and predicate not in allowed_predicates:
                     continue
@@ -680,9 +811,21 @@ def _query_edge(
 
                 matches.append((subj_idx, predicate, end_idx))
 
+            t_node_end = time.perf_counter()
+            node_time = t_node_end - t_node_start
+            total_neighbors += node_neighbors
+
+            if node_time > 0.1:  # Track slow nodes
+                slow_nodes.append((end_idx, node_neighbors, node_time))
+
         t1 = time.perf_counter()
         if verbose:
-            print(f"  Found {len(matches)} matches in {t1 - t0:.3f}s")
+            print(f"  Traversed {total_neighbors:,} total incoming neighbors")
+            if slow_nodes:
+                print(f"  Slow nodes (>0.1s): {len(slow_nodes)}")
+                for node_idx, neighbors, node_time in slow_nodes[:5]:  # Show top 5
+                    print(f"    Node {node_idx}: {neighbors:,} neighbors, {node_time:.2f}s")
+            print(f"  Found {len(matches):,} matches in {t1 - t0:.3f}s")
 
     # Case 3: Both pinned
     elif start_idxes is not None and end_idxes is not None:
@@ -694,13 +837,22 @@ def _query_edge(
         # Build forward edges with predicates
         forward_edges = defaultdict(list)  # obj_idx -> [(subj_idx, predicate), ...]
 
+        t_neighbors_start = time.perf_counter()
+        total_neighbors = 0
         for start_idx in start_idxes:
             for obj_idx, predicate, _ in graph.neighbors_with_properties(start_idx):
+                total_neighbors += 1
                 if allowed_predicates and predicate not in allowed_predicates:
                     continue
                 forward_edges[obj_idx].append((start_idx, predicate))
 
+        t_neighbors_end = time.perf_counter()
+        if verbose:
+            print(f"    Neighbor traversal: {t_neighbors_end - t_neighbors_start:.3f}s "
+                  f"({total_neighbors:,} neighbors, {len(forward_edges):,} unique targets)")
+
         # Find intersection with end nodes
+        t_intersect_start = time.perf_counter()
         end_set = set(end_idxes)
 
         for obj_idx in forward_edges.keys():
@@ -710,7 +862,8 @@ def _query_edge(
 
         t1 = time.perf_counter()
         if verbose:
-            print(f"  Found {len(matches)} matches in {t1 - t0:.3f}s")
+            print(f"    Intersection: {t1 - t_intersect_start:.3f}s")
+            print(f"  Found {len(matches):,} matches in {t1 - t0:.3f}s")
 
     else:
         raise Exception("Both nodes unpinned - bad query planning")
@@ -722,8 +875,8 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
     """
     Reconstruct complete paths by iteratively joining edge results.
 
-    Uses a fast iterative join strategy instead of recursion.
-    Optimized to use tuples during joining for better performance.
+    Uses NumPy arrays for efficient memory usage and to avoid GC pressure.
+    For 15M+ paths, this eliminates Python object creation overhead.
 
     Args:
         graph: CSRGraph instance
@@ -746,139 +899,221 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
     if verbose:
         print(f"  Join order: {join_order}")
 
+    # Build mappings for query structure
+    # qnode_id -> column index in node array
+    qnode_to_col = {}
+    # qedge_id -> column index in predicate array
+    qedge_to_col = {eid: i for i, eid in enumerate(join_order)}
+
+    # Build predicate vocabulary: predicate_string -> int
+    predicate_to_idx = {}
+    idx_to_predicate = []
+
+    def get_pred_idx(pred):
+        if pred not in predicate_to_idx:
+            predicate_to_idx[pred] = len(idx_to_predicate)
+            idx_to_predicate.append(pred)
+        return predicate_to_idx[pred]
+
     # Start with the first edge results
     first_edge_id = join_order[0]
     first_edge = query_graph["edges"][first_edge_id]
     subj_qnode = first_edge["subject"]
     obj_qnode = first_edge["object"]
 
-    # Use tuple-based representation for efficiency during joining:
-    # Each path is: (nodes_tuple, edges_tuple)
-    # nodes_tuple: ((qnode_id, node_idx), ...)
-    # edges_tuple: ((qedge_id, subj_idx, predicate, obj_idx), ...)
-    # Tuples are immutable and much faster to create than dicts
-    partial_paths = [
-        (
-            ((subj_qnode, subj_idx), (obj_qnode, obj_idx)),
-            ((first_edge_id, subj_idx, predicate, obj_idx),),
-        )
-        for subj_idx, predicate, obj_idx in edge_results[first_edge_id]
-    ]
+    # Assign column indices for first edge's nodes
+    qnode_to_col[subj_qnode] = 0
+    qnode_to_col[obj_qnode] = 1
+    num_node_cols = 2
+
+    # Convert first edge results to numpy arrays
+    first_results = edge_results[first_edge_id]
+    num_paths = len(first_results)
+
+    if num_paths == 0:
+        return []
+
+    # Pre-allocate arrays for nodes and predicates
+    # nodes: shape (num_paths, max_nodes) - will grow columns as needed
+    # preds: shape (num_paths, num_edges)
+    max_nodes = len(query_graph["nodes"])
+    num_edges = len(join_order)
+
+    paths_nodes = np.zeros((num_paths, max_nodes), dtype=np.int32)
+    paths_preds = np.zeros((num_paths, num_edges), dtype=np.int32)
+
+    # Fill in first edge data
+    for i, (subj_idx, predicate, obj_idx) in enumerate(first_results):
+        paths_nodes[i, 0] = subj_idx
+        paths_nodes[i, 1] = obj_idx
+        paths_preds[i, 0] = get_pred_idx(predicate)
 
     if verbose:
-        print(
-            f"  Starting with {len(partial_paths):,} paths from edge '{first_edge_id}'"
-        )
+        print(f"  Starting with {num_paths:,} paths from edge '{first_edge_id}'")
 
     # Iteratively join with remaining edges
-    for i, edge_id in enumerate(join_order[1:], 1):
+    for join_idx, edge_id in enumerate(join_order[1:], 1):
         edge = query_graph["edges"][edge_id]
         subj_qnode = edge["subject"]
         obj_qnode = edge["object"]
 
         if verbose:
             print(
-                f"  Join {i}/{len(join_order) - 1}: Adding edge '{edge_id}' ({len(partial_paths):,} paths)...",
+                f"  Join {join_idx}/{len(join_order) - 1}: Adding edge '{edge_id}' ({len(paths_nodes):,} paths)...",
                 end="",
             )
 
         t_join_start = time.perf_counter()
 
-        # Check which nodes are already in paths (check first path as representative)
-        if partial_paths:
-            first_path_nodes = {qn: idx for qn, idx in partial_paths[0][0]}
-            subj_in_paths = subj_qnode in first_path_nodes
-            obj_in_paths = obj_qnode in first_path_nodes
-        else:
-            subj_in_paths = False
-            obj_in_paths = False
+        subj_in_paths = subj_qnode in qnode_to_col
+        obj_in_paths = obj_qnode in qnode_to_col
 
-        new_paths = []
+        edge_data = edge_results[edge_id]
 
         if subj_in_paths and obj_in_paths:
-            # Both nodes already in path - validate consistency using index
-            # Build index: (subj_idx, obj_idx) -> [predicates]
+            # Both nodes already in path - validate consistency
+            subj_col = qnode_to_col[subj_qnode]
+            obj_col = qnode_to_col[obj_qnode]
+
+            # Build index: (subj_idx, obj_idx) -> [pred_idx, ...]
             edge_index = defaultdict(list)
-            for subj_idx, predicate, obj_idx in edge_results[edge_id]:
-                edge_index[(subj_idx, obj_idx)].append(predicate)
+            for subj_idx, predicate, obj_idx in edge_data:
+                edge_index[(subj_idx, obj_idx)].append(get_pred_idx(predicate))
 
-            for nodes_tuple, edges_tuple in partial_paths:
-                nodes_dict = {qn: idx for qn, idx in nodes_tuple}
-                expected_subj = nodes_dict.get(subj_qnode)
-                expected_obj = nodes_dict.get(obj_qnode)
-                key = (expected_subj, expected_obj)
+            # Find matching paths
+            new_nodes_list = []
+            new_preds_list = []
 
+            for path_idx in range(len(paths_nodes)):
+                key = (paths_nodes[path_idx, subj_col], paths_nodes[path_idx, obj_col])
                 if key in edge_index:
-                    for predicate in edge_index[key]:
-                        new_edges = edges_tuple + (
-                            (edge_id, expected_subj, predicate, expected_obj),
-                        )
-                        new_paths.append((nodes_tuple, new_edges))
+                    for pred_idx in edge_index[key]:
+                        new_nodes_list.append(paths_nodes[path_idx].copy())
+                        new_preds = paths_preds[path_idx].copy()
+                        new_preds[join_idx] = pred_idx
+                        new_preds_list.append(new_preds)
+
+            if new_nodes_list:
+                paths_nodes = np.array(new_nodes_list, dtype=np.int32)
+                paths_preds = np.array(new_preds_list, dtype=np.int32)
+            else:
+                paths_nodes = np.zeros((0, max_nodes), dtype=np.int32)
+                paths_preds = np.zeros((0, num_edges), dtype=np.int32)
 
         elif subj_in_paths:
-            # Join on subject node
-            # Build index: subj_idx -> [(pred, obj_idx), ...]
+            # Join on subject node, add object node
+            subj_col = qnode_to_col[subj_qnode]
+
+            # Assign column for new object node
+            if obj_qnode not in qnode_to_col:
+                qnode_to_col[obj_qnode] = num_node_cols
+                num_node_cols += 1
+            obj_col = qnode_to_col[obj_qnode]
+
+            # Build index: subj_idx -> [(pred_idx, obj_idx), ...]
             edge_index = defaultdict(list)
-            for subj_idx, predicate, obj_idx in edge_results[edge_id]:
-                edge_index[subj_idx].append((predicate, obj_idx))
+            for subj_idx, predicate, obj_idx in edge_data:
+                edge_index[subj_idx].append((get_pred_idx(predicate), obj_idx))
 
-            for nodes_tuple, edges_tuple in partial_paths:
-                nodes_dict = {qn: idx for qn, idx in nodes_tuple}
-                subj_idx = nodes_dict.get(subj_qnode)
+            # Find matching paths
+            new_nodes_list = []
+            new_preds_list = []
 
+            for path_idx in range(len(paths_nodes)):
+                subj_idx = paths_nodes[path_idx, subj_col]
                 if subj_idx in edge_index:
-                    for predicate, obj_idx in edge_index[subj_idx]:
-                        new_nodes = nodes_tuple + ((obj_qnode, obj_idx),)
-                        new_edges = edges_tuple + (
-                            (edge_id, subj_idx, predicate, obj_idx),
-                        )
-                        new_paths.append((new_nodes, new_edges))
+                    for pred_idx, obj_idx in edge_index[subj_idx]:
+                        new_nodes = paths_nodes[path_idx].copy()
+                        new_nodes[obj_col] = obj_idx
+                        new_nodes_list.append(new_nodes)
+                        new_preds = paths_preds[path_idx].copy()
+                        new_preds[join_idx] = pred_idx
+                        new_preds_list.append(new_preds)
+
+            if new_nodes_list:
+                paths_nodes = np.array(new_nodes_list, dtype=np.int32)
+                paths_preds = np.array(new_preds_list, dtype=np.int32)
+            else:
+                paths_nodes = np.zeros((0, max_nodes), dtype=np.int32)
+                paths_preds = np.zeros((0, num_edges), dtype=np.int32)
 
         elif obj_in_paths:
-            # Join on object node
-            # Build index: obj_idx -> [(subj_idx, pred), ...]
+            # Join on object node, add subject node
+            obj_col = qnode_to_col[obj_qnode]
+
+            # Assign column for new subject node
+            if subj_qnode not in qnode_to_col:
+                qnode_to_col[subj_qnode] = num_node_cols
+                num_node_cols += 1
+            subj_col = qnode_to_col[subj_qnode]
+
+            # Build index: obj_idx -> [(subj_idx, pred_idx), ...]
             edge_index = defaultdict(list)
-            for subj_idx, predicate, obj_idx in edge_results[edge_id]:
-                edge_index[obj_idx].append((subj_idx, predicate))
+            for subj_idx, predicate, obj_idx in edge_data:
+                edge_index[obj_idx].append((subj_idx, get_pred_idx(predicate)))
 
-            for nodes_tuple, edges_tuple in partial_paths:
-                nodes_dict = {qn: idx for qn, idx in nodes_tuple}
-                obj_idx = nodes_dict.get(obj_qnode)
+            # Find matching paths
+            new_nodes_list = []
+            new_preds_list = []
 
+            for path_idx in range(len(paths_nodes)):
+                obj_idx = paths_nodes[path_idx, obj_col]
                 if obj_idx in edge_index:
-                    for subj_idx, predicate in edge_index[obj_idx]:
-                        new_nodes = nodes_tuple + ((subj_qnode, subj_idx),)
-                        new_edges = edges_tuple + (
-                            (edge_id, subj_idx, predicate, obj_idx),
-                        )
-                        new_paths.append((new_nodes, new_edges))
+                    for subj_idx, pred_idx in edge_index[obj_idx]:
+                        new_nodes = paths_nodes[path_idx].copy()
+                        new_nodes[subj_col] = subj_idx
+                        new_nodes_list.append(new_nodes)
+                        new_preds = paths_preds[path_idx].copy()
+                        new_preds[join_idx] = pred_idx
+                        new_preds_list.append(new_preds)
+
+            if new_nodes_list:
+                paths_nodes = np.array(new_nodes_list, dtype=np.int32)
+                paths_preds = np.array(new_preds_list, dtype=np.int32)
+            else:
+                paths_nodes = np.zeros((0, max_nodes), dtype=np.int32)
+                paths_preds = np.zeros((0, num_edges), dtype=np.int32)
 
         else:
-            # Neither node in paths - cartesian product (should be rare with good join order)
+            # Neither node in paths - cartesian product
             if verbose:
                 print(f"\n    Warning: Cartesian product needed for edge '{edge_id}'")
 
-            for nodes_tuple, edges_tuple in partial_paths:
-                for subj_idx, predicate, obj_idx in edge_results[edge_id]:
-                    new_nodes = nodes_tuple + (
-                        (subj_qnode, subj_idx),
-                        (obj_qnode, obj_idx),
-                    )
-                    new_edges = edges_tuple + (
-                        (edge_id, subj_idx, predicate, obj_idx),
-                    )
-                    new_paths.append((new_nodes, new_edges))
+            # Assign columns for both nodes
+            if subj_qnode not in qnode_to_col:
+                qnode_to_col[subj_qnode] = num_node_cols
+                num_node_cols += 1
+            if obj_qnode not in qnode_to_col:
+                qnode_to_col[obj_qnode] = num_node_cols
+                num_node_cols += 1
+            subj_col = qnode_to_col[subj_qnode]
+            obj_col = qnode_to_col[obj_qnode]
 
-        partial_paths = new_paths
+            new_nodes_list = []
+            new_preds_list = []
+
+            for path_idx in range(len(paths_nodes)):
+                for subj_idx, predicate, obj_idx in edge_data:
+                    new_nodes = paths_nodes[path_idx].copy()
+                    new_nodes[subj_col] = subj_idx
+                    new_nodes[obj_col] = obj_idx
+                    new_nodes_list.append(new_nodes)
+                    new_preds = paths_preds[path_idx].copy()
+                    new_preds[join_idx] = get_pred_idx(predicate)
+                    new_preds_list.append(new_preds)
+
+            if new_nodes_list:
+                paths_nodes = np.array(new_nodes_list, dtype=np.int32)
+                paths_preds = np.array(new_preds_list, dtype=np.int32)
+            else:
+                paths_nodes = np.zeros((0, max_nodes), dtype=np.int32)
+                paths_preds = np.zeros((0, num_edges), dtype=np.int32)
 
         t_join_end = time.perf_counter()
         if verbose:
-            print(
-                f" -> {len(partial_paths):,} paths ({t_join_end - t_join_start:.2f}s)"
-            )
+            print(f" -> {len(paths_nodes):,} paths ({t_join_end - t_join_start:.2f}s)")
 
-        # Early termination if no paths remain
-        if len(partial_paths) == 0:
+        if len(paths_nodes) == 0:
             if verbose:
                 print(f"  No valid paths found after joining edge '{edge_id}'")
             break
@@ -887,17 +1122,19 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
     if verbose:
         print(f"  Path reconstruction took {t1 - t0:.2f}s")
 
-    # Build node property cache directly from tuple-based paths
+    num_paths = len(paths_nodes)
+    if num_paths == 0:
+        return []
+
+    # Build node property cache
     if verbose:
-        print(f"  Enriching {len(partial_paths):,} paths...")
+        print(f"  Enriching {num_paths:,} paths...")
 
     t_cache_start = time.perf_counter()
-    unique_node_indices = set()
-    for nodes_tuple, edges_tuple in partial_paths:
-        for qn, idx in nodes_tuple:
-            unique_node_indices.add(idx)
 
-    # Fetch properties for each unique node once
+    # Get unique node indices from numpy array (much faster than Python loops)
+    unique_node_indices = np.unique(paths_nodes[:, :num_node_cols])
+
     node_cache = {}
     for node_idx in unique_node_indices:
         node_cache[node_idx] = {
@@ -913,11 +1150,53 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
             f"({t_cache_end - t_cache_start:.2f}s)"
         )
 
-    # Enrich paths directly from tuples (no dict conversion needed)
-    enriched_paths = [
-        _enrich_path_from_tuples(query_graph, nodes_tuple, edges_tuple, node_cache)
-        for nodes_tuple, edges_tuple in partial_paths
-    ]
+    # Convert numpy arrays to enriched path format
+    t_enrich_start = time.perf_counter()
+
+    # Reverse mappings for output
+    col_to_qnode = {v: k for k, v in qnode_to_col.items()}
+    col_to_qedge = {v: k for k, v in qedge_to_col.items()}
+
+    # Disable GC during enrichment to prevent stochastic pauses
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+
+    try:
+        enriched_paths = []
+        for path_idx in range(num_paths):
+            nodes = {}
+            for col in range(num_node_cols):
+                qnode_id = col_to_qnode[col]
+                node_idx = paths_nodes[path_idx, col]
+                nodes[qnode_id] = node_cache[node_idx]
+
+            edges = {}
+            for col in range(num_edges):
+                qedge_id = col_to_qedge[col]
+                pred_idx = paths_preds[path_idx, col]
+                predicate = idx_to_predicate[pred_idx]
+
+                # Get subject and object from query graph structure
+                edge_def = query_graph["edges"][qedge_id]
+                subj_qnode = edge_def["subject"]
+                obj_qnode = edge_def["object"]
+                subj_col = qnode_to_col[subj_qnode]
+                obj_col = qnode_to_col[obj_qnode]
+
+                edges[qedge_id] = {
+                    "predicate": predicate,
+                    "subject": node_cache[paths_nodes[path_idx, subj_col]]["id"],
+                    "object": node_cache[paths_nodes[path_idx, obj_col]]["id"],
+                }
+
+            enriched_paths.append({"nodes": nodes, "edges": edges})
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+    t_enrich_end = time.perf_counter()
+    if verbose:
+        print(f"  Enrichment took {t_enrich_end - t_enrich_start:.2f}s")
 
     return enriched_paths
 
@@ -977,32 +1256,3 @@ def _compute_join_order(query_graph, edge_results, edge_order, verbose):
         nodes_in_path.add(edge_info["object"])
 
     return join_order
-
-
-def _enrich_path_from_tuples(query_graph, nodes_tuple, edges_tuple, node_cache):
-    """
-    Convert tuple-based path to enriched format with node/edge properties.
-
-    Args:
-        query_graph: Original query graph
-        nodes_tuple: ((qnode_id, node_idx), ...)
-        edges_tuple: ((qedge_id, subj_idx, predicate, obj_idx), ...)
-        node_cache: Dict mapping node_idx -> {id, category, name} for cached lookups
-
-    Returns:
-        Enriched path dictionary matching query graph structure
-    """
-    # Build nodes dict directly from tuple
-    nodes = {qnode_id: node_cache[node_idx] for qnode_id, node_idx in nodes_tuple}
-
-    # Build edges dict directly from tuple
-    edges = {
-        qedge_id: {
-            "predicate": predicate,
-            "subject": node_cache[subj_idx]["id"],
-            "object": node_cache[obj_idx]["id"],
-        }
-        for qedge_id, subj_idx, predicate, obj_idx in edges_tuple
-    }
-
-    return {"nodes": nodes, "edges": edges}
