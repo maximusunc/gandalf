@@ -30,8 +30,8 @@ class TestBuildGraphFromJsonl:
     def test_loads_correct_number_of_nodes(self, graph):
         """Should load all unique nodes from edges."""
         # Nodes in edges: CHEBI:6801, MONDO:0005148, NCBIGene:5468, NCBIGene:3643,
-        # HP:0001943, CHEBI:17234, GO:0006006, NCBIGene:2645
-        assert graph.num_nodes == 8
+        # HP:0001943, CHEBI:17234, GO:0006006, NCBIGene:2645, NCBIGene:7124 (TNF)
+        assert graph.num_nodes == 9
 
     def test_loads_edges(self, graph):
         """Should load edges into the graph."""
@@ -50,6 +50,7 @@ class TestBuildGraphFromJsonl:
             "CHEBI:17234",
             "GO:0006006",
             "NCBIGene:2645",
+            "NCBIGene:7124",  # TNF - added for qualifier constraint tests
         ]
         for node_id in expected_nodes:
             assert node_id in graph.node_id_to_idx
@@ -135,11 +136,15 @@ class TestGraphStructure:
         metformin_idx = graph.node_id_to_idx["CHEBI:6801"]
         neighbors = graph.neighbors(metformin_idx)
 
-        # Metformin should connect to: MONDO:0005148, NCBIGene:5468, CHEBI:17234
+        # Metformin should connect to: MONDO:0005148, NCBIGene:5468, CHEBI:17234,
+        # NCBIGene:3643 (INSR), NCBIGene:2645 (GCK), NCBIGene:7124 (TNF)
         neighbor_ids = {graph.idx_to_node_id[int(n)] for n in neighbors}
         assert "MONDO:0005148" in neighbor_ids
         assert "NCBIGene:5468" in neighbor_ids
         assert "CHEBI:17234" in neighbor_ids
+        assert "NCBIGene:3643" in neighbor_ids  # INSR - qualifier test edge
+        assert "NCBIGene:2645" in neighbor_ids  # GCK - qualifier test edge
+        assert "NCBIGene:7124" in neighbor_ids  # TNF - qualifier test edge
 
     def test_neighbors_with_predicate_filter(self, graph):
         """Should filter neighbors by predicate."""
@@ -155,8 +160,14 @@ class TestGraphStructure:
         """Should correctly calculate node degree."""
         metformin_idx = graph.node_id_to_idx["CHEBI:6801"]
         degree = graph.degree(metformin_idx)
-        # Metformin has 3 outgoing edges (treats, affects x2)
-        assert degree == 5
+        # Metformin has 8 outgoing edges:
+        # - treats, ameliorates, preventative (to MONDO:0005148)
+        # - affects NCBIGene:5468 (PPARG)
+        # - affects CHEBI:17234 (Glucose)
+        # - affects NCBIGene:3643 (INSR) with qualifiers
+        # - affects NCBIGene:2645 (GCK) with qualifiers
+        # - affects NCBIGene:7124 (TNF) with qualifiers
+        assert degree == 8
 
     def test_degree_with_predicate_filter(self, graph):
         """Should correctly calculate filtered degree."""
@@ -169,7 +180,8 @@ class TestGraphStructure:
         metformin_idx = graph.node_id_to_idx["CHEBI:6801"]
         edges = graph.get_edges(metformin_idx)
 
-        assert len(edges) == 5
+        # Metformin has 8 outgoing edges (including qualifier test edges)
+        assert len(edges) == 8
         for neighbor_idx, predicate in edges:
             assert isinstance(neighbor_idx, int)
             assert isinstance(predicate, str)
@@ -207,7 +219,8 @@ class TestGraphSaveLoad:
 
             metformin_idx = loaded_graph.node_id_to_idx["CHEBI:6801"]
             neighbors = loaded_graph.neighbors(metformin_idx)
-            assert len(neighbors) == 5
+            # Metformin has 8 outgoing edges (including qualifier test edges)
+            assert len(neighbors) == 8
         finally:
             os.unlink(temp_path)
 

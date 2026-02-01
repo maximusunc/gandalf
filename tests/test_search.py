@@ -86,10 +86,11 @@ class TestLookupOneHop:
         response = lookup(graph, query, verbose=False)
         results = response["message"]["results"]
 
-        # CHEBI:6801 (Metformin) affects NCBIGene:5468 (PPARG)
-        # Should return 1 path to a Gene
-        assert len(results) == 1
-        assert results[0]["node_bindings"]["n1"][0]["id"] == "NCBIGene:5468"
+        # CHEBI:6801 (Metformin) affects 4 genes:
+        # NCBIGene:5468 (PPARG), NCBIGene:3643 (INSR), NCBIGene:2645 (GCK), NCBIGene:7124 (TNF)
+        assert len(results) == 4
+        gene_ids = {r["node_bindings"]["n1"][0]["id"] for r in results}
+        assert gene_ids == {"NCBIGene:5468", "NCBIGene:3643", "NCBIGene:2645", "NCBIGene:7124"}
 
     def test_one_hop_no_matching_predicate(self, graph):
         """Query with non-matching predicate should return 0 paths."""
@@ -180,11 +181,17 @@ class TestLookupTwoHop:
         response = lookup(graph, query, verbose=False)
         results = response["message"]["results"]
 
-        # Path: CHEBI:6801 --affects--> NCBIGene:5468 --gene_associated--> MONDO:0005148
-        assert len(results) == 1
-        assert results[0]["node_bindings"]["n0"][0]["id"] == "CHEBI:6801"
-        assert results[0]["node_bindings"]["n1"][0]["id"] == "NCBIGene:5468"
-        assert results[0]["node_bindings"]["n2"][0]["id"] == "MONDO:0005148"
+        # Three paths from Metformin through genes to Type 2 Diabetes:
+        # CHEBI:6801 --affects--> NCBIGene:5468 (PPARG) --gene_associated--> MONDO:0005148
+        # CHEBI:6801 --affects--> NCBIGene:3643 (INSR) --gene_associated--> MONDO:0005148
+        # CHEBI:6801 --affects--> NCBIGene:2645 (GCK) --gene_associated--> MONDO:0005148
+        assert len(results) == 3
+        gene_ids = {r["node_bindings"]["n1"][0]["id"] for r in results}
+        assert gene_ids == {"NCBIGene:5468", "NCBIGene:3643", "NCBIGene:2645"}
+        # All paths should start with Metformin and end with Type 2 Diabetes
+        for result in results:
+            assert result["node_bindings"]["n0"][0]["id"] == "CHEBI:6801"
+            assert result["node_bindings"]["n2"][0]["id"] == "MONDO:0005148"
 
     def test_two_hop_multiple_intermediate_nodes(self, graph):
         """Two-hop query with multiple valid intermediate nodes."""
