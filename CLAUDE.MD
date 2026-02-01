@@ -13,12 +13,17 @@ GANDALF (Graph Analysis Navigator for Discovery And Link Finding) is a Python li
 - **pytest** - Testing framework
 - **black** - Code formatting
 
+## Installation
+```bash
+pip install -r requirements.txt
+pip install -r requirements-dev.txt
+# Install (development mode)
+pip install -e .
+```
+
 ## Quick Commands
 
 ```bash
-# Install (development mode)
-pip install -e .
-
 # Build graph from JSONL
 gandalf-build --edges data/edges.jsonl --nodes data/nodes.jsonl --output graph.pkl
 
