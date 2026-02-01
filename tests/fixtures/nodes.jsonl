@@ -6,3 +6,4 @@
 {"id": "CHEBI:17234", "name": "Glucose", "category": ["biolink:SmallMolecule", "biolink:ChemicalEntity"], "equivalent_identifiers": ["CHEBI:17234"], "information_content": 70.1}
 {"id": "GO:0006006", "name": "Glucose metabolic process", "category": ["biolink:BiologicalProcess"], "equivalent_identifiers": ["GO:0006006"], "information_content": 55.8}
 {"id": "NCBIGene:2645", "name": "GCK", "category": ["biolink:Gene", "biolink:GeneOrGeneProduct"], "equivalent_identifiers": ["NCBIGene:2645", "HGNC:4195"], "information_content": 81.2}
+{"id": "NCBIGene:7124", "name": "TNF", "category": ["biolink:Gene", "biolink:GeneOrGeneProduct"], "equivalent_identifiers": ["NCBIGene:7124", "HGNC:11892"], "information_content": 94.5}

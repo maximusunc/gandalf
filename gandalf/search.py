@@ -14,6 +14,59 @@ from gandalf.graph import CSRGraph
 from gandalf.query_planner import get_next_qedge, remove_orphaned
 
 
+def _edge_matches_qualifier_constraints(edge_qualifiers, qualifier_constraints):
+    """
+    Check if an edge's qualifiers match the query's qualifier constraints.
+
+    Qualifier constraints use OR semantics between qualifier_sets and AND semantics
+    within each qualifier_set. An edge matches if it satisfies at least one
+    qualifier_set (i.e., has ALL qualifiers in that set).
+
+    Args:
+        edge_qualifiers: List of qualifier dicts from the edge, each with
+                        'qualifier_type_id' and 'qualifier_value'
+        qualifier_constraints: List of constraint dicts from the query, each with
+                              a 'qualifier_set' containing qualifiers to match
+
+    Returns:
+        True if the edge matches at least one qualifier_set, False otherwise.
+        Returns True if qualifier_constraints is None or empty.
+    """
+    # No constraints means all edges match
+    if not qualifier_constraints:
+        return True
+
+    # Build a set of (type_id, value) tuples from edge qualifiers for fast lookup
+    edge_qualifier_set = set()
+    if edge_qualifiers:
+        for q in edge_qualifiers:
+            type_id = q.get("qualifier_type_id")
+            value = q.get("qualifier_value")
+            if type_id and value:
+                edge_qualifier_set.add((type_id, value))
+
+    # Check if edge satisfies at least one qualifier_set (OR semantics)
+    for constraint in qualifier_constraints:
+        qualifier_set = constraint.get("qualifier_set", [])
+        if not qualifier_set:
+            # Empty qualifier_set matches any edge
+            return True
+
+        # Check if edge has ALL qualifiers in this set (AND semantics)
+        all_match = True
+        for required_qualifier in qualifier_set:
+            req_type = required_qualifier.get("qualifier_type_id")
+            req_value = required_qualifier.get("qualifier_value")
+            if (req_type, req_value) not in edge_qualifier_set:
+                all_match = False
+                break
+
+        if all_match:
+            return True
+
+    return False
+
+
 class GCMonitor:
     """Monitor garbage collection events and log timing information."""
 
@@ -554,6 +607,9 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
         ]
         # allowed_predicates = next_edge["predicates"]
 
+        # Get qualifier constraints for this edge
+        qualifier_constraints = next_edge.get("qualifier_constraints", [])
+
         # Query for matching edges
         edge_matches = _query_edge(
             graph,
@@ -562,6 +618,7 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
             start_node.get("categories", []),
             end_node.get("categories", []),
             allowed_predicates,
+            qualifier_constraints,
             verbose,
         )
 
@@ -727,10 +784,21 @@ def _query_edge(
     start_categories,
     end_categories,
     allowed_predicates,
+    qualifier_constraints,
     verbose,
 ):
     """
     Query for a single edge with given constraints.
+
+    Args:
+        graph: CSRGraph instance
+        start_idxes: List of pinned start node indices, or None if unpinned
+        end_idxes: List of pinned end node indices, or None if unpinned
+        start_categories: List of allowed categories for start node
+        end_categories: List of allowed categories for end node
+        allowed_predicates: List of allowed predicate strings
+        qualifier_constraints: List of qualifier constraint dicts from query
+        verbose: Print progress information
 
     Returns:
         List of (subject_idx, predicate, object_idx) tuples
@@ -751,7 +819,7 @@ def _query_edge(
             t_node_start = time.perf_counter()
             node_neighbors = 0
 
-            for obj_idx, predicate, _ in graph.neighbors_with_properties(start_idx):
+            for obj_idx, predicate, props in graph.neighbors_with_properties(start_idx):
                 node_neighbors += 1
                 # Check predicate
                 if allowed_predicates and predicate not in allowed_predicates:
@@ -761,6 +829,14 @@ def _query_edge(
                 if end_categories:
                     obj_cats = graph.get_node_property(obj_idx, "category", [])
                     if not any(cat in obj_cats for cat in end_categories):
+                        continue
+
+                # Check qualifier constraints
+                if qualifier_constraints:
+                    edge_qualifiers = props.get("qualifiers", [])
+                    if not _edge_matches_qualifier_constraints(
+                        edge_qualifiers, qualifier_constraints
+                    ):
                         continue
 
                 matches.append((start_idx, predicate, obj_idx))
@@ -795,7 +871,7 @@ def _query_edge(
             t_node_start = time.perf_counter()
             node_neighbors = 0
 
-            for subj_idx, predicate, _ in graph.incoming_neighbors_with_properties(
+            for subj_idx, predicate, props in graph.incoming_neighbors_with_properties(
                 end_idx
             ):
                 node_neighbors += 1
@@ -807,6 +883,14 @@ def _query_edge(
                 if start_categories:
                     subj_cats = graph.get_node_property(subj_idx, "category", [])
                     if not any(cat in subj_cats for cat in start_categories):
+                        continue
+
+                # Check qualifier constraints
+                if qualifier_constraints:
+                    edge_qualifiers = props.get("qualifiers", [])
+                    if not _edge_matches_qualifier_constraints(
+                        edge_qualifiers, qualifier_constraints
+                    ):
                         continue
 
                 matches.append((subj_idx, predicate, end_idx))
@@ -834,17 +918,18 @@ def _query_edge(
 
         t0 = time.perf_counter()
 
-        # Build forward edges with predicates
-        forward_edges = defaultdict(list)  # obj_idx -> [(subj_idx, predicate), ...]
+        # Build forward edges with predicates and props for qualifier checking
+        # obj_idx -> [(subj_idx, predicate, props), ...]
+        forward_edges = defaultdict(list)
 
         t_neighbors_start = time.perf_counter()
         total_neighbors = 0
         for start_idx in start_idxes:
-            for obj_idx, predicate, _ in graph.neighbors_with_properties(start_idx):
+            for obj_idx, predicate, props in graph.neighbors_with_properties(start_idx):
                 total_neighbors += 1
                 if allowed_predicates and predicate not in allowed_predicates:
                     continue
-                forward_edges[obj_idx].append((start_idx, predicate))
+                forward_edges[obj_idx].append((start_idx, predicate, props))
 
         t_neighbors_end = time.perf_counter()
         if verbose:
@@ -857,7 +942,14 @@ def _query_edge(
 
         for obj_idx in forward_edges.keys():
             if obj_idx in end_set:
-                for subj_idx, predicate in forward_edges[obj_idx]:
+                for subj_idx, predicate, props in forward_edges[obj_idx]:
+                    # Check qualifier constraints
+                    if qualifier_constraints:
+                        edge_qualifiers = props.get("qualifiers", [])
+                        if not _edge_matches_qualifier_constraints(
+                            edge_qualifiers, qualifier_constraints
+                        ):
+                            continue
                     matches.append((subj_idx, predicate, obj_idx))
 
         t1 = time.perf_counter()
