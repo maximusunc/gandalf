@@ -1229,11 +1229,13 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
 
     node_cache = {}
     for node_idx in unique_node_indices:
-        node_cache[node_idx] = {
-            "id": graph.get_node_id(node_idx),
-            "category": graph.get_node_property(node_idx, "category", []),
-            "name": graph.get_node_property(node_idx, "name"),
-        }
+        # Start with all stored node properties
+        node_props = graph.get_all_node_properties(node_idx).copy()
+        # Ensure required fields are present
+        node_props["id"] = graph.get_node_id(node_idx)
+        if "category" not in node_props:
+            node_props["category"] = []
+        node_cache[node_idx] = node_props
 
     t_cache_end = time.perf_counter()
     if verbose:
@@ -1275,11 +1277,20 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
                 subj_col = qnode_to_col[subj_qnode]
                 obj_col = qnode_to_col[obj_qnode]
 
-                edges[qedge_id] = {
-                    "predicate": predicate,
-                    "subject": node_cache[paths_nodes[path_idx, subj_col]]["id"],
-                    "object": node_cache[paths_nodes[path_idx, obj_col]]["id"],
-                }
+                subj_idx = paths_nodes[path_idx, subj_col]
+                obj_idx = paths_nodes[path_idx, obj_col]
+
+                # Get all edge properties
+                edge_props = graph.get_all_edge_properties(
+                    int(subj_idx), int(obj_idx), predicate
+                ).copy()
+
+                # Ensure required fields are present
+                edge_props["predicate"] = predicate
+                edge_props["subject"] = node_cache[subj_idx]["id"]
+                edge_props["object"] = node_cache[obj_idx]["id"]
+
+                edges[qedge_id] = edge_props
 
             enriched_paths.append({"nodes": nodes, "edges": edges})
     finally:
