@@ -827,7 +827,7 @@ def _query_edge(
 
                 # Check object categories
                 if end_categories:
-                    obj_cats = graph.get_node_property(obj_idx, "category", [])
+                    obj_cats = graph.get_node_property(obj_idx, "categories", [])
                     if not any(cat in obj_cats for cat in end_categories):
                         continue
 
@@ -881,7 +881,7 @@ def _query_edge(
 
                 # Check subject categories
                 if start_categories:
-                    subj_cats = graph.get_node_property(subj_idx, "category", [])
+                    subj_cats = graph.get_node_property(subj_idx, "categories", [])
                     if not any(cat in subj_cats for cat in start_categories):
                         continue
 
@@ -1233,8 +1233,10 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
         node_props = graph.get_all_node_properties(node_idx).copy()
         # Ensure required fields are present
         node_props["id"] = graph.get_node_id(node_idx)
-        if "category" not in node_props:
-            node_props["category"] = []
+        if "categories" not in node_props:
+            node_props["categories"] = []
+        if "attributes" not in node_props:
+            node_props["attributes"] = []
         node_cache[node_idx] = node_props
 
     t_cache_end = time.perf_counter()
