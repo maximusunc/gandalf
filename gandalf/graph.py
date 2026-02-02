@@ -302,6 +302,27 @@ class CSRGraph:
             return default
         return self.edge_properties[edge_idx].get(key, default)
 
+    def get_all_edge_properties(self, src_idx, dst_idx, predicate):
+        """
+        Get all properties for an edge - O(1) lookup
+
+        Args:
+            src_idx: Source node index
+            dst_idx: Destination node index
+            predicate: Predicate string
+
+        Returns:
+            Dict of all edge properties, or empty dict if edge not found
+        """
+        pred_id = self.predicate_to_idx.get(predicate)
+        if pred_id is None:
+            return {}
+
+        edge_idx = self.edge_prop_index.get((src_idx, dst_idx, pred_id))
+        if edge_idx is None:
+            return {}
+        return self.edge_properties[edge_idx]
+
     def get_all_edges_between(self, src_idx, dst_idx, predicate_filter: Optional[list] = None):
         """
         Get all edges (with different predicates) between two nodes
@@ -336,6 +357,10 @@ class CSRGraph:
     def get_node_property(self, node_idx, key, default=None):
         """Get a specific property for a node"""
         return self.node_properties.get(node_idx, {}).get(key, default)
+
+    def get_all_node_properties(self, node_idx):
+        """Get all properties for a node as a dict"""
+        return self.node_properties.get(node_idx, {})
 
     def degree(self, node_idx, predicate_filter=None):
         """

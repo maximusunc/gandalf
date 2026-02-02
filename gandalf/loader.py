@@ -55,7 +55,7 @@ def build_graph_from_jsonl(
             # Store edge with its properties
             edge_props = {
                 "predicate": predicate,
-                "category": data.get("category", []),
+                # "category": data.get("category", []),
                 "publications": data.get("publications", []),
                 "sources": [
                    {
@@ -63,10 +63,10 @@ def build_graph_from_jsonl(
                        "resource_id": data.get("primary_knowledge_source", "infores:gandalf"),
                    },
                 ],
-                "knowledge_level": data.get("knowledge_level", ""),
-                "agent_type": data.get("agent_type", ""),
-                "original_subject": data.get("original_subject", ""),
-                "original_object": data.get("original_object", ""),
+                # "knowledge_level": data.get("knowledge_level", ""),
+                # "agent_type": data.get("agent_type", ""),
+                # "original_subject": data.get("original_subject", ""),
+                # "original_object": data.get("original_object", ""),
                 "qualifiers": data.get("qualifiers", []),
             }
 
@@ -87,7 +87,7 @@ def build_graph_from_jsonl(
                 if node_id:
                     node_props_by_id[node_id] = {
                         "id": node_data.get("id", ""),
-                        "category": node_data.get("category", []),
+                        "categories": node_data.get("category", []),
                         "name": node_data.get("name", None),
                         "equivalent_identifiers": node_data.get("equivalent_identifiers", []),
                         "information_content": node_data.get("information_content", 0.0),

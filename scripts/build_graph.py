@@ -62,7 +62,7 @@ Examples:
 
         # Save graph
         print(f"\nSaving graph to {args.output}")
-        graph.save(str(args.output))
+        graph.save_mmap(str(args.output))
 
         print("\n✓ Graph built successfully!")
         # print(f"  Nodes: {graph.num_nodes:,}")

@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
+from bmt.toolkit import Toolkit
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import (
@@ -16,9 +17,10 @@ from starlette.responses import HTMLResponse
 from gandalf import CSRGraph, lookup
 
 GRAPH = None
+BMT = None
 
 # Configuration via environment variables
-GRAPH_PATH = os.environ.get("GANDALF_GRAPH_PATH", "../12_17_2025/gandalf_12_17_2025.pkl")
+GRAPH_PATH = os.environ.get("GANDALF_GRAPH_PATH", "../12_17_2025/gandalf_mmap")
 GRAPH_FORMAT = os.environ.get("GANDALF_GRAPH_FORMAT", "auto")  # "auto", "pickle", or "mmap"
 
 
@@ -54,12 +56,16 @@ def load_graph(path: str, format: str = "auto") -> CSRGraph:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Handle graph loading on startup."""
-    global GRAPH
+    """Handle graph and BMT loading on startup."""
+    global GRAPH, BMT
     print(f"Loading graph from {GRAPH_PATH} (format={GRAPH_FORMAT})...")
     GRAPH = load_graph(GRAPH_PATH, GRAPH_FORMAT)
+    print("Initializing Biolink Model Toolkit...")
+    BMT = Toolkit()
+    print("Server ready!")
     yield
     GRAPH = None
+    BMT = None
 
 
 APP = FastAPI(
@@ -94,14 +100,14 @@ async def custom_swagger_ui_html(req: Request) -> HTMLResponse:
 @APP.post("/query")
 def sync_lookup(request: dict):
     """Do a lookup."""
-    response = lookup(GRAPH, request)
+    response = lookup(GRAPH, request, bmt=BMT)
 
     return response
 
 
 def async_lookup(callback_url: str, query: dict):
     """Do an async lookup."""
-    response = lookup(GRAPH, query)
+    response = lookup(GRAPH, query, bmt=BMT)
 
     try:
         with httpx.Client(
