@@ -20,7 +20,7 @@ GRAPH = None
 BMT = None
 
 # Configuration via environment variables
-GRAPH_PATH = os.environ.get("GANDALF_GRAPH_PATH", "../12_17_2025/gandalf_12_17_2025.pkl")
+GRAPH_PATH = os.environ.get("GANDALF_GRAPH_PATH", "../12_17_2025/gandalf_mmap")
 GRAPH_FORMAT = os.environ.get("GANDALF_GRAPH_FORMAT", "auto")  # "auto", "pickle", or "mmap"
 
 
