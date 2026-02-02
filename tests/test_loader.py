@@ -225,6 +225,104 @@ class TestGraphSaveLoad:
             os.unlink(temp_path)
 
 
+class TestGraphMmapSaveLoad:
+    """Tests for memory-mapped graph serialization."""
+
+    def test_save_mmap_creates_directory(self, graph):
+        """Should create directory with expected files."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            graph.save_mmap(temp_dir)
+
+            # Check all expected files exist
+            expected_files = [
+                "fwd_targets.npy",
+                "fwd_predicates.npy",
+                "fwd_offsets.npy",
+                "rev_sources.npy",
+                "rev_predicates.npy",
+                "rev_offsets.npy",
+                "metadata.pkl",
+                "edge_properties.pkl",
+            ]
+            for filename in expected_files:
+                assert os.path.exists(os.path.join(temp_dir, filename)), f"Missing {filename}"
+
+    def test_mmap_save_and_load_roundtrip(self, graph):
+        """Should correctly save and load graph in mmap format."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            graph.save_mmap(temp_dir)
+            loaded_graph = CSRGraph.load_mmap(temp_dir)
+
+            # Verify key attributes match
+            assert loaded_graph.num_nodes == graph.num_nodes
+            assert len(loaded_graph.fwd_targets) == len(graph.fwd_targets)
+            assert loaded_graph.node_id_to_idx == graph.node_id_to_idx
+            assert loaded_graph.predicate_to_idx == graph.predicate_to_idx
+
+    def test_mmap_loaded_graph_neighbors_work(self, graph):
+        """Should be able to query neighbors after mmap load."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            graph.save_mmap(temp_dir)
+            loaded_graph = CSRGraph.load_mmap(temp_dir)
+
+            metformin_idx = loaded_graph.node_id_to_idx["CHEBI:6801"]
+            neighbors = loaded_graph.neighbors(metformin_idx)
+            # Metformin has 8 outgoing edges (including qualifier test edges)
+            assert len(neighbors) == 8
+
+    def test_mmap_loaded_graph_edge_properties(self, graph):
+        """Should correctly load edge properties in mmap format."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            graph.save_mmap(temp_dir)
+            loaded_graph = CSRGraph.load_mmap(temp_dir)
+
+            # Test edge property lookup
+            src_idx = loaded_graph.node_id_to_idx["CHEBI:6801"]
+            dst_idx = loaded_graph.node_id_to_idx["MONDO:0005148"]
+            predicate = loaded_graph.get_edge_property(
+                src_idx, dst_idx, "biolink:treats", "predicate"
+            )
+            assert predicate == "biolink:treats"
+
+    def test_mmap_loaded_graph_node_properties(self, graph):
+        """Should correctly load node properties in mmap format."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            graph.save_mmap(temp_dir)
+            loaded_graph = CSRGraph.load_mmap(temp_dir)
+
+            metformin_idx = loaded_graph.node_id_to_idx["CHEBI:6801"]
+            name = loaded_graph.get_node_property(metformin_idx, "name")
+            assert name == "Metformin"
+
+    def test_mmap_loaded_graph_qualifiers(self, graph):
+        """Should correctly load edge qualifiers in mmap format."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            graph.save_mmap(temp_dir)
+            loaded_graph = CSRGraph.load_mmap(temp_dir)
+
+            # Check an edge with qualifiers
+            metformin_idx = loaded_graph.node_id_to_idx["CHEBI:6801"]
+            insr_idx = loaded_graph.node_id_to_idx["NCBIGene:3643"]
+
+            qualifiers = loaded_graph.get_edge_property(
+                metformin_idx, insr_idx, "biolink:affects", "qualifiers"
+            )
+            assert qualifiers is not None
+            assert len(qualifiers) == 2
+
+    def test_mmap_with_no_mmap_mode(self, graph):
+        """Should load fully into memory when mmap_mode=None."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            graph.save_mmap(temp_dir)
+            loaded_graph = CSRGraph.load_mmap(temp_dir, mmap_mode=None)
+
+            # Verify it still works
+            assert loaded_graph.num_nodes == graph.num_nodes
+            metformin_idx = loaded_graph.node_id_to_idx["CHEBI:6801"]
+            neighbors = loaded_graph.neighbors(metformin_idx)
+            assert len(neighbors) == 8
+
+
 class TestEdgeCases:
     """Tests for edge cases and error handling."""
 

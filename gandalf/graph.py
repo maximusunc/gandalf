@@ -1,8 +1,10 @@
 """Main Gandalf CSR Graph class."""
 
+import os
 import pickle
 import time
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 
 import numpy as np
 
@@ -442,4 +444,134 @@ class CSRGraph:
             f"Graph loaded! {graph.num_nodes:,} nodes, {len(graph.fwd_targets):,} edges"
         )
         print(f"  Unique predicates: {len(graph.predicate_to_idx):,}")
+        return graph
+
+    def save_mmap(self, directory: Union[str, Path]):
+        """
+        Save graph in memory-mappable format for fast loading.
+
+        Creates a directory with separate files:
+        - NumPy arrays as .npy files (can be memory-mapped)
+        - Metadata dictionaries as pickle
+        - Edge properties as separate pickle (large, but shared via copy-on-write)
+
+        Args:
+            directory: Directory path to save graph files
+        """
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+
+        print(f"Saving graph to {directory} (mmap format)...")
+        t0 = time.perf_counter()
+
+        # Save NumPy arrays as .npy files (memory-mappable)
+        np.save(directory / "fwd_targets.npy", self.fwd_targets)
+        np.save(directory / "fwd_predicates.npy", self.fwd_predicates)
+        np.save(directory / "fwd_offsets.npy", self.fwd_offsets)
+        np.save(directory / "rev_sources.npy", self.rev_sources)
+        np.save(directory / "rev_predicates.npy", self.rev_predicates)
+        np.save(directory / "rev_offsets.npy", self.rev_offsets)
+
+        # Save small metadata as pickle
+        metadata = {
+            "num_nodes": self.num_nodes,
+            "node_id_to_idx": self.node_id_to_idx,
+            "predicate_to_idx": self.predicate_to_idx,
+            "node_properties": self.node_properties,
+            "edge_prop_index": self.edge_prop_index,
+        }
+        with open(directory / "metadata.pkl", "wb") as f:
+            pickle.dump(metadata, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        # Save edge properties separately (large file, shared via copy-on-write)
+        with open(directory / "edge_properties.pkl", "wb") as f:
+            pickle.dump(self.edge_properties, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        t1 = time.perf_counter()
+        print(f"Graph saved in {t1 - t0:.2f}s")
+
+        # Print file sizes
+        total_size = 0
+        for f in directory.iterdir():
+            size = f.stat().st_size
+            total_size += size
+            print(f"  {f.name}: {size / 1024 / 1024:.1f} MB")
+        print(f"  Total: {total_size / 1024 / 1024:.1f} MB")
+
+    @staticmethod
+    def load_mmap(directory: Union[str, Path], mmap_mode: str = "r"):
+        """
+        Load graph from memory-mapped format.
+
+        This provides near-instant startup by memory-mapping the large NumPy arrays.
+        The OS will page in data on demand, and multiple processes can share
+        the same memory pages (great for multi-worker FastAPI).
+
+        Args:
+            directory: Directory containing graph files
+            mmap_mode: Memory-map mode for NumPy arrays:
+                - 'r': Read-only (default, recommended for serving)
+                - 'r+': Read-write (allows modification)
+                - 'c': Copy-on-write (modifications are private)
+                - None: Load fully into memory (no mmap)
+
+        Returns:
+            CSRGraph instance with memory-mapped arrays
+        """
+        directory = Path(directory)
+        print(f"Loading graph from {directory} (mmap_mode={mmap_mode})...")
+        t0 = time.perf_counter()
+
+        graph = CSRGraph.__new__(CSRGraph)
+
+        # Load NumPy arrays with memory mapping
+        graph.fwd_targets = np.load(
+            directory / "fwd_targets.npy", mmap_mode=mmap_mode
+        )
+        graph.fwd_predicates = np.load(
+            directory / "fwd_predicates.npy", mmap_mode=mmap_mode
+        )
+        graph.fwd_offsets = np.load(
+            directory / "fwd_offsets.npy", mmap_mode=mmap_mode
+        )
+        graph.rev_sources = np.load(
+            directory / "rev_sources.npy", mmap_mode=mmap_mode
+        )
+        graph.rev_predicates = np.load(
+            directory / "rev_predicates.npy", mmap_mode=mmap_mode
+        )
+        graph.rev_offsets = np.load(
+            directory / "rev_offsets.npy", mmap_mode=mmap_mode
+        )
+
+        # Load metadata
+        with open(directory / "metadata.pkl", "rb") as f:
+            metadata = pickle.load(f)
+
+        graph.num_nodes = metadata["num_nodes"]
+        graph.node_id_to_idx = metadata["node_id_to_idx"]
+        graph.idx_to_node_id = {idx: nid for nid, idx in graph.node_id_to_idx.items()}
+        graph.predicate_to_idx = metadata["predicate_to_idx"]
+        graph.id_to_predicate = {
+            idx: pred for pred, idx in graph.predicate_to_idx.items()
+        }
+        graph.node_properties = metadata["node_properties"]
+        graph.edge_prop_index = metadata.get("edge_prop_index", {})
+
+        # Load edge properties (large, but will be shared via fork)
+        t_props_start = time.perf_counter()
+        with open(directory / "edge_properties.pkl", "rb") as f:
+            graph.edge_properties = pickle.load(f)
+        t_props_end = time.perf_counter()
+
+        t1 = time.perf_counter()
+        print(
+            f"Graph loaded in {t1 - t0:.2f}s "
+            f"(edge_properties: {t_props_end - t_props_start:.2f}s)"
+        )
+        print(
+            f"  {graph.num_nodes:,} nodes, {len(graph.fwd_targets):,} edges, "
+            f"{len(graph.predicate_to_idx):,} predicates"
+        )
+
         return graph

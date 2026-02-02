@@ -1,6 +1,8 @@
 """GANDALF."""
 
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -15,12 +17,47 @@ from gandalf import CSRGraph, lookup
 
 GRAPH = None
 
+# Configuration via environment variables
+GRAPH_PATH = os.environ.get("GANDALF_GRAPH_PATH", "../12_17_2025/gandalf_12_17_2025.pkl")
+GRAPH_FORMAT = os.environ.get("GANDALF_GRAPH_FORMAT", "auto")  # "auto", "pickle", or "mmap"
+
+
+def load_graph(path: str, format: str = "auto") -> CSRGraph:
+    """
+    Load graph from disk.
+
+    Args:
+        path: Path to graph file (pickle) or directory (mmap)
+        format: "auto" (detect from path), "pickle", or "mmap"
+
+    Returns:
+        Loaded CSRGraph
+    """
+    path = Path(path)
+
+    # Auto-detect format
+    if format == "auto":
+        if path.is_dir():
+            format = "mmap"
+        elif path.suffix == ".pkl":
+            format = "pickle"
+        else:
+            raise ValueError(f"Cannot auto-detect format for: {path}")
+
+    if format == "mmap":
+        return CSRGraph.load_mmap(path)
+    elif format == "pickle":
+        return CSRGraph.load(path)
+    else:
+        raise ValueError(f"Unknown format: {format}")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Handle db connection."""
+    """Handle graph loading on startup."""
     global GRAPH
-    GRAPH = CSRGraph.load("../12_17_2025/gandalf_12_17_2025.pkl")
+    print(f"Loading graph from {GRAPH_PATH} (format={GRAPH_FORMAT})...")
+    GRAPH = load_graph(GRAPH_PATH, GRAPH_FORMAT)
     yield
     GRAPH = None
 
