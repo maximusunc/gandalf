@@ -1,6 +1,6 @@
 # Predicate Handling in Gandalf
 
-This document describes how predicates are processed and matched during query execution in Gandalf's search system.
+This document describes how predicates are processed and matched during query execution in Gandalf's search system. The implementation follows the same rules as the [reasoner-transpiler](https://github.com/ranking-agent/reasoner-transpiler) tool used for Neo4j-based Translator knowledge graphs.
 
 ## Overview
 
@@ -11,114 +11,90 @@ Gandalf handles predicates at **query time** rather than load time. This means:
 
 ## Predicate Processing Pipeline
 
-### 1. Descendant Expansion
+### 1. Special Handling for `related_to`
 
-**Location**: `search.py` in `lookup()` function
-
-**Rule**: For each predicate specified in the query, expand it to include all BMT descendants.
+**Rule**: If `biolink:related_to` is in the query predicates, treat it as "any predicate" (empty predicate list allows all matches).
 
 ```python
-allowed_predicates = [
-    predicate
-    for edge_predicate in next_edge["predicates"]
-    if bmt.get_element(edge_predicate) is not None
-    for predicate in bmt.get_descendants(edge_predicate, formatted=True)
+if 'biolink:related_to' in predicates:
+    return [], []  # No filtering, match any predicate
+```
+
+This is because `related_to` is the root of the predicate hierarchy, so querying for it is equivalent to querying for all predicates.
+
+### 2. Inverse Predicate Collection
+
+**Rule**: For each query predicate, collect its inverse and add symmetric predicates to the inverse list.
+
+```python
+inverse_preds = []
+for pred in predicates:
+    # Get explicit inverse (e.g., treats -> treated_by)
+    inverse = get_inverse(pred)
+    if inverse:
+        inverse_preds.append(inverse)
+    # Symmetric predicates are their own inverse
+    if is_symmetric(pred):
+        inverse_preds.append(pred)
+```
+
+**Example**:
+
+| Query Predicate | Inverses Collected |
+|-----------------|-------------------|
+| `biolink:treats` | `biolink:treated_by` |
+| `biolink:interacts_with` | `biolink:interacts_with` (symmetric) |
+| `biolink:expresses` | `biolink:expressed_in` |
+
+### 3. Descendant Expansion with Filtering
+
+**Rule**: Expand both forward predicates and inverse predicates to their descendants, but **only keep predicates that are canonical OR symmetric**.
+
+```python
+# Filter: only include if canonical_predicate annotation is True OR symmetric is True
+def is_canonical_or_symmetric(pred):
+    element = bmt.get_element(pred)
+    is_canonical = element.annotations.get('canonical_predicate', False)
+    is_symmetric = element.symmetric
+    return is_canonical or is_symmetric
+
+# Expand and filter
+forward_predicates = [
+    descendant
+    for pred in query_predicates
+    for descendant in bmt.get_descendants(pred)
+    if is_canonical_or_symmetric(descendant)
+]
+
+inverse_predicates = [
+    descendant
+    for pred in inverse_preds
+    for descendant in bmt.get_descendants(pred)
+    if is_canonical_or_symmetric(descendant)
 ]
 ```
 
-**Example**:
+**Why filter to canonical/symmetric?**
+- Canonical predicates represent the "preferred" direction for a relationship
+- Symmetric predicates are valid in both directions
+- Non-canonical, non-symmetric predicates should not be matched directly (they should be found via their canonical inverse)
 
-| Query Predicate | Expanded To Include |
-|-----------------|---------------------|
-| `biolink:related_to` | All predicates (root of hierarchy) |
-| `biolink:affects` | `affects`, `regulates`, `disrupts`, `positively_regulates`, `negatively_regulates`, etc. |
-| `biolink:treats` | `treats` (plus any descendants) |
+### 4. Edge Matching
 
-### 2. Reverse Predicate Map Construction
-
-**Location**: `search.py` in `_query_edge()` function
-
-**Rule**: Build a mapping from predicates that might be found in the reverse direction to the predicate that should be reported.
-
+**Forward predicates** are used for direct edge matching:
 ```python
-reverse_pred_map = {}
-for pred in allowed_predicates:
-    inverse = predicate_expander.get_inverse(pred)
-    if inverse:
-        reverse_pred_map[inverse] = pred
-    if predicate_expander.is_symmetric(pred):
-        reverse_pred_map[pred] = pred
+# Check if stored predicate is in forward_predicates
+if predicate in forward_predicates:
+    add_match(subject, predicate, object)
 ```
 
-**Example**:
-
-| Stored Predicate | Maps To | Reason |
-|------------------|---------|--------|
-| `biolink:treated_by` | `biolink:treats` | Inverse relationship |
-| `biolink:interacts_with` | `biolink:interacts_with` | Symmetric predicate |
-| `biolink:expressed_in` | `biolink:expresses` | Inverse relationship |
-
-### 3. Direct Predicate Matching
-
-**Rule**: For edges traversed in their natural direction, check if the stored predicate is in the allowed predicates list.
-
+**Inverse predicates** are used for reverse direction matching:
 ```python
-if allowed_predicates and predicate not in allowed_predicates:
-    continue
+# Check if stored predicate is in inverse_predicates
+if predicate in inverse_predicates:
+    # Report with the stored predicate (not mapped back)
+    add_match(subject, predicate, object)
 ```
-
-| Traversal Direction | Edge Being Checked | Predicate Requirement |
-|---------------------|--------------------|-----------------------|
-| Forward (outgoing) | `start --P--> obj` | `P in allowed_predicates` |
-| Backward (incoming) | `subj --P--> end` | `P in allowed_predicates` |
-
-### 4. Symmetric Predicate Handling
-
-**Definition**: A symmetric predicate has the same meaning in both directions. If `A --P--> B` exists and P is symmetric, then `B --P--> A` is also semantically true.
-
-**Rule**: When a predicate is symmetric, also check the reverse direction using the same predicate.
-
-**Implementation**: Add `reverse_pred_map[P] = P` for symmetric predicates, then check incoming edges during forward search (and vice versa).
-
-**Examples of Symmetric Predicates**:
-- `biolink:interacts_with`
-- `biolink:genetically_interacts_with`
-- `biolink:physically_interacts_with`
-- `biolink:correlated_with`
-
-**Matching Behavior**:
-
-| Query Predicate | Stored Edge | Found Via | Reported As |
-|-----------------|-------------|-----------|-------------|
-| `interacts_with` | `A --interacts_with--> B` | Direct (outgoing from A) | `A --interacts_with--> B` |
-| `interacts_with` | `B --interacts_with--> A` | Reverse (incoming to A) | `A --interacts_with--> B` |
-
-### 5. Inverse Predicate Handling
-
-**Definition**: An inverse predicate expresses the same relationship from the opposite perspective. If `A --P--> B` and P has inverse Q, then `B --Q--> A` represents the same fact.
-
-**Rule**: When checking the reverse direction, look for the inverse predicate and report the match using the originally queried predicate.
-
-**Implementation**: Add `reverse_pred_map[inverse(P)] = P`, then check incoming edges during forward search for the inverse predicate.
-
-**Examples of Inverse Predicate Pairs**:
-
-| Predicate | Inverse |
-|-----------|---------|
-| `biolink:treats` | `biolink:treated_by` |
-| `biolink:expresses` | `biolink:expressed_in` |
-| `biolink:has_part` | `biolink:part_of` |
-| `biolink:has_participant` | `biolink:participates_in` |
-| `biolink:causes` | `biolink:caused_by` |
-| `biolink:produces` | `biolink:produced_by` |
-| `biolink:enables` | `biolink:enabled_by` |
-
-**Matching Behavior**:
-
-| Query Predicate | Stored Edge | Found Via | Reported As |
-|-----------------|-------------|-----------|-------------|
-| `treats` | `Drug --treats--> Disease` | Direct | `Drug --treats--> Disease` |
-| `treats` | `Disease --treated_by--> Drug` | Reverse (incoming to Drug) | `Drug --treats--> Disease` |
 
 ## Search Cases
 
@@ -127,17 +103,16 @@ if allowed_predicates and predicate not in allowed_predicates:
 ```
 For each start_node:
     1. Check OUTGOING edges: start --P--> obj
-       - If P in allowed_predicates:
+       - If P in forward_predicates:
          - Check category constraints on obj
          - Check qualifier constraints
          - Add match: (start, P, obj)
 
     2. Check INCOMING edges: other --Q--> start
-       - If Q in reverse_pred_map:
-         - original_pred = reverse_pred_map[Q]
+       - If Q in inverse_predicates:
          - Check category constraints on other
          - Check qualifier constraints
-         - Add match: (start, original_pred, other)
+         - Add match: (start, Q, other)
 ```
 
 ### Case 2: Start Unpinned, End Pinned (Backward Search)
@@ -145,30 +120,28 @@ For each start_node:
 ```
 For each end_node:
     1. Check INCOMING edges: subj --P--> end
-       - If P in allowed_predicates:
+       - If P in forward_predicates:
          - Check category constraints on subj
          - Check qualifier constraints
          - Add match: (subj, P, end)
 
     2. Check OUTGOING edges: end --Q--> other
-       - If Q in reverse_pred_map:
-         - original_pred = reverse_pred_map[Q]
+       - If Q in inverse_predicates:
          - Check category constraints on other
          - Check qualifier constraints
-         - Add match: (other, original_pred, end)
+         - Add match: (other, Q, end)
 ```
 
 ### Case 3: Both Ends Pinned
 
 ```
 1. Check OUTGOING edges from start nodes:
-   - For each start --P--> obj where P in allowed_predicates:
+   - For each start --P--> obj where P in forward_predicates:
      - Store in forward_edges[obj]
 
 2. Check reverse direction (OUTGOING from end nodes):
-   - For each end --Q--> obj where Q in reverse_pred_map and obj in start_nodes:
-     - original_pred = reverse_pred_map[Q]
-     - Store in forward_edges[end] as (obj, original_pred, props)
+   - For each end --Q--> obj where Q in inverse_predicates and obj in start_nodes:
+     - Store in forward_edges[end] as (obj, Q, props)
 
 3. Find intersection:
    - For each obj in forward_edges that is also in end_nodes:
@@ -185,26 +158,56 @@ class PredicateExpander:
     def is_symmetric(predicate: str) -> bool
         """Check if predicate is symmetric (cached)."""
 
+    def is_canonical(predicate: str) -> bool
+        """Check if predicate has canonical_predicate annotation (cached)."""
+
+    def is_canonical_or_symmetric(predicate: str) -> bool
+        """Check if predicate is either canonical or symmetric."""
+
     def get_inverse(predicate: str) -> str | None
         """Get inverse predicate if one exists (cached)."""
 
-    def should_check_reverse_direction(predicate: str) -> bool
-        """True if predicate is symmetric or has an inverse."""
+    def get_descendants(predicate: str) -> list[str]
+        """Get all descendants of a predicate (cached)."""
 
-    def get_reverse_predicate(predicate: str) -> str | None
-        """Get predicate to use when checking reverse direction."""
+    def get_filtered_descendants(predicate: str) -> list[str]
+        """Get descendants filtered to only canonical OR symmetric."""
+
+    def expand_predicates(predicates: list[str]) -> tuple[list[str], list[str]]
+        """
+        Expand predicates following reasoner-transpiler rules.
+        Returns (forward_predicates, inverse_predicates).
+        """
 ```
 
-## Current Limitations
+## Matching Behavior Examples
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Descendant expansion | Supported | Via `bmt.get_descendants()` |
-| Direct predicate matching | Supported | Standard edge filtering |
-| Symmetric predicates | Supported | Via reverse direction check |
-| Inverse predicates | Supported | Via `reverse_pred_map` |
-| Inverse of descendants | Not supported | If querying `treats` and `kills` is a descendant, we don't automatically check for `killed_by` |
-| Canonical normalization | Not supported | Could normalize all results to canonical predicate direction |
+### Symmetric Predicate (`interacts_with`)
+
+| Query Predicate | Stored Edge | Found Via | Reported Predicate |
+|-----------------|-------------|-----------|-------------------|
+| `interacts_with` | `A --interacts_with--> B` | Direct (forward) | `interacts_with` |
+| `interacts_with` | `B --interacts_with--> A` | Reverse (inverse) | `interacts_with` |
+
+### Inverse Predicate Pair (`treats` / `treated_by`)
+
+| Query Predicate | Stored Edge | Found Via | Reported Predicate |
+|-----------------|-------------|-----------|-------------------|
+| `treats` | `Drug --treats--> Disease` | Direct (forward) | `treats` |
+| `treats` | `Disease --treated_by--> Drug` | Reverse (inverse) | `treated_by` |
+
+Note: The reported predicate is the **actual predicate stored in the graph**, consistent with reasoner-transpiler behavior.
+
+## Comparison with reasoner-transpiler
+
+| Feature | reasoner-transpiler | Gandalf |
+|---------|---------------------|---------|
+| `related_to` handling | Treats as "any predicate" | Same |
+| Descendant expansion | Filtered to canonical/symmetric | Same |
+| Inverse expansion | Expands inverse predicates too | Same |
+| Canonical filtering | Uses `annotations.canonical_predicate` | Same |
+| Direction handling | Cypher WHERE clause | Explicit bidirectional traversal |
+| Result predicates | Returns stored predicate | Same |
 
 ## Performance Considerations
 
@@ -215,6 +218,7 @@ class PredicateExpander:
 
 ## References
 
+- [reasoner-transpiler](https://github.com/ranking-agent/reasoner-transpiler) - Reference implementation for Cypher query generation
 - [BMT Documentation](https://biolink.github.io/biolink-model-toolkit/)
 - [Biolink Model - Inverse Predicates](https://github.com/biolink/biolink-model/issues/57)
 - [Best Practices for Inverse Predicates](https://github.com/biolink/biolink-model/issues/440)
