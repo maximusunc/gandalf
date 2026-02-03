@@ -789,6 +789,10 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
     # edge_id -> list of (subject_idx, predicate, object_idx) tuples
     edge_results = {}
 
+    # Store inverse predicates for each edge (needed for path reconstruction)
+    # edge_id -> set of inverse predicates
+    edge_inverse_preds = {}
+
     # Track original query graph structure for path reconstruction
     original_edges = list(query_graph["edges"].keys())
     original_nodes = set(query_graph["nodes"].keys())
@@ -845,6 +849,9 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
             print(f"  Query predicates: {query_predicates}")
             print(f"  Expanded to {len(forward_predicates)} forward, {len(inverse_predicates)} inverse predicates")
 
+        # Store inverse predicates for this edge (for path reconstruction)
+        edge_inverse_preds[next_edge_id] = set(inverse_predicates)
+
         # Get qualifier constraints for this edge
         qualifier_constraints = next_edge.get("qualifier_constraints", [])
 
@@ -900,7 +907,8 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
         print(f"\nReconstructing complete paths...")
 
     paths = _reconstruct_paths(
-        graph, query_graph, edge_results, original_edges, verbose
+        graph, query_graph, edge_results, original_edges, verbose,
+        edge_inverse_preds=edge_inverse_preds
     )
 
     if verbose:
@@ -1124,9 +1132,9 @@ def _query_edge(
                         ):
                             continue
 
-                    # Report as start -> other with the stored predicate
-                    # (consistent with reasoner-transpiler behavior)
-                    add_match(start_idx, stored_pred, other_idx)
+                    # Report the actual edge as stored in the graph
+                    # The edge is: other_idx --[stored_pred]--> start_idx
+                    add_match(other_idx, stored_pred, start_idx)
 
             t_node_end = time.perf_counter()
             node_time = t_node_end - t_node_start
@@ -1207,9 +1215,9 @@ def _query_edge(
                         ):
                             continue
 
-                    # Report as other -> end with the stored predicate
-                    # (consistent with reasoner-transpiler behavior)
-                    add_match(other_idx, stored_pred, end_idx)
+                    # Report the actual edge as stored in the graph
+                    # The edge is: end_idx --[stored_pred]--> other_idx
+                    add_match(end_idx, stored_pred, other_idx)
 
             t_node_end = time.perf_counter()
             node_time = t_node_end - t_node_start
@@ -1260,9 +1268,17 @@ def _query_edge(
                     # Check if stored predicate is one of our inverse predicates
                     if stored_pred not in inverse_pred_set:
                         continue
-                    # Store as start -> end with the stored predicate
-                    # (consistent with reasoner-transpiler behavior)
-                    forward_edges[end_idx].append((obj_idx, stored_pred, props))
+                    # Check qualifier constraints before adding
+                    if qualifier_constraints:
+                        edge_qualifiers = props.get("qualifiers", [])
+                        if not _edge_matches_qualifier_constraints(
+                            edge_qualifiers, qualifier_constraints
+                        ):
+                            continue
+                    # Report the actual edge as stored in the graph
+                    # The edge is: end_idx --[stored_pred]--> obj_idx
+                    # (where obj_idx is a start node)
+                    add_match(end_idx, stored_pred, obj_idx)
 
         t_neighbors_end = time.perf_counter()
         if verbose:
@@ -1296,7 +1312,8 @@ def _query_edge(
     return matches
 
 
-def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
+def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
+                       edge_inverse_preds=None):
     """
     Reconstruct complete paths by iteratively joining edge results.
 
@@ -1367,10 +1384,25 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
     paths_nodes = np.zeros((num_paths, max_nodes), dtype=np.int32)
     paths_preds = np.zeros((num_paths, num_edges), dtype=np.int32)
 
+    # Get inverse predicates for first edge
+    first_edge_inverse_preds = (
+        edge_inverse_preds.get(first_edge_id, set())
+        if edge_inverse_preds else set()
+    )
+
     # Fill in first edge data
+    # For inverse matches, the actual edge has subject/object swapped relative to query
     for i, (subj_idx, predicate, obj_idx) in enumerate(first_results):
-        paths_nodes[i, 0] = subj_idx
-        paths_nodes[i, 1] = obj_idx
+        if predicate in first_edge_inverse_preds:
+            # Inverse match: actual edge is (subj, pred, obj) but query expects reversed
+            # subj in actual edge corresponds to query's object
+            # obj in actual edge corresponds to query's subject
+            paths_nodes[i, 0] = obj_idx   # Query subject column gets actual object
+            paths_nodes[i, 1] = subj_idx  # Query object column gets actual subject
+        else:
+            # Direct match: actual edge matches query direction
+            paths_nodes[i, 0] = subj_idx
+            paths_nodes[i, 1] = obj_idx
         paths_preds[i, 0] = get_pred_idx(predicate)
 
     if verbose:
@@ -1394,6 +1426,24 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
         obj_in_paths = obj_qnode in qnode_to_col
 
         edge_data = edge_results[edge_id]
+
+        # Get inverse predicates for this edge
+        edge_inverse_preds_set = (
+            edge_inverse_preds.get(edge_id, set())
+            if edge_inverse_preds else set()
+        )
+
+        # Normalize edge data to query-aligned direction
+        # For inverse predicates, the actual edge (subj, pred, obj) represents
+        # the query direction (obj, pred, subj), so we swap
+        normalized_edge_data = []
+        for subj_idx, predicate, obj_idx in edge_data:
+            if predicate in edge_inverse_preds_set:
+                # Inverse: swap to query-aligned direction
+                normalized_edge_data.append((obj_idx, predicate, subj_idx))
+            else:
+                normalized_edge_data.append((subj_idx, predicate, obj_idx))
+        edge_data = normalized_edge_data
 
         if subj_in_paths and obj_in_paths:
             # Both nodes already in path - validate consistency
@@ -1612,18 +1662,36 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
                 subj_col = qnode_to_col[subj_qnode]
                 obj_col = qnode_to_col[obj_qnode]
 
-                subj_idx = paths_nodes[path_idx, subj_col]
-                obj_idx = paths_nodes[path_idx, obj_col]
+                # Get query-aligned node indices
+                query_subj_idx = paths_nodes[path_idx, subj_col]
+                query_obj_idx = paths_nodes[path_idx, obj_col]
 
-                # Get all edge properties
+                # Check if this predicate was found via inverse lookup
+                # If so, the actual edge in the graph has swapped direction
+                qedge_inverse_preds = (
+                    edge_inverse_preds.get(qedge_id, set())
+                    if edge_inverse_preds else set()
+                )
+                is_inverse = predicate in qedge_inverse_preds
+
+                if is_inverse:
+                    # Actual edge: query_obj -> query_subj
+                    actual_subj_idx = query_obj_idx
+                    actual_obj_idx = query_subj_idx
+                else:
+                    # Actual edge: query_subj -> query_obj
+                    actual_subj_idx = query_subj_idx
+                    actual_obj_idx = query_obj_idx
+
+                # Get all edge properties using actual edge direction
                 edge_props = graph.get_all_edge_properties(
-                    int(subj_idx), int(obj_idx), predicate
+                    int(actual_subj_idx), int(actual_obj_idx), predicate
                 ).copy()
 
-                # Ensure required fields are present
+                # Ensure required fields are present with actual edge direction
                 edge_props["predicate"] = predicate
-                edge_props["subject"] = node_cache[subj_idx]["id"]
-                edge_props["object"] = node_cache[obj_idx]["id"]
+                edge_props["subject"] = node_cache[actual_subj_idx]["id"]
+                edge_props["object"] = node_cache[actual_obj_idx]["id"]
 
                 edges[qedge_id] = edge_props
 

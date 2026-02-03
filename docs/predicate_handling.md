@@ -184,19 +184,24 @@ class PredicateExpander:
 
 ### Symmetric Predicate (`interacts_with`)
 
-| Query Predicate | Stored Edge | Found Via | Reported Predicate |
-|-----------------|-------------|-----------|-------------------|
-| `interacts_with` | `A --interacts_with--> B` | Direct (forward) | `interacts_with` |
-| `interacts_with` | `B --interacts_with--> A` | Reverse (inverse) | `interacts_with` |
+| Query | Stored Edge | Found Via | Reported Edge |
+|-------|-------------|-----------|---------------|
+| `A --interacts_with--> ?` | `A --interacts_with--> B` | Direct (forward) | `A --interacts_with--> B` |
+| `A --interacts_with--> ?` | `B --interacts_with--> A` | Reverse (inverse) | `B --interacts_with--> A` |
 
 ### Inverse Predicate Pair (`treats` / `treated_by`)
 
-| Query Predicate | Stored Edge | Found Via | Reported Predicate |
-|-----------------|-------------|-----------|-------------------|
-| `treats` | `Drug --treats--> Disease` | Direct (forward) | `treats` |
-| `treats` | `Disease --treated_by--> Drug` | Reverse (inverse) | `treated_by` |
+| Query | Stored Edge | Found Via | Reported Edge |
+|-------|-------------|-----------|---------------|
+| `Drug --treats--> ?` | `Drug --treats--> Disease` | Direct (forward) | `Drug --treats--> Disease` |
+| `Drug --treats--> ?` | `Disease --treated_by--> Drug` | Reverse (inverse) | `Disease --treated_by--> Drug` |
 
-Note: The reported predicate is the **actual predicate stored in the graph**, consistent with reasoner-transpiler behavior.
+**Important**: The reported edge always reflects the **actual edge stored in the graph** - both the predicate and the subject/object direction match what's stored. This ensures:
+1. Edges can be validated against the graph
+2. Results are consistent with reasoner-transpiler behavior
+3. No "phantom" edges are created
+
+When an edge is found via inverse lookup, the query still correctly identifies it as a match, but the knowledge graph edge preserves the actual storage direction.
 
 ## Comparison with reasoner-transpiler
 
