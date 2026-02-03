@@ -7,7 +7,41 @@ query results are consistent with the actual graph data.
 from dataclasses import dataclass
 from typing import Optional
 
+from bmt.toolkit import Toolkit
+
 from gandalf.graph import CSRGraph
+
+
+# Module-level BMT instance for predicate lookups
+_bmt: Optional[Toolkit] = None
+
+
+def _get_bmt() -> Toolkit:
+    """Get or create the BMT instance."""
+    global _bmt
+    if _bmt is None:
+        _bmt = Toolkit()
+    return _bmt
+
+
+def _get_inverse_predicate(predicate: str) -> Optional[str]:
+    """Get the inverse of a predicate if one exists."""
+    bmt = _get_bmt()
+    try:
+        if bmt.has_inverse(predicate):
+            return bmt.get_inverse_predicate(predicate, formatted=True)
+    except Exception:
+        pass
+    return None
+
+
+def _is_symmetric(predicate: str) -> bool:
+    """Check if a predicate is symmetric."""
+    bmt = _get_bmt()
+    try:
+        return bmt.is_symmetric(predicate)
+    except Exception:
+        return False
 
 
 @dataclass
@@ -62,17 +96,22 @@ def validate_edge_exists(
     subject_id: str,
     predicate: str,
     object_id: str,
-    check_reverse: bool = True,
+    check_inverse: bool = True,
 ) -> Optional[ValidationError]:
     """
-    Check if an edge exists in the graph.
+    Check if an edge exists in the graph, including inverse predicate checks.
+
+    This function checks for:
+    1. Direct match: subject --[predicate]--> object
+    2. Symmetric match: object --[predicate]--> subject (if predicate is symmetric)
+    3. Inverse match: object --[inverse(predicate)]--> subject
 
     Args:
         graph: The CSRGraph to validate against
         subject_id: Subject node ID
         predicate: Edge predicate
         object_id: Object node ID
-        check_reverse: If True, also check for the edge in reverse direction
+        check_inverse: If True, also check for inverse predicates in reverse direction
 
     Returns:
         ValidationError if edge not found, None otherwise
@@ -94,18 +133,35 @@ def validate_edge_exists(
             node_id=object_id,
         )
 
-    # Check forward direction: subject -> object
+    # Check forward direction: subject -> object with exact predicate
     edges = graph.get_all_edges_between(subj_idx, obj_idx)
     for edge_pred, _ in edges:
         if edge_pred == predicate:
             return None  # Found the edge
 
-    # Check reverse direction: object -> subject (for symmetric/inverse predicates)
-    if check_reverse:
-        reverse_edges = graph.get_all_edges_between(obj_idx, subj_idx)
-        for edge_pred, _ in reverse_edges:
-            if edge_pred == predicate:
-                return None  # Found the edge in reverse
+    if check_inverse:
+        # Check reverse direction for symmetric predicates: object -> subject
+        if _is_symmetric(predicate):
+            reverse_edges = graph.get_all_edges_between(obj_idx, subj_idx)
+            for edge_pred, _ in reverse_edges:
+                if edge_pred == predicate:
+                    return None  # Found symmetric edge in reverse
+
+        # Check reverse direction for inverse predicate: object --[inverse]--> subject
+        inverse_pred = _get_inverse_predicate(predicate)
+        if inverse_pred:
+            reverse_edges = graph.get_all_edges_between(obj_idx, subj_idx)
+            for edge_pred, _ in reverse_edges:
+                if edge_pred == inverse_pred:
+                    return None  # Found inverse edge
+
+        # Also check if the predicate itself is an inverse of something stored forward
+        # e.g., result says "treated_by" but graph has "treats" in forward direction
+        # This handles the case where the result predicate is the inverse
+        for edge_pred, _ in edges:
+            stored_inverse = _get_inverse_predicate(edge_pred)
+            if stored_inverse == predicate:
+                return None  # Result predicate is inverse of stored predicate
 
     return ValidationError(
         error_type="EDGE_NOT_FOUND",
@@ -116,19 +172,21 @@ def validate_edge_exists(
 def validate_trapi_response(
     graph: CSRGraph,
     response: dict,
-    check_reverse_edges: bool = True,
+    check_inverse: bool = True,
     verbose: bool = False,
 ) -> ValidationResult:
     """
     Validate a TRAPI response against the graph.
 
     Checks that all nodes and edges in the knowledge graph and results
-    actually exist in the source graph.
+    actually exist in the source graph. For edges, this includes checking
+    for inverse predicates (e.g., if result has "treats", also checks for
+    "treated_by" in the reverse direction).
 
     Args:
         graph: The CSRGraph to validate against
         response: TRAPI response dict with message.knowledge_graph and message.results
-        check_reverse_edges: If True, also check for edges in reverse direction
+        check_inverse: If True, also check for inverse predicates in reverse direction
         verbose: Print progress information
 
     Returns:
@@ -171,7 +229,7 @@ def validate_trapi_response(
 
         err = validate_edge_exists(
             graph, subject_id, predicate, object_id,
-            check_reverse=check_reverse_edges
+            check_inverse=check_inverse
         )
         if err:
             err.edge_id = edge_id
@@ -232,7 +290,7 @@ def validate_trapi_response(
 def validate_edge_list(
     graph: CSRGraph,
     edges: list[tuple[int, str, int]],
-    check_reverse: bool = True,
+    check_inverse: bool = True,
     verbose: bool = False,
 ) -> ValidationResult:
     """
@@ -241,7 +299,7 @@ def validate_edge_list(
     Args:
         graph: The CSRGraph to validate against
         edges: List of (subject_idx, predicate, object_idx) tuples
-        check_reverse: If True, also check for edges in reverse direction
+        check_inverse: If True, also check for inverse predicates in reverse direction
         verbose: Print progress information
 
     Returns:
@@ -274,7 +332,7 @@ def validate_edge_list(
         # Check if edge exists
         err = validate_edge_exists(
             graph, subj_id, predicate, obj_id,
-            check_reverse=check_reverse
+            check_inverse=check_inverse
         )
         if err:
             err.path_index = i
@@ -368,10 +426,19 @@ def debug_missing_edge(
         "",
     ]
 
+    # Show predicate info
+    inverse_pred = _get_inverse_predicate(predicate)
+    is_symmetric = _is_symmetric(predicate)
+    lines.append("Predicate info:")
+    lines.append(f"  Predicate: {predicate}")
+    lines.append(f"  Is symmetric: {is_symmetric}")
+    lines.append(f"  Inverse: {inverse_pred if inverse_pred else '(none)'}")
+
     # Check if nodes exist
     subj_idx = graph.get_node_idx(subject_id)
     obj_idx = graph.get_node_idx(object_id)
 
+    lines.append("")
     lines.append("Node existence:")
     lines.append(f"  Subject '{subject_id}': {'EXISTS (idx={subj_idx})' if subj_idx is not None else 'NOT FOUND'}")
     lines.append(f"  Object '{object_id}': {'EXISTS (idx={obj_idx})' if obj_idx is not None else 'NOT FOUND'}")
@@ -388,9 +455,20 @@ def debug_missing_edge(
         lines.append("  (none)")
     else:
         for edge in found_edges:
+            edge_inverse = _get_inverse_predicate(edge['predicate'])
+            inverse_note = f" (inverse: {edge_inverse})" if edge_inverse else ""
             lines.append(
-                f"  [{edge['direction']}] {edge['subject']} --[{edge['predicate']}]--> {edge['object']}"
+                f"  [{edge['direction']}] {edge['subject']} --[{edge['predicate']}]--> {edge['object']}{inverse_note}"
             )
+
+    # Show what we expected to find
+    lines.append("")
+    lines.append("Expected matches (any of these would validate):")
+    lines.append(f"  1. Forward: {subject_id} --[{predicate}]--> {object_id}")
+    if is_symmetric:
+        lines.append(f"  2. Symmetric reverse: {object_id} --[{predicate}]--> {subject_id}")
+    if inverse_pred:
+        lines.append(f"  3. Inverse reverse: {object_id} --[{inverse_pred}]--> {subject_id}")
 
     # Check neighbors
     lines.append("")
