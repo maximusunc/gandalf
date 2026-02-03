@@ -154,11 +154,14 @@ class PredicateExpander:
                 inverse_preds.append(pred)
 
         # Expand to descendants and filter to canonical/symmetric
-        forward_expanded = []
+        # Always include the original query predicates (they should always match)
+        # Only filter descendants to canonical/symmetric
+        forward_expanded = list(predicates)
         for pred in predicates:
             forward_expanded.extend(self.get_filtered_descendants(pred))
 
-        inverse_expanded = []
+        # Always include the original inverse predicates
+        inverse_expanded = list(inverse_preds)
         for pred in inverse_preds:
             inverse_expanded.extend(self.get_filtered_descendants(pred))
 
