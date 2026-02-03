@@ -22,6 +22,7 @@ from gandalf.validation import (
     ValidationError,
     ValidationResult,
     debug_missing_edge,
+    diagnose_graph_edge_storage,
     find_edge_in_graph,
     validate_edge_exists,
     validate_edge_list,
@@ -54,4 +55,5 @@ __all__ = [
     "validate_edge_exists",
     "find_edge_in_graph",
     "debug_missing_edge",
+    "diagnose_graph_edge_storage",
 ]

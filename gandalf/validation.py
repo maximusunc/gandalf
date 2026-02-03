@@ -351,6 +351,85 @@ def validate_edge_list(
     )
 
 
+def diagnose_graph_edge_storage(
+    graph: CSRGraph,
+    node_id: str,
+    max_neighbors: int = 5,
+) -> str:
+    """
+    Diagnose edge storage for a node to check if predicates are being stored correctly.
+
+    Args:
+        graph: The CSRGraph to check
+        node_id: Node ID to diagnose
+        max_neighbors: Maximum neighbors to show
+
+    Returns:
+        Human-readable diagnostic report
+    """
+    lines = [f"Edge storage diagnosis for node '{node_id}':", ""]
+
+    node_idx = graph.get_node_idx(node_id)
+    if node_idx is None:
+        lines.append(f"  Node not found in graph!")
+        return "\n".join(lines)
+
+    lines.append(f"  Node index: {node_idx}")
+
+    # Check outgoing edges
+    lines.append("")
+    lines.append("Outgoing edges (neighbors_with_properties):")
+    try:
+        out_count = 0
+        for neighbor_idx, predicate, props in graph.neighbors_with_properties(node_idx):
+            if out_count >= max_neighbors:
+                lines.append(f"  ... (limited to {max_neighbors})")
+                break
+            neighbor_id = graph.get_node_id(neighbor_idx)
+            lines.append(f"  -> {neighbor_id} (idx={neighbor_idx})")
+            lines.append(f"     predicate: {predicate!r}")
+            lines.append(f"     props keys: {list(props.keys()) if props else '(none)'}")
+            out_count += 1
+        if out_count == 0:
+            lines.append("  (no outgoing edges)")
+    except Exception as e:
+        lines.append(f"  ERROR: {e}")
+
+    # Check incoming edges
+    lines.append("")
+    lines.append("Incoming edges (incoming_neighbors_with_properties):")
+    try:
+        in_count = 0
+        for neighbor_idx, predicate, props in graph.incoming_neighbors_with_properties(node_idx):
+            if in_count >= max_neighbors:
+                lines.append(f"  ... (limited to {max_neighbors})")
+                break
+            neighbor_id = graph.get_node_id(neighbor_idx)
+            lines.append(f"  <- {neighbor_id} (idx={neighbor_idx})")
+            lines.append(f"     predicate: {predicate!r}")
+            lines.append(f"     props keys: {list(props.keys()) if props else '(none)'}")
+            in_count += 1
+        if in_count == 0:
+            lines.append("  (no incoming edges)")
+    except Exception as e:
+        lines.append(f"  ERROR: {e}")
+
+    # Check raw neighbor indices
+    lines.append("")
+    lines.append("Raw neighbor check (neighbors vs neighbors_with_properties):")
+    try:
+        raw_neighbors = graph.neighbors(node_idx)
+        lines.append(f"  neighbors() count: {len(raw_neighbors)}")
+        with_props_count = sum(1 for _ in graph.neighbors_with_properties(node_idx))
+        lines.append(f"  neighbors_with_properties() count: {with_props_count}")
+        if len(raw_neighbors) != with_props_count:
+            lines.append(f"  WARNING: Counts don't match!")
+    except Exception as e:
+        lines.append(f"  ERROR: {e}")
+
+    return "\n".join(lines)
+
+
 def find_edge_in_graph(
     graph: CSRGraph,
     subject_id: str,
@@ -440,8 +519,8 @@ def debug_missing_edge(
 
     lines.append("")
     lines.append("Node existence:")
-    lines.append(f"  Subject '{subject_id}': {'EXISTS (idx={subj_idx})' if subj_idx is not None else 'NOT FOUND'}")
-    lines.append(f"  Object '{object_id}': {'EXISTS (idx={obj_idx})' if obj_idx is not None else 'NOT FOUND'}")
+    lines.append(f"  Subject '{subject_id}': EXISTS (idx={subj_idx})" if subj_idx is not None else f"  Subject '{subject_id}': NOT FOUND")
+    lines.append(f"  Object '{object_id}': EXISTS (idx={obj_idx})" if obj_idx is not None else f"  Object '{object_id}': NOT FOUND")
 
     if subj_idx is None or obj_idx is None:
         return "\n".join(lines)
