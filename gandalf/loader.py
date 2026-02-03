@@ -2,7 +2,6 @@
 
 import json
 
-from bmt.toolkit import Toolkit
 import numpy as np
 
 from gandalf.graph import CSRGraph
@@ -23,7 +22,6 @@ def build_graph_from_jsonl(
         CSRGraph object with the loaded graph
     """
     print(f"Reading edges from {edge_jsonl_path}...")
-    bmt = Toolkit()
 
     # First pass: collect all unique node IDs and edges with properties
     node_ids = set()
@@ -126,16 +124,7 @@ def build_graph_from_jsonl(
         edge_predicates.append(pred_idx)
         edge_properties[(src_idx, dst_idx, pred_idx)] = props
 
-        if bmt.is_symmetric(predicate):
-            # symmetric predicate, add reverse edge
-            # This allows an incoming symmetric predicate edge to return in the same
-            # direction it was asked in
-            edges.append((dst_idx, src_idx))
-            edge_predicates.append(pred_idx)
-            # Reverse edge has same properties
-            edge_properties[(dst_idx, src_idx, pred_idx)] = props
-
-    print(f"Total edges (with symmetric predicates): {len(edges):,}")
+    print(f"Total edges: {len(edges):,}")
 
     # Build CSR structure
     print("Building CSR structure...")

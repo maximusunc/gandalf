@@ -14,6 +14,232 @@ from gandalf.graph import CSRGraph
 from gandalf.query_planner import get_next_qedge, remove_orphaned
 
 
+class PredicateExpander:
+    """
+    Handles predicate expansion for symmetric and inverse predicates at query time.
+
+    This class caches BMT lookups for performance and provides methods to determine
+    what predicates should match when traversing edges in different directions.
+
+    Predicate handling follows the reasoner-transpiler rules:
+    1. If 'biolink:related_to' is queried, treat as "any predicate"
+    2. For each predicate P:
+       - Get inverse Q (if exists) → add to inverse predicates
+       - If P is symmetric → add P to inverse predicates
+    3. Expand both predicates and inverse predicates to descendants
+    4. Filter descendants to only those that are canonical OR symmetric
+
+    For a query predicate P:
+    - Symmetric predicates: If P is symmetric, an edge A--P-->B also represents B--P-->A
+    - Inverse predicates: If P has inverse Q, an edge A--P-->B is equivalent to B--Q-->A
+
+    When traversing:
+    - Forward (outgoing edges): Match predicate P directly
+    - Backward (incoming edges): Match P if symmetric, or match inverse(P) if it exists
+    """
+
+    def __init__(self, bmt: Toolkit):
+        self.bmt = bmt
+        self._inverse_cache: dict[str, str | None] = {}
+        self._symmetric_cache: dict[str, bool] = {}
+        self._canonical_cache: dict[str, bool] = {}
+        self._descendants_cache: dict[str, list[str]] = {}
+
+    def is_symmetric(self, predicate: str) -> bool:
+        """Check if a predicate is symmetric (cached)."""
+        if predicate not in self._symmetric_cache:
+            try:
+                self._symmetric_cache[predicate] = self.bmt.is_symmetric(predicate)
+            except Exception:
+                self._symmetric_cache[predicate] = False
+        return self._symmetric_cache[predicate]
+
+    def is_canonical(self, predicate: str) -> bool:
+        """
+        Check if a predicate is canonical (cached).
+
+        A predicate is canonical if it has the 'canonical_predicate' annotation
+        set to True in the Biolink Model.
+        """
+        if predicate not in self._canonical_cache:
+            try:
+                element = self.bmt.get_element(predicate)
+                if element is None:
+                    self._canonical_cache[predicate] = False
+                else:
+                    # Check for canonical_predicate annotation
+                    annotations = getattr(element, 'annotations', {}) or {}
+                    self._canonical_cache[predicate] = bool(
+                        annotations.get('canonical_predicate', False)
+                    )
+            except Exception:
+                self._canonical_cache[predicate] = False
+        return self._canonical_cache[predicate]
+
+    def is_canonical_or_symmetric(self, predicate: str) -> bool:
+        """Check if a predicate is either canonical or symmetric."""
+        return self.is_canonical(predicate) or self.is_symmetric(predicate)
+
+    def get_inverse(self, predicate: str) -> str | None:
+        """Get the inverse of a predicate if one exists (cached)."""
+        if predicate not in self._inverse_cache:
+            try:
+                if self.bmt.has_inverse(predicate):
+                    inverse = self.bmt.get_inverse_predicate(predicate, formatted=True)
+                    self._inverse_cache[predicate] = inverse
+                else:
+                    self._inverse_cache[predicate] = None
+            except Exception:
+                self._inverse_cache[predicate] = None
+        return self._inverse_cache[predicate]
+
+    def get_descendants(self, predicate: str) -> list[str]:
+        """Get all descendants of a predicate (cached)."""
+        if predicate not in self._descendants_cache:
+            try:
+                element = self.bmt.get_element(predicate)
+                if element is None:
+                    self._descendants_cache[predicate] = []
+                else:
+                    self._descendants_cache[predicate] = self.bmt.get_descendants(
+                        predicate, formatted=True
+                    )
+            except Exception:
+                self._descendants_cache[predicate] = []
+        return self._descendants_cache[predicate]
+
+    def get_filtered_descendants(self, predicate: str) -> list[str]:
+        """
+        Get descendants of a predicate, filtered to only canonical OR symmetric.
+
+        This follows the reasoner-transpiler behavior where only predicates that
+        are either marked as canonical_predicate or are symmetric are included
+        in query expansion.
+        """
+        descendants = self.get_descendants(predicate)
+        return [d for d in descendants if self.is_canonical_or_symmetric(d)]
+
+    def expand_predicates(self, predicates: list[str]) -> tuple[list[str], list[str]]:
+        """
+        Expand predicates following reasoner-transpiler rules.
+
+        This method:
+        1. Handles 'biolink:related_to' as "any predicate" (returns empty lists)
+        2. For each predicate, gets its inverse and adds to inverse list
+        3. For symmetric predicates, adds them to the inverse list too
+        4. Expands both lists to descendants
+        5. Filters to only canonical OR symmetric predicates
+
+        Args:
+            predicates: List of predicate CURIEs from the query
+
+        Returns:
+            Tuple of (forward_predicates, inverse_predicates) where:
+            - forward_predicates: Predicates to match in the forward direction
+            - inverse_predicates: Predicates to match in the reverse direction
+        """
+        # Handle 'related_to' as "any predicate"
+        if 'biolink:related_to' in predicates:
+            return [], []
+
+        # Collect inverse predicates
+        inverse_preds = []
+        for pred in predicates:
+            # Get explicit inverse
+            inverse = self.get_inverse(pred)
+            if inverse:
+                inverse_preds.append(inverse)
+            # Symmetric predicates are their own inverse for bidirectional matching
+            if self.is_symmetric(pred):
+                inverse_preds.append(pred)
+
+        # Expand to descendants and filter to canonical/symmetric
+        forward_expanded = []
+        for pred in predicates:
+            forward_expanded.extend(self.get_filtered_descendants(pred))
+
+        inverse_expanded = []
+        for pred in inverse_preds:
+            inverse_expanded.extend(self.get_filtered_descendants(pred))
+
+        # Deduplicate while preserving order
+        forward_unique = list(dict.fromkeys(forward_expanded))
+        inverse_unique = list(dict.fromkeys(inverse_expanded))
+
+        return forward_unique, inverse_unique
+
+    def get_predicates_for_incoming_edges(self, predicates: list[str]) -> set[str]:
+        """
+        Get predicates that should match on incoming edges.
+
+        When we're looking for edges with predicate P pointing TO a node,
+        we should also consider:
+        - P itself if it's stored in the incoming direction
+        - The inverse of P, since an incoming edge with inverse(P) represents
+          the same relationship as an outgoing edge with P
+
+        Args:
+            predicates: List of predicates we're searching for
+
+        Returns:
+            Set of predicates to match on incoming edges
+        """
+        result = set()
+        for pred in predicates:
+            # Always include the original predicate for direct matches
+            result.add(pred)
+            # If P has inverse Q, then an incoming edge with Q is equivalent
+            # to an outgoing edge with P from the perspective of the target node
+            inverse = self.get_inverse(pred)
+            if inverse:
+                result.add(inverse)
+        return result
+
+    def get_predicates_for_outgoing_edges(self, predicates: list[str]) -> set[str]:
+        """
+        Get predicates that should match on outgoing edges.
+
+        When we're looking for edges with predicate P pointing FROM a node,
+        we should also consider:
+        - P itself for direct matches
+        - The inverse of P when checking from the object's perspective
+
+        Args:
+            predicates: List of predicates we're searching for
+
+        Returns:
+            Set of predicates to match on outgoing edges
+        """
+        result = set()
+        for pred in predicates:
+            result.add(pred)
+            # Include inverse for bidirectional matching
+            inverse = self.get_inverse(pred)
+            if inverse:
+                result.add(inverse)
+        return result
+
+    def should_check_reverse_direction(self, predicate: str) -> bool:
+        """
+        Determine if we should also check the reverse direction for this predicate.
+
+        Returns True if the predicate is symmetric or has an inverse defined.
+        """
+        return self.is_symmetric(predicate) or self.get_inverse(predicate) is not None
+
+    def get_reverse_predicate(self, predicate: str) -> str | None:
+        """
+        Get the predicate to use when checking the reverse direction.
+
+        For symmetric predicates, returns the same predicate.
+        For predicates with inverses, returns the inverse.
+        For other predicates, returns None.
+        """
+        if self.is_symmetric(predicate):
+            return predicate
+        return self.get_inverse(predicate)
+
+
 def _edge_matches_qualifier_constraints(edge_qualifiers, qualifier_constraints):
     """
     Check if an edge's qualifiers match the query's qualifier constraints.
@@ -553,12 +779,19 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
     elif verbose:
         print("Using provided BMT instance")
 
+    # Create predicate expander for handling symmetric/inverse predicates at query time
+    predicate_expander = PredicateExpander(bmt)
+
     query_graph = query["message"]["query_graph"]
     subqgraph = copy.deepcopy(query_graph)
 
     # Store results for each edge query
     # edge_id -> list of (subject_idx, predicate, object_idx) tuples
     edge_results = {}
+
+    # Store inverse predicates for each edge (needed for path reconstruction)
+    # edge_id -> set of inverse predicates
+    edge_inverse_preds = {}
 
     # Track original query graph structure for path reconstruction
     original_edges = list(query_graph["edges"].keys())
@@ -598,14 +831,26 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
                 if graph.get_node_idx(node_id) is not None
             ]
 
-        # Get allowed predicates (including descendants)
-        allowed_predicates = [
-            predicate
-            for edge_predicate in next_edge["predicates"]
-            if bmt.get_element(edge_predicate) is not None
-            for predicate in bmt.get_descendants(edge_predicate, formatted=True)
-        ]
-        # allowed_predicates = next_edge["predicates"]
+        # Get allowed predicates using reasoner-transpiler rules:
+        # 1. Handle 'related_to' as "any predicate"
+        # 2. Expand to descendants filtered to canonical OR symmetric only
+        # 3. Also expand inverse predicates for bidirectional matching
+        query_predicates = next_edge.get("predicates", [])
+        forward_predicates, inverse_predicates = predicate_expander.expand_predicates(
+            query_predicates
+        )
+
+        # Forward predicates are used for direct edge matching
+        # Inverse predicates are used for reverse direction matching
+        # Keep them separate to avoid confusion in reverse_pred_map construction
+        allowed_predicates = forward_predicates
+
+        if verbose and query_predicates:
+            print(f"  Query predicates: {query_predicates}")
+            print(f"  Expanded to {len(forward_predicates)} forward, {len(inverse_predicates)} inverse predicates")
+
+        # Store inverse predicates for this edge (for path reconstruction)
+        edge_inverse_preds[next_edge_id] = set(inverse_predicates)
 
         # Get qualifier constraints for this edge
         qualifier_constraints = next_edge.get("qualifier_constraints", [])
@@ -620,6 +865,7 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
             allowed_predicates,
             qualifier_constraints,
             verbose,
+            inverse_predicates=inverse_predicates,
         )
 
         # Store results for this edge
@@ -661,7 +907,8 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
         print(f"\nReconstructing complete paths...")
 
     paths = _reconstruct_paths(
-        graph, query_graph, edge_results, original_edges, verbose
+        graph, query_graph, edge_results, original_edges, verbose,
+        edge_inverse_preds=edge_inverse_preds
     )
 
     if verbose:
@@ -786,9 +1033,14 @@ def _query_edge(
     allowed_predicates,
     qualifier_constraints,
     verbose,
+    inverse_predicates: list[str] = None,
 ):
     """
     Query for a single edge with given constraints.
+
+    Handles symmetric and inverse predicates at query time by checking both
+    edge directions when appropriate. For example, if searching for predicate P
+    and P has inverse Q, edges stored as B--Q-->A will be returned as A--P-->B.
 
     Args:
         graph: CSRGraph instance
@@ -796,14 +1048,28 @@ def _query_edge(
         end_idxes: List of pinned end node indices, or None if unpinned
         start_categories: List of allowed categories for start node
         end_categories: List of allowed categories for end node
-        allowed_predicates: List of allowed predicate strings
+        allowed_predicates: List of forward predicate strings (canonical/symmetric descendants)
         qualifier_constraints: List of qualifier constraint dicts from query
         verbose: Print progress information
+        inverse_predicates: List of inverse predicate strings for reverse direction matching
 
     Returns:
         List of (subject_idx, predicate, object_idx) tuples
     """
     matches = []
+    seen_edges = set()  # Track (subj, pred, obj) to avoid duplicates
+
+    # Build set of inverse predicates for quick lookup
+    # When we find an inverse predicate in reverse direction, we report it using
+    # the stored predicate (since that's what's actually in the graph)
+    inverse_pred_set = set(inverse_predicates) if inverse_predicates else set()
+
+    def add_match(subj_idx, predicate, obj_idx):
+        """Add a match, avoiding duplicates."""
+        key = (subj_idx, predicate, obj_idx)
+        if key not in seen_edges:
+            seen_edges.add(key)
+            matches.append((subj_idx, predicate, obj_idx))
 
     # Case 1: Start pinned, end unpinned
     if start_idxes is not None and end_idxes is None:
@@ -819,6 +1085,7 @@ def _query_edge(
             t_node_start = time.perf_counter()
             node_neighbors = 0
 
+            # Check outgoing edges (direct matches)
             for obj_idx, predicate, props in graph.neighbors_with_properties(start_idx):
                 node_neighbors += 1
                 # Check predicate
@@ -839,7 +1106,35 @@ def _query_edge(
                     ):
                         continue
 
-                matches.append((start_idx, predicate, obj_idx))
+                add_match(start_idx, predicate, obj_idx)
+
+            # Check incoming edges for symmetric/inverse predicates
+            # An incoming edge with inverse(P) represents an outgoing edge with P
+            if inverse_pred_set:
+                for other_idx, stored_pred, props in graph.incoming_neighbors_with_properties(start_idx):
+                    node_neighbors += 1
+
+                    # Check if stored predicate is one of our inverse predicates
+                    if stored_pred not in inverse_pred_set:
+                        continue
+
+                    # Check object categories (the "other" node becomes our object)
+                    if end_categories:
+                        obj_cats = graph.get_node_property(other_idx, "categories", [])
+                        if not any(cat in obj_cats for cat in end_categories):
+                            continue
+
+                    # Check qualifier constraints
+                    if qualifier_constraints:
+                        edge_qualifiers = props.get("qualifiers", [])
+                        if not _edge_matches_qualifier_constraints(
+                            edge_qualifiers, qualifier_constraints
+                        ):
+                            continue
+
+                    # Report the actual edge as stored in the graph
+                    # The edge is: other_idx --[stored_pred]--> start_idx
+                    add_match(other_idx, stored_pred, start_idx)
 
             t_node_end = time.perf_counter()
             node_time = t_node_end - t_node_start
@@ -871,6 +1166,7 @@ def _query_edge(
             t_node_start = time.perf_counter()
             node_neighbors = 0
 
+            # Check incoming edges (direct matches)
             for subj_idx, predicate, props in graph.incoming_neighbors_with_properties(
                 end_idx
             ):
@@ -893,7 +1189,35 @@ def _query_edge(
                     ):
                         continue
 
-                matches.append((subj_idx, predicate, end_idx))
+                add_match(subj_idx, predicate, end_idx)
+
+            # Check outgoing edges for symmetric/inverse predicates
+            # An outgoing edge with inverse(P) represents an incoming edge with P
+            if inverse_pred_set:
+                for other_idx, stored_pred, props in graph.neighbors_with_properties(end_idx):
+                    node_neighbors += 1
+
+                    # Check if stored predicate is one of our inverse predicates
+                    if stored_pred not in inverse_pred_set:
+                        continue
+
+                    # Check subject categories (the "other" node becomes our subject)
+                    if start_categories:
+                        subj_cats = graph.get_node_property(other_idx, "categories", [])
+                        if not any(cat in subj_cats for cat in start_categories):
+                            continue
+
+                    # Check qualifier constraints
+                    if qualifier_constraints:
+                        edge_qualifiers = props.get("qualifiers", [])
+                        if not _edge_matches_qualifier_constraints(
+                            edge_qualifiers, qualifier_constraints
+                        ):
+                            continue
+
+                    # Report the actual edge as stored in the graph
+                    # The edge is: end_idx --[stored_pred]--> other_idx
+                    add_match(end_idx, stored_pred, other_idx)
 
             t_node_end = time.perf_counter()
             node_time = t_node_end - t_node_start
@@ -931,6 +1255,31 @@ def _query_edge(
                     continue
                 forward_edges[obj_idx].append((start_idx, predicate, props))
 
+        # Also check reverse direction for symmetric/inverse predicates
+        # Look for edges: end_node --inverse(P)--> start_node
+        if inverse_pred_set:
+            start_set = set(start_idxes)
+            for end_idx in end_idxes:
+                for obj_idx, stored_pred, props in graph.neighbors_with_properties(end_idx):
+                    total_neighbors += 1
+                    # Only consider if obj_idx is one of our start nodes
+                    if obj_idx not in start_set:
+                        continue
+                    # Check if stored predicate is one of our inverse predicates
+                    if stored_pred not in inverse_pred_set:
+                        continue
+                    # Check qualifier constraints before adding
+                    if qualifier_constraints:
+                        edge_qualifiers = props.get("qualifiers", [])
+                        if not _edge_matches_qualifier_constraints(
+                            edge_qualifiers, qualifier_constraints
+                        ):
+                            continue
+                    # Report the actual edge as stored in the graph
+                    # The edge is: end_idx --[stored_pred]--> obj_idx
+                    # (where obj_idx is a start node)
+                    add_match(end_idx, stored_pred, obj_idx)
+
         t_neighbors_end = time.perf_counter()
         if verbose:
             print(f"    Neighbor traversal: {t_neighbors_end - t_neighbors_start:.3f}s "
@@ -950,7 +1299,7 @@ def _query_edge(
                             edge_qualifiers, qualifier_constraints
                         ):
                             continue
-                    matches.append((subj_idx, predicate, obj_idx))
+                    add_match(subj_idx, predicate, obj_idx)
 
         t1 = time.perf_counter()
         if verbose:
@@ -963,7 +1312,8 @@ def _query_edge(
     return matches
 
 
-def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
+def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
+                       edge_inverse_preds=None):
     """
     Reconstruct complete paths by iteratively joining edge results.
 
@@ -1034,10 +1384,25 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
     paths_nodes = np.zeros((num_paths, max_nodes), dtype=np.int32)
     paths_preds = np.zeros((num_paths, num_edges), dtype=np.int32)
 
+    # Get inverse predicates for first edge
+    first_edge_inverse_preds = (
+        edge_inverse_preds.get(first_edge_id, set())
+        if edge_inverse_preds else set()
+    )
+
     # Fill in first edge data
+    # For inverse matches, the actual edge has subject/object swapped relative to query
     for i, (subj_idx, predicate, obj_idx) in enumerate(first_results):
-        paths_nodes[i, 0] = subj_idx
-        paths_nodes[i, 1] = obj_idx
+        if predicate in first_edge_inverse_preds:
+            # Inverse match: actual edge is (subj, pred, obj) but query expects reversed
+            # subj in actual edge corresponds to query's object
+            # obj in actual edge corresponds to query's subject
+            paths_nodes[i, 0] = obj_idx   # Query subject column gets actual object
+            paths_nodes[i, 1] = subj_idx  # Query object column gets actual subject
+        else:
+            # Direct match: actual edge matches query direction
+            paths_nodes[i, 0] = subj_idx
+            paths_nodes[i, 1] = obj_idx
         paths_preds[i, 0] = get_pred_idx(predicate)
 
     if verbose:
@@ -1061,6 +1426,24 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
         obj_in_paths = obj_qnode in qnode_to_col
 
         edge_data = edge_results[edge_id]
+
+        # Get inverse predicates for this edge
+        edge_inverse_preds_set = (
+            edge_inverse_preds.get(edge_id, set())
+            if edge_inverse_preds else set()
+        )
+
+        # Normalize edge data to query-aligned direction
+        # For inverse predicates, the actual edge (subj, pred, obj) represents
+        # the query direction (obj, pred, subj), so we swap
+        normalized_edge_data = []
+        for subj_idx, predicate, obj_idx in edge_data:
+            if predicate in edge_inverse_preds_set:
+                # Inverse: swap to query-aligned direction
+                normalized_edge_data.append((obj_idx, predicate, subj_idx))
+            else:
+                normalized_edge_data.append((subj_idx, predicate, obj_idx))
+        edge_data = normalized_edge_data
 
         if subj_in_paths and obj_in_paths:
             # Both nodes already in path - validate consistency
@@ -1279,18 +1662,36 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose):
                 subj_col = qnode_to_col[subj_qnode]
                 obj_col = qnode_to_col[obj_qnode]
 
-                subj_idx = paths_nodes[path_idx, subj_col]
-                obj_idx = paths_nodes[path_idx, obj_col]
+                # Get query-aligned node indices
+                query_subj_idx = paths_nodes[path_idx, subj_col]
+                query_obj_idx = paths_nodes[path_idx, obj_col]
 
-                # Get all edge properties
+                # Check if this predicate was found via inverse lookup
+                # If so, the actual edge in the graph has swapped direction
+                qedge_inverse_preds = (
+                    edge_inverse_preds.get(qedge_id, set())
+                    if edge_inverse_preds else set()
+                )
+                is_inverse = predicate in qedge_inverse_preds
+
+                if is_inverse:
+                    # Actual edge: query_obj -> query_subj
+                    actual_subj_idx = query_obj_idx
+                    actual_obj_idx = query_subj_idx
+                else:
+                    # Actual edge: query_subj -> query_obj
+                    actual_subj_idx = query_subj_idx
+                    actual_obj_idx = query_obj_idx
+
+                # Get all edge properties using actual edge direction
                 edge_props = graph.get_all_edge_properties(
-                    int(subj_idx), int(obj_idx), predicate
+                    int(actual_subj_idx), int(actual_obj_idx), predicate
                 ).copy()
 
-                # Ensure required fields are present
+                # Ensure required fields are present with actual edge direction
                 edge_props["predicate"] = predicate
-                edge_props["subject"] = node_cache[subj_idx]["id"]
-                edge_props["object"] = node_cache[obj_idx]["id"]
+                edge_props["subject"] = node_cache[actual_subj_idx]["id"]
+                edge_props["object"] = node_cache[actual_obj_idx]["id"]
 
                 edges[qedge_id] = edge_props
 
