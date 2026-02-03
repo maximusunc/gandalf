@@ -18,6 +18,16 @@ from gandalf.search import (
     find_mechanistic_paths,
     lookup,
 )
+from gandalf.validation import (
+    ValidationError,
+    ValidationResult,
+    debug_missing_edge,
+    find_edge_in_graph,
+    validate_edge_exists,
+    validate_edge_list,
+    validate_node_exists,
+    validate_trapi_response,
+)
 
 __all__ = [
     # Core classes
@@ -35,4 +45,13 @@ __all__ = [
     "analyze_predicates",
     # Query Planner
     "get_next_qedge",
+    # Validation
+    "ValidationError",
+    "ValidationResult",
+    "validate_trapi_response",
+    "validate_edge_list",
+    "validate_node_exists",
+    "validate_edge_exists",
+    "find_edge_in_graph",
+    "debug_missing_edge",
 ]
