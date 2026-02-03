@@ -11,6 +11,26 @@ Graph Analysis Navigator for Discovery And Link Finding
 - **Diagnostic tools** to understand path counts
 
 ## Installation
+
+**Recommended: Use a virtual environment**
+
+Some transitive dependencies (e.g., `stringcase`, `pytest-logging`) require modern pip/setuptools to build correctly. Using a virtual environment ensures you have updated tools.
+
+```bash
+# Create and activate a virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Upgrade pip and setuptools (important for building dependencies)
+pip install --upgrade pip setuptools wheel
+
+# Install the package
+pip install -e .
+```
+
+**Alternative: Direct install (may fail on some systems)**
+
+If you have a recent pip/setuptools already, you can try:
 ```bash
 pip install -e .
 ```

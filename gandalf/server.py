@@ -82,7 +82,9 @@ APP.add_middleware(
     allow_headers=["*"],
 )
 
-APP.mount("/static", StaticFiles(directory="static"), name="static")
+STATIC_DIR = Path(__file__).parent.parent / "static"
+if STATIC_DIR.exists():
+    APP.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @APP.get("/docs", include_in_schema=False)
