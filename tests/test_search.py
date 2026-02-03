@@ -22,7 +22,7 @@ def graph():
 class TestLookupOneHop:
     """Tests for single-hop queries using the lookup function."""
 
-    def test_one_hop_pinned_both_ends_single_result(self, graph):
+    def test_one_hop_pinned_both_ends_single_result(self, graph, bmt):
         """Query with pinned start and end should return 1 result with multiple edge bindings.
 
         Note: biolink:treats has descendants ameliorates_condition and
@@ -47,7 +47,7 @@ class TestLookupOneHop:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # Results are aggregated by unique node paths
@@ -63,7 +63,7 @@ class TestLookupOneHop:
         edge_bindings = result["analyses"][0]["edge_bindings"]["e0"]
         assert len(edge_bindings) == 3
 
-    def test_one_hop_pinned_start_unpinned_end(self, graph):
+    def test_one_hop_pinned_start_unpinned_end(self, graph, bmt):
         """Query with pinned start should return all matching edges."""
         query = {
             "message": {
@@ -83,7 +83,7 @@ class TestLookupOneHop:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # CHEBI:6801 (Metformin) affects 4 genes:
@@ -92,7 +92,7 @@ class TestLookupOneHop:
         gene_ids = {r["node_bindings"]["n1"][0]["id"] for r in results}
         assert gene_ids == {"NCBIGene:5468", "NCBIGene:3643", "NCBIGene:2645", "NCBIGene:7124"}
 
-    def test_one_hop_no_matching_predicate(self, graph):
+    def test_one_hop_no_matching_predicate(self, graph, bmt):
         """Query with non-matching predicate should return 0 paths."""
         query = {
             "message": {
@@ -112,12 +112,12 @@ class TestLookupOneHop:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         assert len(results) == 0
 
-    def test_one_hop_multiple_results_same_predicate(self, graph):
+    def test_one_hop_multiple_results_same_predicate(self, graph, bmt):
         """Query should return all edges matching the predicate."""
         query = {
             "message": {
@@ -137,7 +137,7 @@ class TestLookupOneHop:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # Three genes associated with MONDO:0005148:
@@ -152,7 +152,7 @@ class TestLookupOneHop:
 class TestLookupTwoHop:
     """Tests for two-hop queries using the lookup function."""
 
-    def test_two_hop_linear_path(self, graph):
+    def test_two_hop_linear_path(self, graph, bmt):
         """Two-hop query should return paths through intermediate nodes."""
         query = {
             "message": {
@@ -178,7 +178,7 @@ class TestLookupTwoHop:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # Three paths from Metformin through genes to Type 2 Diabetes:
@@ -193,7 +193,7 @@ class TestLookupTwoHop:
             assert result["node_bindings"]["n0"][0]["id"] == "CHEBI:6801"
             assert result["node_bindings"]["n2"][0]["id"] == "MONDO:0005148"
 
-    def test_two_hop_multiple_intermediate_nodes(self, graph):
+    def test_two_hop_multiple_intermediate_nodes(self, graph, bmt):
         """Two-hop query with multiple valid intermediate nodes."""
         query = {
             "message": {
@@ -219,7 +219,7 @@ class TestLookupTwoHop:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # NCBIGene:2645 (GCK) participates_in GO:0006006 AND
@@ -232,7 +232,7 @@ class TestLookupTwoHop:
 class TestLookupEdgeCases:
     """Tests for edge cases in the lookup function."""
 
-    def test_nonexistent_start_node(self, graph):
+    def test_nonexistent_start_node(self, graph, bmt):
         """Query with non-existent start node should return 0 paths."""
         query = {
             "message": {
@@ -252,12 +252,12 @@ class TestLookupEdgeCases:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         assert len(results) == 0
 
-    def test_nonexistent_end_node(self, graph):
+    def test_nonexistent_end_node(self, graph, bmt):
         """Query with non-existent end node should return 0 paths."""
         query = {
             "message": {
@@ -277,12 +277,12 @@ class TestLookupEdgeCases:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         assert len(results) == 0
 
-    def test_category_filter_excludes_non_matching(self, graph):
+    def test_category_filter_excludes_non_matching(self, graph, bmt):
         """Category filter should exclude nodes not matching the category."""
         query = {
             "message": {
@@ -302,7 +302,7 @@ class TestLookupEdgeCases:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # CHEBI:6801 affects NCBIGene:5468 (Gene) and CHEBI:17234 (SmallMolecule)
@@ -313,7 +313,7 @@ class TestLookupEdgeCases:
 class TestLookupResponseStructure:
     """Tests for verifying the response structure from lookup."""
 
-    def test_response_contains_knowledge_graph(self, graph):
+    def test_response_contains_knowledge_graph(self, graph, bmt):
         """Response should contain knowledge_graph with nodes and edges."""
         query = {
             "message": {
@@ -333,14 +333,14 @@ class TestLookupResponseStructure:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
 
         assert "message" in response
         assert "knowledge_graph" in response["message"]
         assert "nodes" in response["message"]["knowledge_graph"]
         assert "edges" in response["message"]["knowledge_graph"]
 
-    def test_response_nodes_have_required_fields(self, graph):
+    def test_response_nodes_have_required_fields(self, graph, bmt):
         """Knowledge graph nodes should have id, category, and name."""
         query = {
             "message": {
@@ -360,7 +360,7 @@ class TestLookupResponseStructure:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         kg_nodes = response["message"]["knowledge_graph"]["nodes"]
 
         # Check Metformin node
@@ -370,7 +370,7 @@ class TestLookupResponseStructure:
         assert metformin["name"] == "Metformin"
         assert "biolink:SmallMolecule" in metformin["categories"]
 
-    def test_response_edges_have_required_fields(self, graph):
+    def test_response_edges_have_required_fields(self, graph, bmt):
         """Knowledge graph edges should have predicate, subject, object."""
         query = {
             "message": {
@@ -390,7 +390,7 @@ class TestLookupResponseStructure:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         kg_edges = response["message"]["knowledge_graph"]["edges"]
 
         # Should have 3 edges (treats includes descendants: ameliorates_condition, preventative_for_condition)
@@ -416,7 +416,7 @@ class TestLookupResponseStructure:
         edge_bindings = results[0]["analyses"][0]["edge_bindings"]["e0"]
         assert len(edge_bindings) == 3
 
-    def test_results_have_node_and_edge_bindings(self, graph):
+    def test_results_have_node_and_edge_bindings(self, graph, bmt):
         """Each result should have node_bindings and edge_bindings."""
         query = {
             "message": {
@@ -436,7 +436,7 @@ class TestLookupResponseStructure:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         result = response["message"]["results"][0]
 
         assert "node_bindings" in result
@@ -459,7 +459,7 @@ class TestLookupResponseStructure:
 class TestMetforminType2DiabetesEdges:
     """Tests specifically for Metformin to Type 2 Diabetes edges."""
 
-    def test_metformin_treats_type2_diabetes(self, graph):
+    def test_metformin_treats_type2_diabetes(self, graph, bmt):
         """Query for biolink:treats returns 1 result with 3 edge bindings.
 
         Note: biolink:treats is a parent predicate that includes descendants
@@ -484,7 +484,7 @@ class TestMetforminType2DiabetesEdges:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # Results aggregated by node path: 1 result with 3 edge bindings
@@ -497,7 +497,7 @@ class TestMetforminType2DiabetesEdges:
         edge_bindings = results[0]["analyses"][0]["edge_bindings"]["e0"]
         assert len(edge_bindings) == 3
 
-    def test_metformin_ameliorates_type2_diabetes(self, graph):
+    def test_metformin_ameliorates_type2_diabetes(self, graph, bmt):
         """Query for Metformin ameliorates_condition Type 2 Diabetes edge."""
         query = {
             "message": {
@@ -517,7 +517,7 @@ class TestMetforminType2DiabetesEdges:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         assert len(results) == 1
@@ -526,7 +526,7 @@ class TestMetforminType2DiabetesEdges:
         assert edge["subject"] == "CHEBI:6801"
         assert edge["object"] == "MONDO:0005148"
 
-    def test_metformin_prevents_type2_diabetes(self, graph):
+    def test_metformin_prevents_type2_diabetes(self, graph, bmt):
         """Query for Metformin preventative_for_condition Type 2 Diabetes edge."""
         query = {
             "message": {
@@ -546,7 +546,7 @@ class TestMetforminType2DiabetesEdges:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         assert len(results) == 1
@@ -555,7 +555,7 @@ class TestMetforminType2DiabetesEdges:
         assert edge["subject"] == "CHEBI:6801"
         assert edge["object"] == "MONDO:0005148"
 
-    def test_all_metformin_to_type2_diabetes_edges(self, graph):
+    def test_all_metformin_to_type2_diabetes_edges(self, graph, bmt):
         """Query for all edges from Metformin to Type 2 Diabetes returns 1 result with 3 edge bindings."""
         query = {
             "message": {
@@ -579,7 +579,7 @@ class TestMetforminType2DiabetesEdges:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # Results aggregated by node path: 1 result with 3 edge bindings
@@ -728,7 +728,7 @@ class TestQualifierConstraintMatching:
 class TestLookupWithQualifierConstraints:
     """Tests for lookup function with qualifier constraints."""
 
-    def test_qualifier_constraint_filters_edges(self, graph):
+    def test_qualifier_constraint_filters_edges(self, graph, bmt):
         """Qualifier constraints should filter to only matching edges."""
         query = {
             "message": {
@@ -756,14 +756,14 @@ class TestLookupWithQualifierConstraints:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # Only NCBIGene:3643 (INSR) has qualifiers matching activity+increased
         assert len(results) == 1
         assert results[0]["node_bindings"]["n1"][0]["id"] == "NCBIGene:3643"
 
-    def test_qualifier_constraint_decreased_direction(self, graph):
+    def test_qualifier_constraint_decreased_direction(self, graph, bmt):
         """Query for edges with decreased direction qualifier."""
         query = {
             "message": {
@@ -791,14 +791,14 @@ class TestLookupWithQualifierConstraints:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # Only NCBIGene:2645 (GCK) has qualifiers matching activity+decreased
         assert len(results) == 1
         assert results[0]["node_bindings"]["n1"][0]["id"] == "NCBIGene:2645"
 
-    def test_qualifier_constraint_abundance_aspect(self, graph):
+    def test_qualifier_constraint_abundance_aspect(self, graph, bmt):
         """Query for edges with abundance aspect qualifier."""
         query = {
             "message": {
@@ -825,14 +825,14 @@ class TestLookupWithQualifierConstraints:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # Only NCBIGene:7124 (TNF) has abundance qualifier
         assert len(results) == 1
         assert results[0]["node_bindings"]["n1"][0]["id"] == "NCBIGene:7124"
 
-    def test_qualifier_constraint_or_semantics(self, graph):
+    def test_qualifier_constraint_or_semantics(self, graph, bmt):
         """Multiple qualifier sets should use OR semantics."""
         query = {
             "message": {
@@ -865,7 +865,7 @@ class TestLookupWithQualifierConstraints:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # Should match both INSR (activity+increased) and TNF (abundance)
@@ -873,7 +873,7 @@ class TestLookupWithQualifierConstraints:
         result_ids = {r["node_bindings"]["n1"][0]["id"] for r in results}
         assert result_ids == {"NCBIGene:3643", "NCBIGene:7124"}
 
-    def test_no_qualifier_constraints_returns_all(self, graph):
+    def test_no_qualifier_constraints_returns_all(self, graph, bmt):
         """Without qualifier constraints, all edges should match."""
         query = {
             "message": {
@@ -893,14 +893,14 @@ class TestLookupWithQualifierConstraints:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # Should return all 4 affects edges to genes:
         # PPARG (no qualifiers), INSR (activity+increased), GCK (activity+decreased), TNF (abundance+increased)
         assert len(results) == 4
 
-    def test_qualifier_constraint_no_matches(self, graph):
+    def test_qualifier_constraint_no_matches(self, graph, bmt):
         """Query with non-matching qualifier constraints should return 0 results."""
         query = {
             "message": {
@@ -927,7 +927,7 @@ class TestLookupWithQualifierConstraints:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # No edges have expression qualifier
@@ -945,7 +945,7 @@ class TestSymmetricPredicates:
     - Query INSR -> PPARG should also find this edge (via symmetric property)
     """
 
-    def test_symmetric_predicate_forward_direction(self, graph):
+    def test_symmetric_predicate_forward_direction(self, graph, bmt):
         """Query in the direction the edge is stored should return the edge."""
         query = {
             "message": {
@@ -965,7 +965,7 @@ class TestSymmetricPredicates:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # Should find the direct edge PPARG -> INSR
@@ -982,7 +982,7 @@ class TestSymmetricPredicates:
         assert edge["subject"] == "NCBIGene:5468"
         assert edge["object"] == "NCBIGene:3643"
 
-    def test_symmetric_predicate_reverse_direction(self, graph):
+    def test_symmetric_predicate_reverse_direction(self, graph, bmt):
         """Query in reverse direction should also find the edge via symmetric property.
 
         Graph has: PPARG --interacts_with--> INSR
@@ -1007,7 +1007,7 @@ class TestSymmetricPredicates:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # Should find 1 result - the symmetric edge
@@ -1025,7 +1025,7 @@ class TestSymmetricPredicates:
         assert edge["subject"] == "NCBIGene:5468"
         assert edge["object"] == "NCBIGene:3643"
 
-    def test_symmetric_predicate_pinned_start_unpinned_end(self, graph):
+    def test_symmetric_predicate_pinned_start_unpinned_end(self, graph, bmt):
         """Query with pinned start should find neighbors via symmetric predicate."""
         query = {
             "message": {
@@ -1045,14 +1045,14 @@ class TestSymmetricPredicates:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # Should find INSR as interacting partner
         assert len(results) == 1
         assert results[0]["node_bindings"]["n1"][0]["id"] == "NCBIGene:3643"
 
-    def test_symmetric_predicate_unpinned_start_pinned_end(self, graph):
+    def test_symmetric_predicate_unpinned_start_pinned_end(self, graph, bmt):
         """Query with pinned end should find neighbors via symmetric predicate.
 
         Graph has: PPARG --interacts_with--> INSR
@@ -1077,14 +1077,14 @@ class TestSymmetricPredicates:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # Should find INSR as the subject (interacts with PPARG)
         assert len(results) == 1
         assert results[0]["node_bindings"]["n0"][0]["id"] == "NCBIGene:3643"
 
-    def test_symmetric_predicate_two_hop_forward(self, graph):
+    def test_symmetric_predicate_two_hop_forward(self, graph, bmt):
         """Two-hop query with symmetric predicate in forward direction.
 
         Path: Metformin --affects--> PPARG --interacts_with--> INSR
@@ -1113,7 +1113,7 @@ class TestSymmetricPredicates:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # Should find 1 path: Metformin -> PPARG -> INSR
@@ -1122,7 +1122,7 @@ class TestSymmetricPredicates:
         assert results[0]["node_bindings"]["n1"][0]["id"] == "NCBIGene:5468"
         assert results[0]["node_bindings"]["n2"][0]["id"] == "NCBIGene:3643"
 
-    def test_symmetric_predicate_two_hop_reverse(self, graph):
+    def test_symmetric_predicate_two_hop_reverse(self, graph, bmt):
         """Two-hop query with symmetric predicate in reverse direction.
 
         Query path: Metformin --affects--> PPARG <--interacts_with-- INSR
@@ -1153,7 +1153,7 @@ class TestSymmetricPredicates:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         results = response["message"]["results"]
 
         # Should find 1 path via symmetric interacts_with
@@ -1170,7 +1170,7 @@ class TestSymmetricPredicateValidation:
     are real edges that exist in the graph, not "phantom edges".
     """
 
-    def test_symmetric_edge_validation_forward(self, graph):
+    def test_symmetric_edge_validation_forward(self, graph, bmt):
         """Edges returned from forward symmetric query should exist in graph."""
         from gandalf.validation import validate_edge_exists
 
@@ -1192,7 +1192,7 @@ class TestSymmetricPredicateValidation:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         kg_edges = response["message"]["knowledge_graph"]["edges"]
 
         # Every edge in the knowledge graph should exist in the actual graph
@@ -1205,7 +1205,7 @@ class TestSymmetricPredicateValidation:
             )
             assert error is None, f"Edge {edge_id} not found: {edge}"
 
-    def test_symmetric_edge_validation_reverse(self, graph):
+    def test_symmetric_edge_validation_reverse(self, graph, bmt):
         """Edges returned from reverse symmetric query should exist in graph.
 
         This is the key test for the phantom edge bug. When querying in
@@ -1232,7 +1232,7 @@ class TestSymmetricPredicateValidation:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         kg_edges = response["message"]["knowledge_graph"]["edges"]
 
         # Should have found at least one edge
@@ -1251,7 +1251,7 @@ class TestSymmetricPredicateValidation:
                 f"{edge['subject']} --{edge['predicate']}--> {edge['object']}"
             )
 
-    def test_symmetric_two_hop_validation(self, graph):
+    def test_symmetric_two_hop_validation(self, graph, bmt):
         """All edges in multi-hop symmetric query should exist in graph."""
         from gandalf.validation import validate_edge_exists
 
@@ -1279,7 +1279,7 @@ class TestSymmetricPredicateValidation:
             },
         }
 
-        response = lookup(graph, query, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False)
         kg_edges = response["message"]["knowledge_graph"]["edges"]
 
         # Validate every edge
