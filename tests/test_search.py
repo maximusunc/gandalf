@@ -368,7 +368,7 @@ class TestLookupResponseStructure:
         metformin = kg_nodes["CHEBI:6801"]
         assert metformin["id"] == "CHEBI:6801"
         assert metformin["name"] == "Metformin"
-        assert "biolink:SmallMolecule" in metformin["category"]
+        assert "biolink:SmallMolecule" in metformin["categories"]
 
     def test_response_edges_have_required_fields(self, graph):
         """Knowledge graph edges should have predicate, subject, object."""
