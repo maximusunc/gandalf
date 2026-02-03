@@ -347,7 +347,7 @@ class CSRGraph:
             if neighbor == dst_idx:
                 predicate_str = self.id_to_predicate[int(pred_id)]
                 # Apply predicate filter if specified
-                if predicate_filter is not None and predicate_str in predicate_filter:
+                if predicate_filter is None or predicate_str in predicate_filter:
                     result.append((predicate_str, prop))
 
         t1 = time.perf_counter()

@@ -87,7 +87,7 @@ class TestNodeProperties:
     def test_node_category_property(self, graph):
         """Should correctly load node category property."""
         pparg_idx = graph.node_id_to_idx["NCBIGene:5468"]
-        categories = graph.get_node_property(pparg_idx, "category")
+        categories = graph.get_node_property(pparg_idx, "categories")
         assert "biolink:Gene" in categories
 
     def test_node_information_content(self, graph):
