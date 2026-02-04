@@ -5,7 +5,7 @@ import os
 import pytest
 
 from gandalf.loader import build_graph_from_jsonl
-from gandalf.search import lookup, _edge_matches_qualifier_constraints
+from gandalf.search import lookup, _edge_matches_qualifier_constraints, QualifierExpander
 
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -723,6 +723,173 @@ class TestQualifierConstraintMatching:
             }
         ]
         assert _edge_matches_qualifier_constraints(edge_qualifiers, constraints) is True
+
+    def test_expanded_format_single_value_match(self):
+        """Expanded format with qualifier_values (plural) should match if edge has any value."""
+        edge_qualifiers = [
+            {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"}
+        ]
+        # Expanded format: qualifier_values (plural) with list of acceptable values
+        constraints = [
+            {
+                "qualifier_set": [
+                    {
+                        "qualifier_type_id": "biolink:object_aspect_qualifier",
+                        "qualifier_values": ["activity", "abundance"],  # Edge has "activity"
+                    }
+                ]
+            }
+        ]
+        assert _edge_matches_qualifier_constraints(edge_qualifiers, constraints) is True
+
+    def test_expanded_format_no_match(self):
+        """Expanded format should not match if edge value is not in the list."""
+        edge_qualifiers = [
+            {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "expression"}
+        ]
+        constraints = [
+            {
+                "qualifier_set": [
+                    {
+                        "qualifier_type_id": "biolink:object_aspect_qualifier",
+                        "qualifier_values": ["activity", "abundance"],  # "expression" not in list
+                    }
+                ]
+            }
+        ]
+        assert _edge_matches_qualifier_constraints(edge_qualifiers, constraints) is False
+
+    def test_expanded_format_multiple_types_all_match(self):
+        """Expanded format with multiple qualifier types - all must match (AND semantics)."""
+        edge_qualifiers = [
+            {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"},
+            {"qualifier_type_id": "biolink:object_direction_qualifier", "qualifier_value": "increased"},
+        ]
+        constraints = [
+            {
+                "qualifier_set": [
+                    {
+                        "qualifier_type_id": "biolink:object_aspect_qualifier",
+                        "qualifier_values": ["activity", "abundance"],
+                    },
+                    {
+                        "qualifier_type_id": "biolink:object_direction_qualifier",
+                        "qualifier_values": ["increased", "decreased"],
+                    },
+                ]
+            }
+        ]
+        assert _edge_matches_qualifier_constraints(edge_qualifiers, constraints) is True
+
+    def test_expanded_format_multiple_types_partial_match(self):
+        """Expanded format with multiple qualifier types - partial match should fail."""
+        edge_qualifiers = [
+            {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"},
+            {"qualifier_type_id": "biolink:object_direction_qualifier", "qualifier_value": "unchanged"},
+        ]
+        constraints = [
+            {
+                "qualifier_set": [
+                    {
+                        "qualifier_type_id": "biolink:object_aspect_qualifier",
+                        "qualifier_values": ["activity", "abundance"],  # Matches
+                    },
+                    {
+                        "qualifier_type_id": "biolink:object_direction_qualifier",
+                        "qualifier_values": ["increased", "decreased"],  # "unchanged" not in list
+                    },
+                ]
+            }
+        ]
+        assert _edge_matches_qualifier_constraints(edge_qualifiers, constraints) is False
+
+
+class TestQualifierExpander:
+    """Tests for the QualifierExpander class which handles qualifier value hierarchy."""
+
+    def test_get_value_descendants_unknown_value(self, bmt):
+        """Unknown values should return just the original value."""
+        expander = QualifierExpander(bmt)
+        descendants = expander.get_value_descendants("unknown_value_xyz")
+        assert "unknown_value_xyz" in descendants
+        # May only have the original value if not in any enum
+        assert len(descendants) >= 1
+
+    def test_get_value_descendants_activity(self, bmt):
+        """Activity value should include itself (may have no children)."""
+        expander = QualifierExpander(bmt)
+        descendants = expander.get_value_descendants("activity")
+        assert "activity" in descendants
+
+    def test_expand_qualifier_constraints_empty(self, bmt):
+        """Empty constraints should return empty."""
+        expander = QualifierExpander(bmt)
+        result = expander.expand_qualifier_constraints([])
+        assert result == []
+
+    def test_expand_qualifier_constraints_none(self, bmt):
+        """None constraints should return None."""
+        expander = QualifierExpander(bmt)
+        result = expander.expand_qualifier_constraints(None)
+        assert result is None
+
+    def test_expand_qualifier_constraints_empty_qualifier_set(self, bmt):
+        """Empty qualifier_set should be preserved."""
+        expander = QualifierExpander(bmt)
+        constraints = [{"qualifier_set": []}]
+        result = expander.expand_qualifier_constraints(constraints)
+        assert len(result) == 1
+        assert result[0]["qualifier_set"] == []
+
+    def test_expand_qualifier_constraints_creates_qualifier_values(self, bmt):
+        """Expansion should create qualifier_values (plural) format."""
+        expander = QualifierExpander(bmt)
+        constraints = [
+            {
+                "qualifier_set": [
+                    {
+                        "qualifier_type_id": "biolink:object_aspect_qualifier",
+                        "qualifier_value": "activity",
+                    }
+                ]
+            }
+        ]
+        result = expander.expand_qualifier_constraints(constraints)
+        assert len(result) == 1
+        assert len(result[0]["qualifier_set"]) == 1
+        expanded_qualifier = result[0]["qualifier_set"][0]
+        assert expanded_qualifier["qualifier_type_id"] == "biolink:object_aspect_qualifier"
+        assert "qualifier_values" in expanded_qualifier
+        assert "activity" in expanded_qualifier["qualifier_values"]
+
+    def test_expand_qualifier_constraints_preserves_or_semantics(self, bmt):
+        """Multiple qualifier_sets should be preserved (OR semantics)."""
+        expander = QualifierExpander(bmt)
+        constraints = [
+            {
+                "qualifier_set": [
+                    {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "activity"}
+                ]
+            },
+            {
+                "qualifier_set": [
+                    {"qualifier_type_id": "biolink:object_aspect_qualifier", "qualifier_value": "abundance"}
+                ]
+            },
+        ]
+        result = expander.expand_qualifier_constraints(constraints)
+        assert len(result) == 2
+
+    def test_caching_works(self, bmt):
+        """Repeated calls should use cache."""
+        expander = QualifierExpander(bmt)
+        # First call
+        descendants1 = expander.get_value_descendants("activity")
+        # Second call should use cache
+        descendants2 = expander.get_value_descendants("activity")
+        assert descendants1 == descendants2
+        # Check cache was populated
+        assert ("_all_", "activity") in expander._descendants_cache
 
 
 class TestLookupWithQualifierConstraints:

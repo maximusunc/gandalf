@@ -14,6 +14,129 @@ from gandalf.graph import CSRGraph
 from gandalf.query_planner import get_next_qedge, remove_orphaned
 
 
+class QualifierExpander:
+    """
+    Handles qualifier value expansion using BMT hierarchy at query time.
+
+    This class caches BMT lookups for performance and provides methods to expand
+    qualifier values to include their descendants, following the reasoner-transpiler
+    approach.
+
+    For example, if a query specifies qualifier_value "activity_or_abundance",
+    this will expand to also match "activity" and "abundance" (the child values).
+    """
+
+    def __init__(self, bmt: Toolkit):
+        self.bmt = bmt
+        self._descendants_cache: dict[tuple[str, str], list[str]] = {}
+        self._enum_names: list[str] | None = None
+
+    def _get_enum_names(self) -> list[str]:
+        """Get all enum names from the Biolink Model (cached)."""
+        if self._enum_names is None:
+            try:
+                self._enum_names = list(self.bmt.view.all_enums().keys())
+            except Exception:
+                self._enum_names = []
+        return self._enum_names
+
+    def get_value_descendants(self, qualifier_value: str) -> list[str]:
+        """
+        Get all descendant values for a qualifier value across all Biolink enums.
+
+        Args:
+            qualifier_value: The qualifier value to expand
+
+        Returns:
+            List of descendant values (including the original value)
+        """
+        # Check cache with just the value as key (we search all enums)
+        cache_key = ("_all_", qualifier_value)
+        if cache_key in self._descendants_cache:
+            return self._descendants_cache[cache_key]
+
+        descendants = set()
+        descendants.add(qualifier_value)  # Always include the original value
+
+        # Search all enums for this value and get descendants
+        for enum_name in self._get_enum_names():
+            try:
+                if self.bmt.is_permissible_value_of_enum(
+                    enum_name=enum_name, value=qualifier_value
+                ):
+                    enum_descendants = self.bmt.get_permissible_value_descendants(
+                        permissible_value=qualifier_value, enum_name=enum_name
+                    )
+                    if enum_descendants:
+                        descendants.update(enum_descendants)
+            except Exception:
+                # If BMT methods fail, continue with other enums
+                continue
+
+        result = list(descendants)
+        self._descendants_cache[cache_key] = result
+        return result
+
+    def expand_qualifier_constraints(
+        self, qualifier_constraints: list[dict]
+    ) -> list[dict]:
+        """
+        Expand qualifier constraints to include descendant values.
+
+        This transforms each qualifier in a qualifier_set by expanding its value
+        to include descendant values. The result uses a special format where each
+        qualifier has "qualifier_values" (plural) containing all acceptable values.
+
+        The matching semantics remain:
+        - OR between qualifier_sets (edge matches if ANY set matches)
+        - AND within each qualifier_set (edge must match ALL qualifiers in a set)
+        - OR between expanded values (edge matches if it has ANY of the descendant values)
+
+        Args:
+            qualifier_constraints: List of qualifier constraint dicts, each with
+                                   a 'qualifier_set' containing qualifiers to match
+
+        Returns:
+            Expanded qualifier constraints with "qualifier_values" lists
+        """
+        if not qualifier_constraints:
+            return qualifier_constraints
+
+        expanded_constraints = []
+        for constraint in qualifier_constraints:
+            qualifier_set = constraint.get("qualifier_set", [])
+            if not qualifier_set:
+                # Empty qualifier_set matches any edge, keep as-is
+                expanded_constraints.append(constraint)
+                continue
+
+            # Expand each qualifier in the set
+            expanded_qualifiers = []
+            for qualifier in qualifier_set:
+                type_id = qualifier.get("qualifier_type_id")
+                value = qualifier.get("qualifier_value")
+
+                if not type_id or not value:
+                    # Keep original if missing fields
+                    expanded_qualifiers.append(qualifier)
+                    continue
+
+                # Get descendant values (includes original)
+                descendant_values = self.get_value_descendants(value)
+
+                # Create expanded qualifier with list of acceptable values
+                expanded_qualifiers.append(
+                    {
+                        "qualifier_type_id": type_id,
+                        "qualifier_values": descendant_values,  # plural - list of values
+                    }
+                )
+
+            expanded_constraints.append({"qualifier_set": expanded_qualifiers})
+
+        return expanded_constraints
+
+
 class PredicateExpander:
     """
     Handles predicate expansion for symmetric and inverse predicates at query time.
@@ -251,6 +374,10 @@ def _edge_matches_qualifier_constraints(edge_qualifiers, qualifier_constraints):
     within each qualifier_set. An edge matches if it satisfies at least one
     qualifier_set (i.e., has ALL qualifiers in that set).
 
+    Supports two formats for constraint qualifiers:
+    - Original: {"qualifier_type_id": "...", "qualifier_value": "..."} - exact match
+    - Expanded: {"qualifier_type_id": "...", "qualifier_values": [...]} - match any value
+
     Args:
         edge_qualifiers: List of qualifier dicts from the edge, each with
                         'qualifier_type_id' and 'qualifier_value'
@@ -267,12 +394,17 @@ def _edge_matches_qualifier_constraints(edge_qualifiers, qualifier_constraints):
 
     # Build a set of (type_id, value) tuples from edge qualifiers for fast lookup
     edge_qualifier_set = set()
+    # Also build a dict mapping type_id -> set of values for expanded matching
+    edge_qualifiers_by_type: dict[str, set[str]] = {}
     if edge_qualifiers:
         for q in edge_qualifiers:
             type_id = q.get("qualifier_type_id")
             value = q.get("qualifier_value")
             if type_id and value:
                 edge_qualifier_set.add((type_id, value))
+                if type_id not in edge_qualifiers_by_type:
+                    edge_qualifiers_by_type[type_id] = set()
+                edge_qualifiers_by_type[type_id].add(value)
 
     # Check if edge satisfies at least one qualifier_set (OR semantics)
     for constraint in qualifier_constraints:
@@ -285,10 +417,21 @@ def _edge_matches_qualifier_constraints(edge_qualifiers, qualifier_constraints):
         all_match = True
         for required_qualifier in qualifier_set:
             req_type = required_qualifier.get("qualifier_type_id")
-            req_value = required_qualifier.get("qualifier_value")
-            if (req_type, req_value) not in edge_qualifier_set:
-                all_match = False
-                break
+
+            # Check for expanded format (qualifier_values - plural)
+            req_values = required_qualifier.get("qualifier_values")
+            if req_values is not None:
+                # Expanded format: edge must have this type with ANY of the values
+                edge_values = edge_qualifiers_by_type.get(req_type, set())
+                if not edge_values.intersection(req_values):
+                    all_match = False
+                    break
+            else:
+                # Original format: exact match required
+                req_value = required_qualifier.get("qualifier_value")
+                if (req_type, req_value) not in edge_qualifier_set:
+                    all_match = False
+                    break
 
         if all_match:
             return True
@@ -785,6 +928,9 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
     # Create predicate expander for handling symmetric/inverse predicates at query time
     predicate_expander = PredicateExpander(bmt)
 
+    # Create qualifier expander for handling qualifier value hierarchy at query time
+    qualifier_expander = QualifierExpander(bmt)
+
     query_graph = query["message"]["query_graph"]
     subqgraph = copy.deepcopy(query_graph)
 
@@ -855,8 +1001,12 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
         # Store inverse predicates for this edge (for path reconstruction)
         edge_inverse_preds[next_edge_id] = set(inverse_predicates)
 
-        # Get qualifier constraints for this edge
+        # Get qualifier constraints for this edge and expand to include descendant values
         qualifier_constraints = next_edge.get("qualifier_constraints", [])
+        if qualifier_constraints:
+            qualifier_constraints = qualifier_expander.expand_qualifier_constraints(
+                qualifier_constraints
+            )
 
         # Query for matching edges
         edge_matches = _query_edge(
