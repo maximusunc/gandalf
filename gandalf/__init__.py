@@ -9,7 +9,7 @@ from gandalf.diagnostics import (
     analyze_predicates,
     diagnose_path_explosion,
 )
-from gandalf.graph import CSRGraph
+from gandalf.graph import CSRGraph, EdgePropertyStore
 from gandalf.loader import build_graph_from_jsonl
 from gandalf.query_planner import get_next_qedge
 from gandalf.search import (
@@ -33,6 +33,7 @@ from gandalf.validation import (
 __all__ = [
     # Core classes
     "CSRGraph",
+    "EdgePropertyStore",
     # Loading
     "build_graph_from_jsonl",
     # Search
