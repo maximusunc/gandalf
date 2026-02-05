@@ -242,7 +242,11 @@ class TestGraphMmapSaveLoad:
                 "rev_predicates.npy",
                 "rev_offsets.npy",
                 "metadata.pkl",
-                "edge_properties.pkl",
+                # Edge properties stored as split mmap-friendly components
+                "edge_pubs_idx.npy",
+                "edge_sources_idx.npy",
+                "edge_quals_idx.npy",
+                "edge_property_pools.pkl",
             ]
             for filename in expected_files:
                 assert os.path.exists(os.path.join(temp_dir, filename)), f"Missing {filename}"

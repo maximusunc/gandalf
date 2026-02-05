@@ -140,6 +140,54 @@ class EdgePropertyStore:
             "unique_qualifiers": len(self._quals_pool),
         }
 
+    def save_mmap(self, directory: Path):
+        """Save to directory as mmap-friendly files.
+
+        Writes the three per-edge index arrays as .npy files (memory-mappable)
+        and the three small intern pools as a single pickle.
+        """
+        np.save(directory / "edge_pubs_idx.npy", self._pubs_idx)
+        np.save(directory / "edge_sources_idx.npy", self._sources_idx)
+        np.save(directory / "edge_quals_idx.npy", self._quals_idx)
+
+        pools = {
+            "pubs_pool": self._pubs_pool,
+            "sources_pool": self._sources_pool,
+            "quals_pool": self._quals_pool,
+        }
+        with open(directory / "edge_property_pools.pkl", "wb") as f:
+            pickle.dump(pools, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    @classmethod
+    def load_mmap(cls, directory: Path, mmap_mode: str = "r"):
+        """Load from directory, memory-mapping the index arrays.
+
+        The per-edge index arrays are loaded via np.load with mmap_mode so
+        they stay on disk and are paged in on demand (and shared across
+        forked workers via copy-on-write).  The pools are small and loaded
+        fully into RAM.
+        """
+        store = cls()
+
+        store._pubs_idx = np.load(
+            directory / "edge_pubs_idx.npy", mmap_mode=mmap_mode
+        )
+        store._sources_idx = np.load(
+            directory / "edge_sources_idx.npy", mmap_mode=mmap_mode
+        )
+        store._quals_idx = np.load(
+            directory / "edge_quals_idx.npy", mmap_mode=mmap_mode
+        )
+
+        with open(directory / "edge_property_pools.pkl", "rb") as f:
+            pools = pickle.load(f)
+
+        store._pubs_pool = pools["pubs_pool"]
+        store._sources_pool = pools["sources_pool"]
+        store._quals_pool = pools["quals_pool"]
+
+        return store
+
 
 class CSRGraph:
     """
@@ -647,7 +695,8 @@ class CSRGraph:
         Creates a directory with separate files:
         - NumPy arrays as .npy files (can be memory-mapped)
         - Metadata dictionaries as pickle
-        - Edge properties as separate pickle (large, but shared via copy-on-write)
+        - Edge property index arrays as .npy files (memory-mapped)
+        - Edge property intern pools as small pickle
 
         Args:
             directory: Directory path to save graph files
@@ -677,9 +726,15 @@ class CSRGraph:
         with open(directory / "metadata.pkl", "wb") as f:
             pickle.dump(metadata, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-        # Save edge properties separately (large file, shared via copy-on-write)
-        with open(directory / "edge_properties.pkl", "wb") as f:
-            pickle.dump(self.edge_properties, f, protocol=pickle.HIGHEST_PROTOCOL)
+        # Save edge properties as mmap-friendly components:
+        # - 3 numpy .npy index arrays (memory-mappable)
+        # - 1 small pickle with the intern pools
+        if isinstance(self.edge_properties, EdgePropertyStore):
+            self.edge_properties.save_mmap(directory)
+        else:
+            # Legacy fallback: pickle the whole thing
+            with open(directory / "edge_properties.pkl", "wb") as f:
+                pickle.dump(self.edge_properties, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         t1 = time.perf_counter()
         print(f"Graph saved in {t1 - t0:.2f}s")
@@ -752,18 +807,30 @@ class CSRGraph:
         graph.node_properties = metadata["node_properties"]
         graph.edge_prop_index = metadata.get("edge_prop_index", {})
 
-        # Load edge properties (large, but will be shared via fork)
+        # Load edge properties - prefer new split mmap format, fall back
+        # to legacy single-pickle format
         t_props_start = time.perf_counter()
-        with open(directory / "edge_properties.pkl", "rb") as f:
-            graph.edge_properties = pickle.load(f)
-        t_props_end = time.perf_counter()
 
-        # Convert old list-of-dicts format to EdgePropertyStore
-        if isinstance(graph.edge_properties, list):
-            print("  Converting edge properties to deduplicated format...")
-            graph.edge_properties = EdgePropertyStore.from_property_list(
-                graph.edge_properties
+        if (directory / "edge_property_pools.pkl").exists():
+            # New format: 3 mmap'd numpy arrays + small pools pickle
+            graph.edge_properties = EdgePropertyStore.load_mmap(
+                directory, mmap_mode=mmap_mode
             )
+        elif (directory / "edge_properties.pkl").exists():
+            # Legacy format: one big pickle (EdgePropertyStore or list)
+            with open(directory / "edge_properties.pkl", "rb") as f:
+                graph.edge_properties = pickle.load(f)
+            if isinstance(graph.edge_properties, list):
+                print("  Converting edge properties to deduplicated format...")
+                graph.edge_properties = EdgePropertyStore.from_property_list(
+                    graph.edge_properties
+                )
+        else:
+            raise FileNotFoundError(
+                f"No edge property files found in {directory}"
+            )
+
+        t_props_end = time.perf_counter()
 
         if isinstance(graph.edge_properties, EdgePropertyStore):
             stats = graph.edge_properties.dedup_stats()
