@@ -51,8 +51,10 @@ def build_graph_from_jsonl(
             edge_set.add(edge_id)
 
             # Store edge with its properties
+            # Note: predicate is NOT stored here - it's already in the CSR arrays
+            # as an integer (fwd_predicates), saving significant memory via
+            # EdgePropertyStore deduplication.
             edge_props = {
-                "predicate": predicate,
                 # "category": data.get("category", []),
                 "publications": data.get("publications", []),
                 "sources": [

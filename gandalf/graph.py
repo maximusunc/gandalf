@@ -9,6 +9,186 @@ from typing import Optional, Union
 import numpy as np
 
 
+class EdgePropertyStore:
+    """Memory-efficient storage for edge properties using deduplication.
+
+    Instead of storing a separate dict per edge, this class deduplicates
+    common field values across edges. Each unique publications list, sources
+    list, and qualifiers list is stored only once in a shared pool, and
+    edges reference them by integer index.
+
+    For a graph with 100M edges where there might be only ~50 unique source
+    configs, ~10K unique qualifier combos, and ~1M unique publication sets,
+    this typically reduces memory from ~30GB to ~2-3GB.
+
+    The 'predicate' key is NOT stored here since it's already in the CSR
+    arrays as an integer (fwd_predicates). CSRGraph accessor methods
+    synthesize it when needed.
+    """
+
+    __slots__ = (
+        '_pubs_pool', '_sources_pool', '_quals_pool',
+        '_pubs_idx', '_sources_idx', '_quals_idx',
+    )
+
+    def __init__(self):
+        self._pubs_pool = []
+        self._sources_pool = []
+        self._quals_pool = []
+        self._pubs_idx = None
+        self._sources_idx = None
+        self._quals_idx = None
+
+    @staticmethod
+    def _make_hashable(obj):
+        """Convert a JSON-compatible value to a hashable key for interning."""
+        if isinstance(obj, dict):
+            return tuple(sorted(
+                (k, EdgePropertyStore._make_hashable(v)) for k, v in obj.items()
+            ))
+        elif isinstance(obj, (list, tuple)):
+            return tuple(EdgePropertyStore._make_hashable(item) for item in obj)
+        return obj
+
+    @classmethod
+    def from_property_list(cls, props_list):
+        """Build an EdgePropertyStore from a list of property dicts.
+
+        Args:
+            props_list: List of dicts, each with keys like 'publications',
+                        'sources', 'qualifiers'. The 'predicate' key is
+                        ignored (stored separately in CSR arrays).
+        """
+        store = cls()
+        n = len(props_list)
+
+        pubs_intern = {}
+        sources_intern = {}
+        quals_intern = {}
+
+        pubs_indices = np.empty(n, dtype=np.int32)
+        sources_indices = np.empty(n, dtype=np.int32)
+        quals_indices = np.empty(n, dtype=np.int32)
+
+        for i, props in enumerate(props_list):
+            # Intern publications
+            pubs = props.get("publications", [])
+            pubs_key = cls._make_hashable(pubs)
+            if pubs_key not in pubs_intern:
+                pubs_intern[pubs_key] = len(store._pubs_pool)
+                store._pubs_pool.append(pubs)
+            pubs_indices[i] = pubs_intern[pubs_key]
+
+            # Intern sources
+            sources = props.get("sources", [])
+            sources_key = cls._make_hashable(sources)
+            if sources_key not in sources_intern:
+                sources_intern[sources_key] = len(store._sources_pool)
+                store._sources_pool.append(sources)
+            sources_indices[i] = sources_intern[sources_key]
+
+            # Intern qualifiers
+            quals = props.get("qualifiers", [])
+            quals_key = cls._make_hashable(quals)
+            if quals_key not in quals_intern:
+                quals_intern[quals_key] = len(store._quals_pool)
+                store._quals_pool.append(quals)
+            quals_indices[i] = quals_intern[quals_key]
+
+        store._pubs_idx = pubs_indices
+        store._sources_idx = sources_indices
+        store._quals_idx = quals_indices
+
+        return store
+
+    def __len__(self):
+        if self._pubs_idx is None:
+            return 0
+        return len(self._pubs_idx)
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            indices = range(*key.indices(len(self)))
+            return [self._get_props(i) for i in indices]
+        return self._get_props(key)
+
+    def _get_props(self, idx):
+        """Get the full property dict for an edge at the given index."""
+        return {
+            "publications": self._pubs_pool[self._pubs_idx[idx]],
+            "sources": self._sources_pool[self._sources_idx[idx]],
+            "qualifiers": self._quals_pool[self._quals_idx[idx]],
+        }
+
+    def get_field(self, idx, key, default=None):
+        """Get a single field value without creating a full dict."""
+        if key == "publications":
+            return self._pubs_pool[self._pubs_idx[idx]]
+        elif key == "sources":
+            return self._sources_pool[self._sources_idx[idx]]
+        elif key == "qualifiers":
+            return self._quals_pool[self._quals_idx[idx]]
+        return default
+
+    def dedup_stats(self):
+        """Return statistics about deduplication effectiveness."""
+        n = len(self)
+        return {
+            "total_edges": n,
+            "unique_publications": len(self._pubs_pool),
+            "unique_sources": len(self._sources_pool),
+            "unique_qualifiers": len(self._quals_pool),
+        }
+
+    def save_mmap(self, directory: Path):
+        """Save to directory as mmap-friendly files.
+
+        Writes the three per-edge index arrays as .npy files (memory-mappable)
+        and the three small intern pools as a single pickle.
+        """
+        np.save(directory / "edge_pubs_idx.npy", self._pubs_idx)
+        np.save(directory / "edge_sources_idx.npy", self._sources_idx)
+        np.save(directory / "edge_quals_idx.npy", self._quals_idx)
+
+        pools = {
+            "pubs_pool": self._pubs_pool,
+            "sources_pool": self._sources_pool,
+            "quals_pool": self._quals_pool,
+        }
+        with open(directory / "edge_property_pools.pkl", "wb") as f:
+            pickle.dump(pools, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    @classmethod
+    def load_mmap(cls, directory: Path, mmap_mode: str = "r"):
+        """Load from directory, memory-mapping the index arrays.
+
+        The per-edge index arrays are loaded via np.load with mmap_mode so
+        they stay on disk and are paged in on demand (and shared across
+        forked workers via copy-on-write).  The pools are small and loaded
+        fully into RAM.
+        """
+        store = cls()
+
+        store._pubs_idx = np.load(
+            directory / "edge_pubs_idx.npy", mmap_mode=mmap_mode
+        )
+        store._sources_idx = np.load(
+            directory / "edge_sources_idx.npy", mmap_mode=mmap_mode
+        )
+        store._quals_idx = np.load(
+            directory / "edge_quals_idx.npy", mmap_mode=mmap_mode
+        )
+
+        with open(directory / "edge_property_pools.pkl", "rb") as f:
+            pools = pickle.load(f)
+
+        store._pubs_pool = pools["pubs_pool"]
+        store._sources_pool = pools["sources_pool"]
+        store._quals_pool = pools["quals_pool"]
+
+        return store
+
+
 class CSRGraph:
     """
     Compressed Sparse Row graph representation for fast neighbor lookups.
@@ -75,7 +255,16 @@ class CSRGraph:
         self.fwd_predicates = np.array(
             [pred_id for src, dst, pred_id, _ in edges_with_props], dtype=np.int32
         )
-        self.edge_properties = [props for _, _, _, props in edges_with_props]
+
+        # Build deduplicated edge property store
+        props_list = [props for _, _, _, props in edges_with_props]
+        self.edge_properties = EdgePropertyStore.from_property_list(props_list)
+
+        stats = self.edge_properties.dedup_stats()
+        print(f"  Edge property dedup: {stats['total_edges']:,} edges -> "
+              f"{stats['unique_publications']:,} unique publication lists, "
+              f"{stats['unique_sources']:,} unique source configs, "
+              f"{stats['unique_qualifiers']:,} unique qualifier combos")
 
         # Build edge property index: (src, dst, pred_id) -> index
         self.edge_prop_index = {}
@@ -300,6 +489,14 @@ class CSRGraph:
         edge_idx = self.edge_prop_index.get((src_idx, dst_idx, pred_id))
         if edge_idx is None:
             return default
+
+        # Predicate is stored in CSR arrays, not in edge properties
+        if key == "predicate":
+            return predicate
+
+        # Use efficient single-field access when available
+        if isinstance(self.edge_properties, EdgePropertyStore):
+            return self.edge_properties.get_field(edge_idx, key, default)
         return self.edge_properties[edge_idx].get(key, default)
 
     def get_all_edge_properties(self, src_idx, dst_idx, predicate):
@@ -312,7 +509,8 @@ class CSRGraph:
             predicate: Predicate string
 
         Returns:
-            Dict of all edge properties, or empty dict if edge not found
+            Dict of all edge properties, or empty dict if edge not found.
+            Always includes 'predicate' key (synthesized from CSR arrays).
         """
         pred_id = self.predicate_to_idx.get(predicate)
         if pred_id is None:
@@ -321,7 +519,12 @@ class CSRGraph:
         edge_idx = self.edge_prop_index.get((src_idx, dst_idx, pred_id))
         if edge_idx is None:
             return {}
-        return self.edge_properties[edge_idx]
+
+        # EdgePropertyStore.__getitem__ creates a new dict each time,
+        # so it's safe to add predicate to it without mutating the store
+        props = self.edge_properties[edge_idx]
+        props["predicate"] = predicate
+        return props
 
     def get_all_edges_between(self, src_idx, dst_idx, predicate_filter: Optional[list] = None):
         """
@@ -465,6 +668,20 @@ class CSRGraph:
         graph.node_properties = data["node_properties"]
         graph.edge_prop_index = data.get("edge_prop_index", {})
 
+        # Convert old list-of-dicts format to EdgePropertyStore
+        if isinstance(graph.edge_properties, list):
+            print("  Converting edge properties to deduplicated format...")
+            graph.edge_properties = EdgePropertyStore.from_property_list(
+                graph.edge_properties
+            )
+
+        if isinstance(graph.edge_properties, EdgePropertyStore):
+            stats = graph.edge_properties.dedup_stats()
+            print(f"  Edge property dedup: {stats['total_edges']:,} edges -> "
+                  f"{stats['unique_publications']:,} unique publication lists, "
+                  f"{stats['unique_sources']:,} unique source configs, "
+                  f"{stats['unique_qualifiers']:,} unique qualifier combos")
+
         print(
             f"Graph loaded! {graph.num_nodes:,} nodes, {len(graph.fwd_targets):,} edges"
         )
@@ -478,7 +695,8 @@ class CSRGraph:
         Creates a directory with separate files:
         - NumPy arrays as .npy files (can be memory-mapped)
         - Metadata dictionaries as pickle
-        - Edge properties as separate pickle (large, but shared via copy-on-write)
+        - Edge property index arrays as .npy files (memory-mapped)
+        - Edge property intern pools as small pickle
 
         Args:
             directory: Directory path to save graph files
@@ -508,9 +726,15 @@ class CSRGraph:
         with open(directory / "metadata.pkl", "wb") as f:
             pickle.dump(metadata, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-        # Save edge properties separately (large file, shared via copy-on-write)
-        with open(directory / "edge_properties.pkl", "wb") as f:
-            pickle.dump(self.edge_properties, f, protocol=pickle.HIGHEST_PROTOCOL)
+        # Save edge properties as mmap-friendly components:
+        # - 3 numpy .npy index arrays (memory-mappable)
+        # - 1 small pickle with the intern pools
+        if isinstance(self.edge_properties, EdgePropertyStore):
+            self.edge_properties.save_mmap(directory)
+        else:
+            # Legacy fallback: pickle the whole thing
+            with open(directory / "edge_properties.pkl", "wb") as f:
+                pickle.dump(self.edge_properties, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         t1 = time.perf_counter()
         print(f"Graph saved in {t1 - t0:.2f}s")
@@ -583,11 +807,37 @@ class CSRGraph:
         graph.node_properties = metadata["node_properties"]
         graph.edge_prop_index = metadata.get("edge_prop_index", {})
 
-        # Load edge properties (large, but will be shared via fork)
+        # Load edge properties - prefer new split mmap format, fall back
+        # to legacy single-pickle format
         t_props_start = time.perf_counter()
-        with open(directory / "edge_properties.pkl", "rb") as f:
-            graph.edge_properties = pickle.load(f)
+
+        if (directory / "edge_property_pools.pkl").exists():
+            # New format: 3 mmap'd numpy arrays + small pools pickle
+            graph.edge_properties = EdgePropertyStore.load_mmap(
+                directory, mmap_mode=mmap_mode
+            )
+        elif (directory / "edge_properties.pkl").exists():
+            # Legacy format: one big pickle (EdgePropertyStore or list)
+            with open(directory / "edge_properties.pkl", "rb") as f:
+                graph.edge_properties = pickle.load(f)
+            if isinstance(graph.edge_properties, list):
+                print("  Converting edge properties to deduplicated format...")
+                graph.edge_properties = EdgePropertyStore.from_property_list(
+                    graph.edge_properties
+                )
+        else:
+            raise FileNotFoundError(
+                f"No edge property files found in {directory}"
+            )
+
         t_props_end = time.perf_counter()
+
+        if isinstance(graph.edge_properties, EdgePropertyStore):
+            stats = graph.edge_properties.dedup_stats()
+            print(f"  Edge property dedup: {stats['total_edges']:,} edges -> "
+                  f"{stats['unique_publications']:,} unique publication lists, "
+                  f"{stats['unique_sources']:,} unique source configs, "
+                  f"{stats['unique_qualifiers']:,} unique qualifier combos")
 
         t1 = time.perf_counter()
         print(
