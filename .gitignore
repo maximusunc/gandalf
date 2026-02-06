@@ -3,6 +3,8 @@
 *.json
 *.tsv
 *.pkl
+*.npy
+*.zst
 
 # Python
 __pycache__/
