@@ -101,22 +101,30 @@ def build_graph_from_jsonl(
     pubs_intern = {}
     sources_intern = {}
     quals_intern = {}
-    attrs_intern = {}
     pubs_pool = []
     sources_pool = []
     quals_pool = []
-    attrs_pool = []
     pubs_indices = np.empty(line_count, dtype=np.int32)
     sources_indices = np.empty(line_count, dtype=np.int32)
     quals_indices = np.empty(line_count, dtype=np.int32)
-    attrs_indices = np.empty(line_count, dtype=np.int32)
+
+    # Attributes (all "other" fields) are NOT interned: they are typically
+    # high-cardinality (unique per edge due to scores, provenance IDs, etc.)
+    # which makes interning counter-productive (38M unique intern keys ≈ 100GB).
+    # Instead we store a single empty entry and point all edges at it.
+    attrs_pool = [[]]
+    attrs_indices = np.zeros(line_count, dtype=np.int32)
 
     # Dedup using integer tuples (much cheaper than string tuples)
     seen_edges = set()
 
-    # Fields that are handled specially (not dumped into attributes)
-    core_fields = {"id", "category", "subject", "object", "predicate", "sources",
-                   "publications", "qualifiers"}
+    # Fields consumed by dedicated extraction above (not dumped into attributes)
+    core_fields = {
+        "id", "category", "subject", "object", "predicate",
+        "sources", "publications", "qualifiers",
+        # Metadata fields handled via sources fallback or ignored
+        "primary_knowledge_source", "knowledge_level", "agent_type",
+    }
     qualifier_fields = {
         "qualified_predicate",
         "object_aspect_qualifier",
@@ -208,20 +216,8 @@ def build_graph_from_jsonl(
                     quals_pool.append(quals)
                 quals_indices[edge_count] = quals_intern[quals_key]
 
-                # --- Intern attributes (everything else) ---
-                attributes = []
-                for field, value in data.items():
-                    if field in core_fields or field in qualifier_fields:
-                        continue
-                    attributes.append({
-                        "attribute_type_id": f"biolink:{field}",
-                        "value": value,
-                    })
-                attrs_key = make_hashable(attributes)
-                if attrs_key not in attrs_intern:
-                    attrs_intern[attrs_key] = len(attrs_pool)
-                    attrs_pool.append(attributes)
-                attrs_indices[edge_count] = attrs_intern[attrs_key]
+                # Attributes (remaining fields) are skipped during loading —
+                # too high-cardinality for interning to be effective.
 
                 edge_count += 1
                 if edge_count % 1_000_000 == 0:
@@ -231,8 +227,8 @@ def build_graph_from_jsonl(
         if gc_was_enabled:
             gc.enable()
 
-    # Free intern dicts (they can be large for publications)
-    del seen_edges, pubs_intern, sources_intern, quals_intern, attrs_intern
+    # Free intern dicts (pubs_intern can be large if publications are unique)
+    del seen_edges, pubs_intern, sources_intern, quals_intern
     gc.collect()
 
     # Trim arrays to actual size
