@@ -54,21 +54,52 @@ def build_graph_from_jsonl(
             # Note: predicate is NOT stored here - it's already in the CSR arrays
             # as an integer (fwd_predicates), saving significant memory via
             # EdgePropertyStore deduplication.
+            core_fields = {"id", "category", "subject", "object", "predicate", "sources"}
+            # Known qualifier fields
+            qualifer_fields = {
+                "qualified_predicate",
+                "object_aspect_qualifier",
+                "object_direction_qualifier",
+                "subject_aspect_qualifier",
+                "subject_direction_qualifier",
+                "causal_mechanism_qualifier",
+                "species_context_qualifier",
+            }
             edge_props = {
                 # "category": data.get("category", []),
                 "publications": data.get("publications", []),
                 "sources": [
-                   {
-                       "resource_role": "primary_knowledge_source",
-                       "resource_id": data.get("primary_knowledge_source", "infores:gandalf"),
-                   },
+                    {
+                        "resource_id": s["resource_id"],
+                        "resource_role": s["resource_role"],
+                        **({"upstream_resource_ids": s["upstream_resource_ids"]} if "upstream_resource_ids" in s else {})
+                    }
+                    for s in data.get("sources", [])
                 ],
-                # "knowledge_level": data.get("knowledge_level", ""),
-                # "agent_type": data.get("agent_type", ""),
-                # "original_subject": data.get("original_subject", ""),
-                # "original_object": data.get("original_object", ""),
-                "qualifiers": data.get("qualifiers", []),
+                "attributes": [],
+                "qualifiers": []
             }
+
+            # --- Qualifiers ---
+            qualifier_set = []
+            for field in qualifer_fields:
+                if field in data:
+                    qualifier_set.append({
+                        "qualifier_type_id": f"biolink:{field}",
+                        "qualifier_value": data[field],
+                    })
+
+            if qualifier_set:
+                edge_props["qualifiers"] = [{"qualifier_set": qualifier_set}]
+
+            # --- Everything else becomes an attribute ---
+            for field, value in data.items():
+                if field in core_fields or field in qualifer_fields:
+                    continue
+                edge_props["attributes"].append({
+                    "attribute_type_id": f"biolink:{field}",
+                    "value": value,
+                })
 
             edge_list.append((subject, predicate, obj, edge_props))
 
