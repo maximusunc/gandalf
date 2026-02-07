@@ -243,7 +243,6 @@ class TestGraphMmapSaveLoad:
                 "rev_offsets.npy",
                 "metadata.pkl",
                 # Edge properties stored as split mmap-friendly components
-                "edge_pubs_idx.npy",
                 "edge_sources_idx.npy",
                 "edge_quals_idx.npy",
                 "edge_property_pools.pkl",
