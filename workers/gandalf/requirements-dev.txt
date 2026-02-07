@@ -1,4 +1,0 @@
-# Shepherd utilities - adjust source as needed:
-#   PyPI:  shepherd_utils
-#   Git:   shepherd_utils @ git+https://github.com/BioPack-team/shepherd.git#subdirectory=shepherd_utils
-shepherd_utils
