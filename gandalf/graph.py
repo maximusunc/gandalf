@@ -1,5 +1,6 @@
 """Main Gandalf CSR Graph class."""
 
+import gc
 import os
 import pickle
 import time
@@ -14,8 +15,8 @@ class EdgePropertyStore:
 
     Instead of storing a separate dict per edge, this class deduplicates
     common field values across edges. Each unique publications list, sources
-    list, and qualifiers list is stored only once in a shared pool, and
-    edges reference them by integer index.
+    list, qualifiers list, and attributes list is stored only once in a shared
+    pool, and edges reference them by integer index.
 
     For a graph with 100M edges where there might be only ~50 unique source
     configs, ~10K unique qualifier combos, and ~1M unique publication sets,
@@ -27,17 +28,19 @@ class EdgePropertyStore:
     """
 
     __slots__ = (
-        '_pubs_pool', '_sources_pool', '_quals_pool',
-        '_pubs_idx', '_sources_idx', '_quals_idx',
+        '_pubs_pool', '_sources_pool', '_quals_pool', '_attrs_pool',
+        '_pubs_idx', '_sources_idx', '_quals_idx', '_attrs_idx',
     )
 
     def __init__(self):
         self._pubs_pool = []
         self._sources_pool = []
         self._quals_pool = []
+        self._attrs_pool = []
         self._pubs_idx = None
         self._sources_idx = None
         self._quals_idx = None
+        self._attrs_idx = None
 
     @staticmethod
     def _make_hashable(obj):
@@ -51,13 +54,32 @@ class EdgePropertyStore:
         return obj
 
     @classmethod
+    def from_arrays_and_pools(cls, pubs_idx, sources_idx, quals_idx, attrs_idx,
+                               pubs_pool, sources_pool, quals_pool, attrs_pool):
+        """Build store from pre-interned arrays and pools.
+
+        Used by the streaming loader to construct the store directly without
+        building intermediate property dicts.
+        """
+        store = cls()
+        store._pubs_idx = pubs_idx
+        store._sources_idx = sources_idx
+        store._quals_idx = quals_idx
+        store._attrs_idx = attrs_idx
+        store._pubs_pool = pubs_pool
+        store._sources_pool = sources_pool
+        store._quals_pool = quals_pool
+        store._attrs_pool = attrs_pool
+        return store
+
+    @classmethod
     def from_property_list(cls, props_list):
         """Build an EdgePropertyStore from a list of property dicts.
 
         Args:
             props_list: List of dicts, each with keys like 'publications',
-                        'sources', 'qualifiers'. The 'predicate' key is
-                        ignored (stored separately in CSR arrays).
+                        'sources', 'qualifiers', 'attributes'. The 'predicate'
+                        key is ignored (stored separately in CSR arrays).
         """
         store = cls()
         n = len(props_list)
@@ -65,10 +87,12 @@ class EdgePropertyStore:
         pubs_intern = {}
         sources_intern = {}
         quals_intern = {}
+        attrs_intern = {}
 
         pubs_indices = np.empty(n, dtype=np.int32)
         sources_indices = np.empty(n, dtype=np.int32)
         quals_indices = np.empty(n, dtype=np.int32)
+        attrs_indices = np.empty(n, dtype=np.int32)
 
         for i, props in enumerate(props_list):
             # Intern publications
@@ -95,10 +119,36 @@ class EdgePropertyStore:
                 store._quals_pool.append(quals)
             quals_indices[i] = quals_intern[quals_key]
 
+            # Intern attributes
+            attrs = props.get("attributes", [])
+            attrs_key = cls._make_hashable(attrs)
+            if attrs_key not in attrs_intern:
+                attrs_intern[attrs_key] = len(store._attrs_pool)
+                store._attrs_pool.append(attrs)
+            attrs_indices[i] = attrs_intern[attrs_key]
+
         store._pubs_idx = pubs_indices
         store._sources_idx = sources_indices
         store._quals_idx = quals_indices
+        store._attrs_idx = attrs_indices
 
+        return store
+
+    def reorder(self, order):
+        """Return a new store with entries reordered by the given index array.
+
+        The pools are shared (not copied) since they're immutable after
+        construction. Only the per-edge index arrays are reordered.
+        """
+        store = EdgePropertyStore()
+        store._pubs_pool = self._pubs_pool
+        store._sources_pool = self._sources_pool
+        store._quals_pool = self._quals_pool
+        store._attrs_pool = self._attrs_pool
+        store._pubs_idx = self._pubs_idx[order]
+        store._sources_idx = self._sources_idx[order]
+        store._quals_idx = self._quals_idx[order]
+        store._attrs_idx = self._attrs_idx[order]
         return store
 
     def __len__(self):
@@ -118,6 +168,7 @@ class EdgePropertyStore:
             "publications": self._pubs_pool[self._pubs_idx[idx]],
             "sources": self._sources_pool[self._sources_idx[idx]],
             "qualifiers": self._quals_pool[self._quals_idx[idx]],
+            "attributes": self._attrs_pool[self._attrs_idx[idx]],
         }
 
     def get_field(self, idx, key, default=None):
@@ -128,6 +179,8 @@ class EdgePropertyStore:
             return self._sources_pool[self._sources_idx[idx]]
         elif key == "qualifiers":
             return self._quals_pool[self._quals_idx[idx]]
+        elif key == "attributes":
+            return self._attrs_pool[self._attrs_idx[idx]]
         return default
 
     def dedup_stats(self):
@@ -138,22 +191,25 @@ class EdgePropertyStore:
             "unique_publications": len(self._pubs_pool),
             "unique_sources": len(self._sources_pool),
             "unique_qualifiers": len(self._quals_pool),
+            "unique_attributes": len(self._attrs_pool),
         }
 
     def save_mmap(self, directory: Path):
         """Save to directory as mmap-friendly files.
 
-        Writes the three per-edge index arrays as .npy files (memory-mappable)
-        and the three small intern pools as a single pickle.
+        Writes the per-edge index arrays as .npy files (memory-mappable)
+        and the intern pools as a single pickle.
         """
         np.save(directory / "edge_pubs_idx.npy", self._pubs_idx)
         np.save(directory / "edge_sources_idx.npy", self._sources_idx)
         np.save(directory / "edge_quals_idx.npy", self._quals_idx)
+        np.save(directory / "edge_attrs_idx.npy", self._attrs_idx)
 
         pools = {
             "pubs_pool": self._pubs_pool,
             "sources_pool": self._sources_pool,
             "quals_pool": self._quals_pool,
+            "attrs_pool": self._attrs_pool,
         }
         with open(directory / "edge_property_pools.pkl", "wb") as f:
             pickle.dump(pools, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -179,12 +235,22 @@ class EdgePropertyStore:
             directory / "edge_quals_idx.npy", mmap_mode=mmap_mode
         )
 
+        # Handle backward compat: older graphs may not have attrs
+        attrs_path = directory / "edge_attrs_idx.npy"
+        if attrs_path.exists():
+            store._attrs_idx = np.load(attrs_path, mmap_mode=mmap_mode)
+        else:
+            store._attrs_idx = np.zeros(len(store._pubs_idx), dtype=np.int32)
+            store._attrs_pool = [[]]  # Single empty-list entry at index 0
+
         with open(directory / "edge_property_pools.pkl", "rb") as f:
             pools = pickle.load(f)
 
         store._pubs_pool = pools["pubs_pool"]
         store._sources_pool = pools["sources_pool"]
         store._quals_pool = pools["quals_pool"]
+        if "attrs_pool" in pools:
+            store._attrs_pool = pools["attrs_pool"]
 
         return store
 
@@ -209,13 +275,15 @@ class CSRGraph:
         node_properties=None,
     ):
         """
+        Build a CSR graph from edge arrays and a pre-built EdgePropertyStore.
+
         Args:
             num_nodes: Total number of unique nodes
-            edges: List of (src_idx, dst_idx) tuples using integer indices
-            edge_predicates: List of predicate IDs (parallel to edges list)
+            edges: Nx2 numpy array of (src_idx, dst_idx) or list of tuples
+            edge_predicates: numpy array of predicate IDs (parallel to edges)
             node_id_to_idx: Dict mapping original node IDs to integer indices
-            predicate_to_id: Dict mapping predicate strings to integer IDs
-            edge_properties: Dict mapping (src_idx, dst_idx, pred_idx) -> properties dict
+            predicate_to_idx: Dict mapping predicate strings to integer IDs
+            edge_properties: EdgePropertyStore with deduped properties
             node_properties: Dict mapping node_idx -> properties dict
         """
         self.num_nodes = num_nodes
@@ -227,93 +295,109 @@ class CSRGraph:
         self.predicate_to_idx = predicate_to_idx
         self.id_to_predicate = {idx: pred for pred, idx in predicate_to_idx.items()}
 
+        # Convert inputs to numpy arrays if needed
+        if isinstance(edges, np.ndarray) and edges.ndim == 2:
+            src_arr = edges[:, 0].astype(np.int32)
+            dst_arr = edges[:, 1].astype(np.int32)
+        elif isinstance(edges, np.ndarray) and edges.ndim == 1 and len(edges) == 0:
+            src_arr = np.array([], dtype=np.int32)
+            dst_arr = np.array([], dtype=np.int32)
+        else:
+            # list of tuples
+            if len(edges) > 0:
+                src_arr = np.array([e[0] for e in edges], dtype=np.int32)
+                dst_arr = np.array([e[1] for e in edges], dtype=np.int32)
+            else:
+                src_arr = np.array([], dtype=np.int32)
+                dst_arr = np.array([], dtype=np.int32)
+
+        pred_arr = np.asarray(edge_predicates, dtype=np.int32)
+
         # Build both forward and reverse CSR structures
         print("Building forward CSR...")
-        self._build_forward_csr(edges, edge_predicates, edge_properties)
+        self._build_forward_csr(src_arr, dst_arr, pred_arr, edge_properties)
 
         print("Building reverse CSR...")
-        self._build_reverse_csr(edges, edge_predicates)
+        self._build_reverse_csr(src_arr, dst_arr, pred_arr)
 
-    def _build_forward_csr(self, edges, edge_predicates, edge_properties):
-        """Build forward adjacency list (source -> targets)."""
-        # Sort edges by source for CSR construction
-        edges_with_props = [
-            (
-                src,
-                dst,
-                pred_id,
-                edge_properties.get((src, dst, pred_id), {}) if edge_properties else {},
-            )
-            for (src, dst), pred_id in zip(edges, edge_predicates)
-        ]
-        edges_with_props.sort(key=lambda x: (x[0], x[1], x[2]))
+    def _build_forward_csr(self, src, dst, pred, edge_properties):
+        """Build forward adjacency list (source -> targets) using numpy sorting."""
+        if len(src) == 0:
+            self.fwd_targets = np.array([], dtype=np.int32)
+            self.fwd_predicates = np.array([], dtype=np.int32)
+            self.fwd_offsets = np.zeros(self.num_nodes + 1, dtype=np.int64)
+            self.edge_properties = edge_properties or EdgePropertyStore()
+            return
 
-        # Build forward CSR arrays
-        self.fwd_targets = np.array(
-            [dst for src, dst, _, _ in edges_with_props], dtype=np.int32
-        )
-        self.fwd_predicates = np.array(
-            [pred_id for src, dst, pred_id, _ in edges_with_props], dtype=np.int32
-        )
+        # Sort edges by (src, dst, pred) using numpy lexsort
+        sort_order = np.lexsort((pred, dst, src))
 
-        # Build deduplicated edge property store
-        props_list = [props for _, _, _, props in edges_with_props]
-        self.edge_properties = EdgePropertyStore.from_property_list(props_list)
+        self.fwd_targets = dst[sort_order]
+        self.fwd_predicates = pred[sort_order]
 
-        stats = self.edge_properties.dedup_stats()
-        print(f"  Edge property dedup: {stats['total_edges']:,} edges -> "
-              f"{stats['unique_publications']:,} unique publication lists, "
-              f"{stats['unique_sources']:,} unique source configs, "
-              f"{stats['unique_qualifiers']:,} unique qualifier combos")
+        # Reorder edge properties to match sorted order
+        if edge_properties is not None:
+            self.edge_properties = edge_properties.reorder(sort_order)
+            stats = self.edge_properties.dedup_stats()
+            print(f"  Edge property dedup: {stats['total_edges']:,} edges -> "
+                  f"{stats['unique_publications']:,} unique publication lists, "
+                  f"{stats['unique_sources']:,} unique source configs, "
+                  f"{stats['unique_qualifiers']:,} unique qualifier combos")
+        else:
+            self.edge_properties = EdgePropertyStore()
 
-        # Build edge property index: (src, dst, pred_id) -> index
-        self.edge_prop_index = {}
-        for i, (src, dst, pred_id, _) in enumerate(edges_with_props):
-            self.edge_prop_index[(src, dst, pred_id)] = i
-
-        # Build forward offsets
+        # Build forward offsets using numpy
+        src_sorted = src[sort_order]
         self.fwd_offsets = np.zeros(self.num_nodes + 1, dtype=np.int64)
 
-        if len(edges_with_props) > 0:
-            current_src = 0
-            for i, (src, dst, _, _) in enumerate(edges_with_props):
-                while current_src < src:
-                    self.fwd_offsets[current_src + 1] = i
-                    current_src += 1
-                self.fwd_offsets[src + 1] = i + 1
+        # Count edges per source node
+        unique_src, counts = np.unique(src_sorted, return_counts=True)
+        for node_idx, count in zip(unique_src, counts):
+            self.fwd_offsets[node_idx + 1] = count
+        np.cumsum(self.fwd_offsets, out=self.fwd_offsets)
 
-            for i in range(current_src + 1, self.num_nodes + 1):
-                self.fwd_offsets[i] = len(edges_with_props)
+    def _build_reverse_csr(self, src, dst, pred):
+        """Build reverse adjacency list (target -> sources) using numpy sorting."""
+        if len(src) == 0:
+            self.rev_sources = np.array([], dtype=np.int32)
+            self.rev_predicates = np.array([], dtype=np.int32)
+            self.rev_offsets = np.zeros(self.num_nodes + 1, dtype=np.int64)
+            return
 
-    def _build_reverse_csr(self, edges, edge_predicates):
-        """Build reverse adjacency list (target -> sources)."""
-        # Create reverse edges: swap source and destination
-        reverse_edges = [
-            (dst, src, pred_id) for (src, dst), pred_id in zip(edges, edge_predicates)
-        ]
-        reverse_edges.sort(key=lambda x: (x[0], x[1], x[2]))
+        # Sort by (dst, src, pred) for reverse CSR
+        sort_order = np.lexsort((pred, src, dst))
 
-        # Build reverse CSR arrays
-        self.rev_sources = np.array(
-            [src for dst, src, _ in reverse_edges], dtype=np.int32
-        )
-        self.rev_predicates = np.array(
-            [pred_id for dst, src, pred_id in reverse_edges], dtype=np.int32
-        )
+        self.rev_sources = src[sort_order]
+        self.rev_predicates = pred[sort_order]
 
         # Build reverse offsets
+        dst_sorted = dst[sort_order]
         self.rev_offsets = np.zeros(self.num_nodes + 1, dtype=np.int64)
 
-        if len(reverse_edges) > 0:
-            current_dst = 0
-            for i, (dst, src, _) in enumerate(reverse_edges):
-                while current_dst < dst:
-                    self.rev_offsets[current_dst + 1] = i
-                    current_dst += 1
-                self.rev_offsets[dst + 1] = i + 1
+        unique_dst, counts = np.unique(dst_sorted, return_counts=True)
+        for node_idx, count in zip(unique_dst, counts):
+            self.rev_offsets[node_idx + 1] = count
+        np.cumsum(self.rev_offsets, out=self.rev_offsets)
 
-            for i in range(current_dst + 1, self.num_nodes + 1):
-                self.rev_offsets[i] = len(reverse_edges)
+    def _find_edge_index(self, src_idx, dst_idx, pred_id):
+        """Find the position of an edge in the forward CSR arrays.
+
+        Scans the CSR offset range for src_idx to find a matching
+        (dst_idx, pred_id) pair. O(degree) but fast for typical node degrees.
+        """
+        start = int(self.fwd_offsets[src_idx])
+        end = int(self.fwd_offsets[src_idx + 1])
+        if start == end:
+            return None
+
+        targets = self.fwd_targets[start:end]
+        preds = self.fwd_predicates[start:end]
+
+        mask = (targets == dst_idx) & (preds == pred_id)
+        indices = np.nonzero(mask)[0]
+        if len(indices) > 0:
+            return start + int(indices[0])
+        return None
 
     def neighbors(self, node_idx, predicate_filter=None):
         """
@@ -426,7 +510,7 @@ class CSRGraph:
         for src_idx, pred_id in zip(sources, pred_ids):
             predicate = self.id_to_predicate[int(pred_id)]
             # Look up properties from the forward edge
-            edge_idx = self.edge_prop_index.get((int(src_idx), node_idx, int(pred_id)))
+            edge_idx = self._find_edge_index(int(src_idx), node_idx, int(pred_id))
             props = self.edge_properties[edge_idx] if edge_idx is not None else {}
 
             if predicate_filter is None or predicate in predicate_filter:
@@ -470,7 +554,7 @@ class CSRGraph:
 
     def get_edge_property(self, src_idx, dst_idx, predicate, key, default=None):
         """
-        Get a specific property for an edge - O(1) lookup
+        Get a specific property for an edge - O(degree) lookup via CSR scan
 
         Args:
             src_idx: Source node index
@@ -486,7 +570,7 @@ class CSRGraph:
         if pred_id is None:
             return default
 
-        edge_idx = self.edge_prop_index.get((src_idx, dst_idx, pred_id))
+        edge_idx = self._find_edge_index(src_idx, dst_idx, pred_id)
         if edge_idx is None:
             return default
 
@@ -501,7 +585,7 @@ class CSRGraph:
 
     def get_all_edge_properties(self, src_idx, dst_idx, predicate):
         """
-        Get all properties for an edge - O(1) lookup
+        Get all properties for an edge - O(degree) lookup via CSR scan
 
         Args:
             src_idx: Source node index
@@ -516,7 +600,7 @@ class CSRGraph:
         if pred_id is None:
             return {}
 
-        edge_idx = self.edge_prop_index.get((src_idx, dst_idx, pred_id))
+        edge_idx = self._find_edge_index(src_idx, dst_idx, pred_id)
         if edge_idx is None:
             return {}
 
@@ -554,7 +638,6 @@ class CSRGraph:
                     result.append((predicate_str, prop))
 
         t1 = time.perf_counter()
-        # print("Getting all edges in between took:", t1 - t0)
         return result
 
     def get_node_property(self, node_idx, key, default=None):
@@ -616,7 +699,6 @@ class CSRGraph:
             # Properties
             "edge_properties": self.edge_properties,
             "node_properties": self.node_properties,
-            "edge_prop_index": self.edge_prop_index,
         }
         with open(filepath, "wb") as f:
             pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -661,12 +743,15 @@ class CSRGraph:
                     pred = graph.fwd_predicates[i]
                     edges.append((src, dst))
                     edge_preds.append(pred)
-            graph._build_reverse_csr(edges, edge_preds)
+            graph._build_reverse_csr(
+                np.array([e[0] for e in edges], dtype=np.int32),
+                np.array([e[1] for e in edges], dtype=np.int32),
+                np.array(edge_preds, dtype=np.int32),
+            )
 
         # Properties
         graph.edge_properties = data["edge_properties"]
         graph.node_properties = data["node_properties"]
-        graph.edge_prop_index = data.get("edge_prop_index", {})
 
         # Convert old list-of-dicts format to EdgePropertyStore
         if isinstance(graph.edge_properties, list):
@@ -721,14 +806,13 @@ class CSRGraph:
             "node_id_to_idx": self.node_id_to_idx,
             "predicate_to_idx": self.predicate_to_idx,
             "node_properties": self.node_properties,
-            "edge_prop_index": self.edge_prop_index,
         }
         with open(directory / "metadata.pkl", "wb") as f:
             pickle.dump(metadata, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         # Save edge properties as mmap-friendly components:
-        # - 3 numpy .npy index arrays (memory-mappable)
-        # - 1 small pickle with the intern pools
+        # - numpy .npy index arrays (memory-mappable)
+        # - small pickle with the intern pools
         if isinstance(self.edge_properties, EdgePropertyStore):
             self.edge_properties.save_mmap(directory)
         else:
@@ -805,14 +889,13 @@ class CSRGraph:
             idx: pred for pred, idx in graph.predicate_to_idx.items()
         }
         graph.node_properties = metadata["node_properties"]
-        graph.edge_prop_index = metadata.get("edge_prop_index", {})
 
         # Load edge properties - prefer new split mmap format, fall back
         # to legacy single-pickle format
         t_props_start = time.perf_counter()
 
         if (directory / "edge_property_pools.pkl").exists():
-            # New format: 3 mmap'd numpy arrays + small pools pickle
+            # New format: mmap'd numpy arrays + small pools pickle
             graph.edge_properties = EdgePropertyStore.load_mmap(
                 directory, mmap_mode=mmap_mode
             )

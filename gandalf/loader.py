@@ -1,10 +1,20 @@
-"""Load nodes and edges into Gandalf."""
+"""Load nodes and edges into Gandalf.
 
+Uses a two-pass approach for memory efficiency:
+  Pass 1: Scan edges to collect node IDs, predicates, and count edges.
+  Pass 2: Re-read edges, converting to integer indices and interning
+           properties directly into deduplication pools.
+
+This avoids holding 38M+ individual Python dicts in memory simultaneously.
+At 38M edges the old approach peaked at ~100GB; this approach stays under ~5GB.
+"""
+
+import gc
 import json
 
 import numpy as np
 
-from gandalf.graph import CSRGraph
+from gandalf.graph import CSRGraph, EdgePropertyStore
 
 
 def build_graph_from_jsonl(
@@ -21,94 +31,42 @@ def build_graph_from_jsonl(
     Returns:
         CSRGraph object with the loaded graph
     """
-    print(f"Reading edges from {edge_jsonl_path}...")
 
-    # First pass: collect all unique node IDs and edges with properties
+    # ===================================================================
+    # PASS 1 — lightweight scan: collect node IDs, predicates, line count
+    # ===================================================================
+    print(f"Pass 1: Scanning {edge_jsonl_path}...")
+
     node_ids = set()
-    edge_list = []  # List of (subject, predicate, object, properties) tuples
-    edge_set = set()  # For duplicate detection: (subject, predicate, object)
-
+    unique_predicates = set()
     line_count = 0
-    duplicates = 0
-    self_loops = 0
 
     with open(edge_jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
-            if line_count % 1_000_000 == 0 and line_count > 0:
-                print(f"  Processed {line_count:,} edges...")
+            line_count += 1
+            if line_count % 1_000_000 == 0:
+                print(f"  Scanned {line_count:,} lines...")
 
             data = json.loads(line)
-            subject = data["subject"]
-            obj = data["object"]
-            predicate = data["predicate"]
+            node_ids.add(data["subject"])
+            node_ids.add(data["object"])
+            unique_predicates.add(data["predicate"])
 
-            node_ids.add(subject)
-            node_ids.add(obj)
+    print(f"  {line_count:,} lines, {len(node_ids):,} unique nodes, "
+          f"{len(unique_predicates):,} unique predicates")
 
-            # Create edge identifier (subject, predicate, object) - predicates make edges unique
-            edge_id = (subject, predicate, obj)
+    # Build mappings
+    print("Building node index mapping...")
+    node_id_to_idx = {nid: idx for idx, nid in enumerate(sorted(node_ids))}
+    num_nodes = len(node_ids)
+    del node_ids  # Free ~200MB for 2M nodes
 
-            edge_set.add(edge_id)
+    print("Building predicate vocabulary...")
+    predicate_to_idx = {p: i for i, p in enumerate(sorted(unique_predicates))}
+    del unique_predicates
 
-            # Store edge with its properties
-            # Note: predicate is NOT stored here - it's already in the CSR arrays
-            # as an integer (fwd_predicates), saving significant memory via
-            # EdgePropertyStore deduplication.
-            core_fields = {"id", "category", "subject", "object", "predicate", "sources"}
-            # Known qualifier fields
-            qualifer_fields = {
-                "qualified_predicate",
-                "object_aspect_qualifier",
-                "object_direction_qualifier",
-                "subject_aspect_qualifier",
-                "subject_direction_qualifier",
-                "causal_mechanism_qualifier",
-                "species_context_qualifier",
-            }
-            edge_props = {
-                # "category": data.get("category", []),
-                "publications": data.get("publications", []),
-                "sources": [
-                    {
-                        "resource_id": s["resource_id"],
-                        "resource_role": s["resource_role"],
-                        **({"upstream_resource_ids": s["upstream_resource_ids"]} if "upstream_resource_ids" in s else {})
-                    }
-                    for s in data.get("sources", [])
-                ],
-                "attributes": [],
-                "qualifiers": []
-            }
-
-            # --- Qualifiers ---
-            qualifier_set = []
-            for field in qualifer_fields:
-                if field in data:
-                    qualifier_set.append({
-                        "qualifier_type_id": f"biolink:{field}",
-                        "qualifier_value": data[field],
-                    })
-
-            if qualifier_set:
-                edge_props["qualifiers"] = [{"qualifier_set": qualifier_set}]
-
-            # --- Everything else becomes an attribute ---
-            for field, value in data.items():
-                if field in core_fields or field in qualifer_fields:
-                    continue
-                edge_props["attributes"].append({
-                    "attribute_type_id": f"biolink:{field}",
-                    "value": value,
-                })
-
-            edge_list.append((subject, predicate, obj, edge_props))
-
-            line_count += 1
-
-    print(f"Found {len(node_ids):,} unique nodes and {len(edge_list):,} edges")
-
-    # Load node properties if provided
-    node_props_by_id = {}
+    # Load node properties — convert to int-keyed dict immediately
+    node_properties = {}
     if node_jsonl_path:
         print(f"Reading node properties from {node_jsonl_path}...")
         with open(node_jsonl_path, "r", encoding="utf-8") as f:
@@ -116,55 +74,206 @@ def build_graph_from_jsonl(
                 node_data = json.loads(line)
                 node_id = node_data.get("id")
                 if node_id:
-                    node_props_by_id[node_id] = {
-                        "id": node_data.get("id", ""),
-                        "categories": node_data.get("category", []),
-                        "name": node_data.get("name", None),
-                        "equivalent_identifiers": node_data.get("equivalent_identifiers", []),
-                        "information_content": node_data.get("information_content", 0.0),
-                    }
-        print(f"  Loaded properties for {len(node_props_by_id):,} nodes")
+                    idx = node_id_to_idx.get(node_id)
+                    if idx is not None:
+                        node_properties[idx] = {
+                            "id": node_data.get("id", ""),
+                            "categories": node_data.get("category", []),
+                            "name": node_data.get("name", None),
+                            "equivalent_identifiers": node_data.get("equivalent_identifiers", []),
+                            "information_content": node_data.get("information_content", 0.0),
+                        }
+        print(f"  Loaded properties for {len(node_properties):,} nodes")
 
-    # Create mapping from node IDs to integer indices
-    print("Building node index mapping...")
-    node_id_to_idx = {node_id: idx for idx, node_id in enumerate(sorted(node_ids))}
+    # ===================================================================
+    # PASS 2 — streaming build: integer indices + property interning
+    # ===================================================================
+    print(f"Pass 2: Building graph arrays from {edge_jsonl_path}...")
 
-    # Build predicate vocabulary
-    print("Building predicate vocabulary...")
-    unique_predicates = sorted(set(pred for _, pred, _, _ in edge_list))
-    predicate_to_idx = {pred: idx for idx, pred in enumerate(unique_predicates)}
-    print(f"  Found {len(unique_predicates):,} unique predicates")
+    # Pre-allocate numpy arrays (line_count is upper bound; trimmed later)
+    src_array = np.empty(line_count, dtype=np.int32)
+    dst_array = np.empty(line_count, dtype=np.int32)
+    pred_array = np.empty(line_count, dtype=np.int32)
 
-    # Convert node properties to use indices
-    node_properties = {}
-    for node_id, props in node_props_by_id.items():
-        idx = node_id_to_idx.get(node_id)
-        if idx is not None:
-            node_properties[idx] = props
+    # Streaming property interning — one pool + intern dict per field
+    make_hashable = EdgePropertyStore._make_hashable
 
-    # Convert edges to integer indices with properties
-    print("Converting edges to indices...")
-    edges = []  # List of (src_idx, dst_idx) tuples
-    edge_predicates = []  # Parallel list of predicate IDs
-    edge_properties = {}  # Dict: (src_idx, dst_idx, pred_idx) -> properties
+    pubs_intern = {}
+    sources_intern = {}
+    quals_intern = {}
+    attrs_intern = {}
+    pubs_pool = []
+    sources_pool = []
+    quals_pool = []
+    attrs_pool = []
+    pubs_indices = np.empty(line_count, dtype=np.int32)
+    sources_indices = np.empty(line_count, dtype=np.int32)
+    quals_indices = np.empty(line_count, dtype=np.int32)
+    attrs_indices = np.empty(line_count, dtype=np.int32)
 
-    for subject, predicate, obj, props in edge_list:
-        src_idx = node_id_to_idx[subject]
-        dst_idx = node_id_to_idx[obj]
-        pred_idx = predicate_to_idx[predicate]
+    # Dedup using integer tuples (much cheaper than string tuples)
+    seen_edges = set()
 
-        edges.append((src_idx, dst_idx))
-        edge_predicates.append(pred_idx)
-        edge_properties[(src_idx, dst_idx, pred_idx)] = props
+    # Fields that are handled specially (not dumped into attributes)
+    core_fields = {"id", "category", "subject", "object", "predicate", "sources",
+                   "publications", "qualifiers"}
+    qualifier_fields = {
+        "qualified_predicate",
+        "object_aspect_qualifier",
+        "object_direction_qualifier",
+        "subject_aspect_qualifier",
+        "subject_direction_qualifier",
+        "causal_mechanism_qualifier",
+        "species_context_qualifier",
+    }
 
-    print(f"Total edges: {len(edges):,}")
+    edge_count = 0
+    duplicates = 0
 
+    # Disable GC during the hot loop — millions of small allocations make
+    # the cyclic GC very expensive; we'll collect once at the end.
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+
+    try:
+        with open(edge_jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                data = json.loads(line)
+
+                src_idx = node_id_to_idx[data["subject"]]
+                dst_idx = node_id_to_idx[data["object"]]
+                pred_idx = predicate_to_idx[data["predicate"]]
+
+                edge_key = (src_idx, dst_idx, pred_idx)
+                if edge_key in seen_edges:
+                    duplicates += 1
+                    continue
+                seen_edges.add(edge_key)
+
+                src_array[edge_count] = src_idx
+                dst_array[edge_count] = dst_idx
+                pred_array[edge_count] = pred_idx
+
+                # --- Intern publications ---
+                pubs = data.get("publications", [])
+                pubs_key = make_hashable(pubs)
+                if pubs_key not in pubs_intern:
+                    pubs_intern[pubs_key] = len(pubs_pool)
+                    pubs_pool.append(pubs)
+                pubs_indices[edge_count] = pubs_intern[pubs_key]
+
+                # --- Intern sources ---
+                raw_sources = data.get("sources", [])
+                if raw_sources:
+                    sources = [
+                        {
+                            "resource_id": s["resource_id"],
+                            "resource_role": s["resource_role"],
+                            **({"upstream_resource_ids": s["upstream_resource_ids"]}
+                               if "upstream_resource_ids" in s else {})
+                        }
+                        for s in raw_sources
+                    ]
+                elif "primary_knowledge_source" in data:
+                    # Fallback: build sources from top-level fields
+                    sources = [{"resource_id": data["primary_knowledge_source"],
+                                "resource_role": "primary_knowledge_source"}]
+                else:
+                    sources = []
+                sources_key = make_hashable(sources)
+                if sources_key not in sources_intern:
+                    sources_intern[sources_key] = len(sources_pool)
+                    sources_pool.append(sources)
+                sources_indices[edge_count] = sources_intern[sources_key]
+
+                # --- Intern qualifiers ---
+                # Support two formats:
+                #  1) Pre-built list: "qualifiers": [{"qualifier_type_id":..., "qualifier_value":...}, ...]
+                #  2) Individual fields: "object_aspect_qualifier": "activity", ...
+                raw_qualifiers = data.get("qualifiers", None)
+                if raw_qualifiers and isinstance(raw_qualifiers, list):
+                    quals = raw_qualifiers
+                else:
+                    # Build from individual top-level fields
+                    quals = []
+                    for field in qualifier_fields:
+                        if field in data:
+                            quals.append({
+                                "qualifier_type_id": f"biolink:{field}",
+                                "qualifier_value": data[field],
+                            })
+                quals_key = make_hashable(quals)
+                if quals_key not in quals_intern:
+                    quals_intern[quals_key] = len(quals_pool)
+                    quals_pool.append(quals)
+                quals_indices[edge_count] = quals_intern[quals_key]
+
+                # --- Intern attributes (everything else) ---
+                attributes = []
+                for field, value in data.items():
+                    if field in core_fields or field in qualifier_fields:
+                        continue
+                    attributes.append({
+                        "attribute_type_id": f"biolink:{field}",
+                        "value": value,
+                    })
+                attrs_key = make_hashable(attributes)
+                if attrs_key not in attrs_intern:
+                    attrs_intern[attrs_key] = len(attrs_pool)
+                    attrs_pool.append(attributes)
+                attrs_indices[edge_count] = attrs_intern[attrs_key]
+
+                edge_count += 1
+                if edge_count % 1_000_000 == 0:
+                    print(f"  Processed {edge_count:,} edges...")
+
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+    # Free intern dicts (they can be large for publications)
+    del seen_edges, pubs_intern, sources_intern, quals_intern, attrs_intern
+    gc.collect()
+
+    # Trim arrays to actual size
+    if edge_count < line_count:
+        src_array = src_array[:edge_count]
+        dst_array = dst_array[:edge_count]
+        pred_array = pred_array[:edge_count]
+        pubs_indices = pubs_indices[:edge_count]
+        sources_indices = sources_indices[:edge_count]
+        quals_indices = quals_indices[:edge_count]
+        attrs_indices = attrs_indices[:edge_count]
+
+    print(f"  {edge_count:,} unique edges ({duplicates:,} duplicates skipped)")
+    print(f"  Dedup pools: {len(pubs_pool):,} unique pub lists, "
+          f"{len(sources_pool):,} unique source configs, "
+          f"{len(quals_pool):,} unique qualifier combos, "
+          f"{len(attrs_pool):,} unique attribute sets")
+
+    # Build EdgePropertyStore directly from interned data
+    edge_properties = EdgePropertyStore.from_arrays_and_pools(
+        pubs_idx=pubs_indices,
+        sources_idx=sources_indices,
+        quals_idx=quals_indices,
+        attrs_idx=attrs_indices,
+        pubs_pool=pubs_pool,
+        sources_pool=sources_pool,
+        quals_pool=quals_pool,
+        attrs_pool=attrs_pool,
+    )
+
+    # Stack src/dst into Nx2 array for CSRGraph constructor
+    edges = np.column_stack((src_array, dst_array))
+
+    # ===================================================================
     # Build CSR structure
+    # ===================================================================
     print("Building CSR structure...")
     graph = CSRGraph(
-        num_nodes=len(node_ids),
+        num_nodes=num_nodes,
         edges=edges,
-        edge_predicates=edge_predicates,
+        edge_predicates=pred_array,
         node_id_to_idx=node_id_to_idx,
         predicate_to_idx=predicate_to_idx,
         edge_properties=edge_properties,
@@ -189,6 +298,6 @@ def build_graph_from_jsonl(
             / 1024
             / 1024
         )
-        print(f"  Memory usage: ~{memory_mb:.1f} MB")
+        print(f"  CSR memory: ~{memory_mb:.1f} MB")
 
     return graph

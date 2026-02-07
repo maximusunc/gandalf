@@ -246,6 +246,7 @@ class TestGraphMmapSaveLoad:
                 "edge_pubs_idx.npy",
                 "edge_sources_idx.npy",
                 "edge_quals_idx.npy",
+                "edge_attrs_idx.npy",
                 "edge_property_pools.pkl",
             ]
             for filename in expected_files:
