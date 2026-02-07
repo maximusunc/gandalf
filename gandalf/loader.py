@@ -1,114 +1,145 @@
-"""Load nodes and edges into Gandalf."""
+"""Load nodes and edges into Gandalf.
+
+Three-pass streaming loader that keeps peak memory at ~3-4GB for 38M edges:
+
+Pass 1: Stream JSONL to collect vocabularies (node IDs, predicates, edge count).
+Pass 2: Stream JSONL again, converting each edge to integer indices stored in
+        pre-allocated numpy arrays. Simultaneously interns qualifier/source data
+        into the EdgePropertyStoreBuilder and writes publications/attributes to
+        a temporary LMDB keyed by original line index.
+Pass 3: Sort numpy arrays by (src, dst, pred) via np.lexsort. Rewrite the temp
+        LMDB in CSR-sorted order to produce the final LMDB where key == CSR
+        edge index (zero indirection at query time). Reorder qualifier/source
+        dedup indices to match. Build CSR offset arrays.
+"""
 
 import json
+import shutil
+import tempfile
+from pathlib import Path
 
+import msgpack
 import numpy as np
 
-from gandalf.graph import CSRGraph
+from gandalf.graph import CSRGraph, EdgePropertyStoreBuilder
+from gandalf.lmdb_store import LMDBPropertyStore, _encode_key
+
+import lmdb
 
 
-def build_graph_from_jsonl(
-    edge_jsonl_path,
-    node_jsonl_path,
-):
+# Fields that are structural (not stored as properties)
+_CORE_FIELDS = {
+    "id", "category", "subject", "object", "predicate", "sources",
+}
+
+# Known qualifier fields that appear as top-level JSONL keys
+_QUALIFIER_FIELDS = {
+    "qualified_predicate",
+    "object_aspect_qualifier",
+    "object_direction_qualifier",
+    "subject_aspect_qualifier",
+    "subject_direction_qualifier",
+    "causal_mechanism_qualifier",
+    "species_context_qualifier",
+}
+
+
+def _extract_sources(data):
+    """Extract normalized source list from edge data."""
+    return [
+        {
+            "resource_id": s["resource_id"],
+            "resource_role": s["resource_role"],
+            **({"upstream_resource_ids": s["upstream_resource_ids"]}
+               if "upstream_resource_ids" in s else {})
+        }
+        for s in data.get("sources", [])
+    ]
+
+
+def _extract_qualifiers(data):
+    """Extract qualifiers, supporting both JSONL formats.
+
+    Format A: Top-level fields (object_aspect_qualifier, etc.)
+        -> Wrapped as [{"qualifier_set": [...]}] for search compatibility.
+    Format B: Nested 'qualifiers' array (already formatted)
+        -> Passed through as-is.
     """
-    Build a CSR graph from a JSONL file of edges.
+    # Format A: top-level qualifier fields
+    qualifier_set = []
+    for field in _QUALIFIER_FIELDS:
+        if field in data:
+            qualifier_set.append({
+                "qualifier_type_id": f"biolink:{field}",
+                "qualifier_value": data[field],
+            })
+    if qualifier_set:
+        return [{"qualifier_set": qualifier_set}]
 
-    Args:
-        edge_jsonl_path: Path to JSONL file where each line has 'subject', 'predicate', and 'object' fields
-        node_jsonl_path: Path to JSONL file with node properties
+    # Format B: pre-formatted qualifiers array — pass through as-is
+    raw_qualifiers = data.get("qualifiers")
+    if raw_qualifiers and isinstance(raw_qualifiers, list):
+        return raw_qualifiers
 
-    Returns:
-        CSRGraph object with the loaded graph
+    return []
+
+
+def _extract_attributes(data):
+    """Extract attributes (everything not in core/qualifier/source fields)."""
+    attributes = []
+    for field, value in data.items():
+        if field in _CORE_FIELDS or field in _QUALIFIER_FIELDS or field == "qualifiers" or field == "publications":
+            continue
+        attributes.append({
+            "attribute_type_id": f"biolink:{field}",
+            "value": value,
+        })
+    return attributes
+
+
+def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path):
+    """Build a CSR graph from JSONL files using three-pass streaming.
+
+    Pass 1: Collect vocabularies (node IDs, predicates, edge count).
+    Pass 2: Build numpy arrays + dedup store + temp LMDB.
+    Pass 3: Sort, rewrite LMDB in CSR order, build offsets.
+
+    Peak memory: ~3-4GB for 38M edges (down from 100GB+).
     """
-    print(f"Reading edges from {edge_jsonl_path}...")
+    edge_jsonl_path = str(edge_jsonl_path)
+    node_jsonl_path = str(node_jsonl_path) if node_jsonl_path else None
 
-    # First pass: collect all unique node IDs and edges with properties
+    # =================================================================
+    # Pass 1: Vocabulary collection
+    # =================================================================
+    print(f"Pass 1: Collecting vocabularies from {edge_jsonl_path}...")
+
     node_ids = set()
-    edge_list = []  # List of (subject, predicate, object, properties) tuples
-    edge_set = set()  # For duplicate detection: (subject, predicate, object)
-
-    line_count = 0
-    duplicates = 0
-    self_loops = 0
+    predicates = set()
+    edge_count = 0
 
     with open(edge_jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
-            if line_count % 1_000_000 == 0 and line_count > 0:
-                print(f"  Processed {line_count:,} edges...")
-
             data = json.loads(line)
-            subject = data["subject"]
-            obj = data["object"]
-            predicate = data["predicate"]
+            node_ids.add(data["subject"])
+            node_ids.add(data["object"])
+            predicates.add(data["predicate"])
+            edge_count += 1
 
-            node_ids.add(subject)
-            node_ids.add(obj)
+            if edge_count % 1_000_000 == 0:
+                print(f"  {edge_count:,} edges scanned...")
 
-            # Create edge identifier (subject, predicate, object) - predicates make edges unique
-            edge_id = (subject, predicate, obj)
+    print(f"  Found {len(node_ids):,} unique nodes, {len(predicates):,} predicates, "
+          f"{edge_count:,} edges")
 
-            edge_set.add(edge_id)
+    # Build vocabulary mappings
+    node_id_to_idx = {nid: idx for idx, nid in enumerate(sorted(node_ids))}
+    predicate_to_idx = {pred: idx for idx, pred in enumerate(sorted(predicates))}
+    num_nodes = len(node_ids)
+    del node_ids  # Free ~2GB immediately
 
-            # Store edge with its properties
-            # Note: predicate is NOT stored here - it's already in the CSR arrays
-            # as an integer (fwd_predicates), saving significant memory via
-            # EdgePropertyStore deduplication.
-            core_fields = {"id", "category", "subject", "object", "predicate", "sources"}
-            # Known qualifier fields
-            qualifer_fields = {
-                "qualified_predicate",
-                "object_aspect_qualifier",
-                "object_direction_qualifier",
-                "subject_aspect_qualifier",
-                "subject_direction_qualifier",
-                "causal_mechanism_qualifier",
-                "species_context_qualifier",
-            }
-            edge_props = {
-                # "category": data.get("category", []),
-                "publications": data.get("publications", []),
-                "sources": [
-                    {
-                        "resource_id": s["resource_id"],
-                        "resource_role": s["resource_role"],
-                        **({"upstream_resource_ids": s["upstream_resource_ids"]} if "upstream_resource_ids" in s else {})
-                    }
-                    for s in data.get("sources", [])
-                ],
-                "attributes": [],
-                "qualifiers": []
-            }
-
-            # --- Qualifiers ---
-            qualifier_set = []
-            for field in qualifer_fields:
-                if field in data:
-                    qualifier_set.append({
-                        "qualifier_type_id": f"biolink:{field}",
-                        "qualifier_value": data[field],
-                    })
-
-            if qualifier_set:
-                edge_props["qualifiers"] = [{"qualifier_set": qualifier_set}]
-
-            # --- Everything else becomes an attribute ---
-            for field, value in data.items():
-                if field in core_fields or field in qualifer_fields:
-                    continue
-                edge_props["attributes"].append({
-                    "attribute_type_id": f"biolink:{field}",
-                    "value": value,
-                })
-
-            edge_list.append((subject, predicate, obj, edge_props))
-
-            line_count += 1
-
-    print(f"Found {len(node_ids):,} unique nodes and {len(edge_list):,} edges")
-
-    # Load node properties if provided
-    node_props_by_id = {}
+    # Load node properties
+    node_properties = {}
     if node_jsonl_path:
         print(f"Reading node properties from {node_jsonl_path}...")
         with open(node_jsonl_path, "r", encoding="utf-8") as f:
@@ -116,60 +147,179 @@ def build_graph_from_jsonl(
                 node_data = json.loads(line)
                 node_id = node_data.get("id")
                 if node_id:
-                    node_props_by_id[node_id] = {
-                        "id": node_data.get("id", ""),
-                        "categories": node_data.get("category", []),
-                        "name": node_data.get("name", None),
-                        "equivalent_identifiers": node_data.get("equivalent_identifiers", []),
-                        "information_content": node_data.get("information_content", 0.0),
-                    }
-        print(f"  Loaded properties for {len(node_props_by_id):,} nodes")
+                    idx = node_id_to_idx.get(node_id)
+                    if idx is not None:
+                        node_properties[idx] = {
+                            "id": node_data.get("id", ""),
+                            "categories": node_data.get("category", []),
+                            "name": node_data.get("name", None),
+                            "equivalent_identifiers": node_data.get("equivalent_identifiers", []),
+                            "information_content": node_data.get("information_content", 0.0),
+                        }
+        print(f"  Loaded properties for {len(node_properties):,} nodes")
 
-    # Create mapping from node IDs to integer indices
-    print("Building node index mapping...")
-    node_id_to_idx = {node_id: idx for idx, node_id in enumerate(sorted(node_ids))}
+    # =================================================================
+    # Pass 2: Build arrays + dedup store + temp LMDB
+    # =================================================================
+    print(f"Pass 2: Building arrays and property stores ({edge_count:,} edges)...")
 
-    # Build predicate vocabulary
-    print("Building predicate vocabulary...")
-    unique_predicates = sorted(set(pred for _, pred, _, _ in edge_list))
-    predicate_to_idx = {pred: idx for idx, pred in enumerate(unique_predicates)}
-    print(f"  Found {len(unique_predicates):,} unique predicates")
+    # Pre-allocate numpy arrays
+    src_indices = np.empty(edge_count, dtype=np.int32)
+    dst_indices = np.empty(edge_count, dtype=np.int32)
+    pred_indices = np.empty(edge_count, dtype=np.int32)
 
-    # Convert node properties to use indices
-    node_properties = {}
-    for node_id, props in node_props_by_id.items():
-        idx = node_id_to_idx.get(node_id)
-        if idx is not None:
-            node_properties[idx] = props
+    # Incremental dedup builder for qualifiers + sources (hot path)
+    prop_builder = EdgePropertyStoreBuilder(edge_count)
 
-    # Convert edges to integer indices with properties
-    print("Converting edges to indices...")
-    edges = []  # List of (src_idx, dst_idx) tuples
-    edge_predicates = []  # Parallel list of predicate IDs
-    edge_properties = {}  # Dict: (src_idx, dst_idx, pred_idx) -> properties
+    # Temp LMDB for cold-path properties (publications, attributes)
+    temp_dir = tempfile.mkdtemp(prefix="gandalf_build_")
+    temp_lmdb_path = Path(temp_dir) / "temp_props.lmdb"
+    temp_lmdb_path.mkdir(parents=True, exist_ok=True)
 
-    for subject, predicate, obj, props in edge_list:
-        src_idx = node_id_to_idx[subject]
-        dst_idx = node_id_to_idx[obj]
-        pred_idx = predicate_to_idx[predicate]
-
-        edges.append((src_idx, dst_idx))
-        edge_predicates.append(pred_idx)
-        edge_properties[(src_idx, dst_idx, pred_idx)] = props
-
-    print(f"Total edges: {len(edges):,}")
-
-    # Build CSR structure
-    print("Building CSR structure...")
-    graph = CSRGraph(
-        num_nodes=len(node_ids),
-        edges=edges,
-        edge_predicates=edge_predicates,
-        node_id_to_idx=node_id_to_idx,
-        predicate_to_idx=predicate_to_idx,
-        edge_properties=edge_properties,
-        node_properties=node_properties,
+    temp_env = lmdb.open(
+        str(temp_lmdb_path),
+        map_size=50 * 1024 * 1024 * 1024,
+        readonly=False,
+        max_dbs=0,
+        readahead=False,
     )
+
+    txn = temp_env.begin(write=True)
+    try:
+        with open(edge_jsonl_path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                data = json.loads(line)
+
+                # Fill numpy arrays
+                src_indices[i] = node_id_to_idx[data["subject"]]
+                dst_indices[i] = node_id_to_idx[data["object"]]
+                pred_indices[i] = predicate_to_idx[data["predicate"]]
+
+                # Extract properties
+                sources = _extract_sources(data)
+                qualifiers = _extract_qualifiers(data)
+                publications = data.get("publications", [])
+                attributes = _extract_attributes(data)
+
+                # Hot path: intern qualifiers + sources
+                prop_builder.add(i, {"sources": sources, "qualifiers": qualifiers})
+
+                # Cold path: write publications + attributes to temp LMDB
+                detail = {
+                    "publications": publications,
+                    "attributes": attributes,
+                }
+                key = _encode_key(i)
+                val = msgpack.packb(detail, use_bin_type=True)
+                txn.put(key, val)
+
+                if (i + 1) % 50_000 == 0:
+                    txn.commit()
+                    txn = temp_env.begin(write=True)
+
+                if (i + 1) % 1_000_000 == 0:
+                    print(f"  {i + 1:,}/{edge_count:,} edges processed...")
+
+        txn.commit()
+    except BaseException:
+        txn.abort()
+        raise
+    finally:
+        temp_env.close()
+
+    print(f"  Arrays and temp LMDB built")
+
+    # =================================================================
+    # Pass 3: Sort, rewrite LMDB, build CSR
+    # =================================================================
+    print("Pass 3: Sorting and building CSR structure...")
+
+    # Sort by (src, dst, pred) using lexsort (last key is primary)
+    sort_order = np.lexsort((pred_indices, dst_indices, src_indices))
+
+    # Reorder numpy arrays
+    src_sorted = src_indices[sort_order]
+    dst_sorted = dst_indices[sort_order]
+    pred_sorted = pred_indices[sort_order]
+
+    # Free unsorted arrays
+    del src_indices, dst_indices, pred_indices
+
+    # Reorder dedup store indices to match CSR order
+    prop_builder.reorder(sort_order)
+    edge_properties = prop_builder.build()
+    del prop_builder
+
+    stats = edge_properties.dedup_stats()
+    print(f"  Edge property dedup: {stats['total_edges']:,} edges -> "
+          f"{stats['unique_sources']:,} unique source configs, "
+          f"{stats['unique_qualifiers']:,} unique qualifier combos")
+
+    # Rewrite temp LMDB in CSR-sorted order → final LMDB
+    # This is the expensive build-time step, but ensures query-time
+    # LMDB key == CSR edge index with zero indirection.
+    final_lmdb_path = Path(temp_dir) / "edge_properties.lmdb"
+    lmdb_store = LMDBPropertyStore.build_sorted(
+        db_path=final_lmdb_path,
+        temp_db_path=temp_lmdb_path,
+        sort_permutation=sort_order,
+        num_edges=edge_count,
+    )
+
+    # Clean up temp LMDB
+    shutil.rmtree(temp_lmdb_path)
+    del sort_order
+
+    # Build CSR offset arrays using searchsorted
+    print("  Building CSR offsets...")
+    fwd_offsets = np.zeros(num_nodes + 1, dtype=np.int64)
+    if edge_count > 0:
+        boundaries = np.searchsorted(src_sorted, np.arange(num_nodes + 1))
+        fwd_offsets = boundaries.astype(np.int64)
+    del src_sorted
+
+    # Build reverse CSR: sort edges by (dst, src, pred)
+    print("  Building reverse CSR...")
+    # Reconstruct per-edge source node IDs from forward CSR offsets
+    edge_src = np.empty(edge_count, dtype=np.int32)
+    for node_idx in range(num_nodes):
+        start = int(fwd_offsets[node_idx])
+        end = int(fwd_offsets[node_idx + 1])
+        edge_src[start:end] = node_idx
+
+    rev_order = np.lexsort((pred_sorted, edge_src, dst_sorted))
+
+    rev_dst_sorted = dst_sorted[rev_order]
+    rev_sources = edge_src[rev_order]
+    rev_predicates = pred_sorted[rev_order]
+
+    rev_offsets = np.zeros(num_nodes + 1, dtype=np.int64)
+    if edge_count > 0:
+        boundaries = np.searchsorted(rev_dst_sorted, np.arange(num_nodes + 1))
+        rev_offsets = boundaries.astype(np.int64)
+
+    del edge_src, rev_dst_sorted, rev_order
+
+    # Assemble the graph
+    print("  Assembling graph...")
+    graph = CSRGraph.__new__(CSRGraph)
+    graph.num_nodes = num_nodes
+    graph.node_id_to_idx = node_id_to_idx
+    graph.idx_to_node_id = {idx: nid for nid, idx in node_id_to_idx.items()}
+    graph.predicate_to_idx = predicate_to_idx
+    graph.id_to_predicate = {idx: pred for pred, idx in predicate_to_idx.items()}
+    graph.node_properties = node_properties
+
+    graph.fwd_targets = dst_sorted
+    graph.fwd_predicates = pred_sorted
+    graph.fwd_offsets = fwd_offsets
+
+    graph.rev_sources = rev_sources
+    graph.rev_predicates = rev_predicates
+    graph.rev_offsets = rev_offsets
+
+    graph.edge_properties = edge_properties
+    graph.lmdb_store = lmdb_store
 
     # Print statistics
     degrees = [graph.degree(i) for i in range(min(1000, graph.num_nodes))]
@@ -181,14 +331,10 @@ def build_graph_from_jsonl(
         print(f"  Avg degree (sampled): {np.mean(degrees):.1f}")
         print(f"  Max degree (sampled): {np.max(degrees)}")
         memory_mb = (
-            (
-                graph.fwd_targets.nbytes
-                + graph.fwd_offsets.nbytes
-                + graph.fwd_predicates.nbytes
-            )
-            / 1024
-            / 1024
-        )
-        print(f"  Memory usage: ~{memory_mb:.1f} MB")
+            graph.fwd_targets.nbytes
+            + graph.fwd_offsets.nbytes
+            + graph.fwd_predicates.nbytes
+        ) / 1024 / 1024
+        print(f"  CSR memory usage: ~{memory_mb:.1f} MB")
 
     return graph

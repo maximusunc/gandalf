@@ -5,6 +5,7 @@
 *.pkl
 *.npy
 *.zst
+*.mdb
 
 # Python
 __pycache__/
