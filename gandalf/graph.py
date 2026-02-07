@@ -2,40 +2,39 @@
 
 import os
 import pickle
+import shutil
 import time
 from pathlib import Path
 from typing import Optional, Union
 
 import numpy as np
 
+from gandalf.lmdb_store import LMDBPropertyStore
+
 
 class EdgePropertyStore:
-    """Memory-efficient storage for edge properties using deduplication.
+    """Memory-efficient storage for qualifier and source dedup via interning.
 
-    Instead of storing a separate dict per edge, this class deduplicates
-    common field values across edges. Each unique publications list, sources
-    list, and qualifiers list is stored only once in a shared pool, and
-    edges reference them by integer index.
+    Qualifiers and sources are the "hot path" data — accessed during
+    traversal for every predicate-matching edge. They have very high
+    deduplication ratios (~10K unique qualifier combos, ~50 unique source
+    configs) so the pools are tiny and shared across workers via fork COW.
 
-    For a graph with 100M edges where there might be only ~50 unique source
-    configs, ~10K unique qualifier combos, and ~1M unique publication sets,
-    this typically reduces memory from ~30GB to ~2-3GB.
+    The wrapper dicts returned by _get_props() contain only references to
+    long-lived pool objects, so they are freed by refcount (no GC cycles).
 
-    The 'predicate' key is NOT stored here since it's already in the CSR
-    arrays as an integer (fwd_predicates). CSRGraph accessor methods
-    synthesize it when needed.
+    Publications, attributes, and other "cold path" data live in
+    LMDBPropertyStore (disk-backed, accessed only during response enrichment).
     """
 
     __slots__ = (
-        '_pubs_pool', '_sources_pool', '_quals_pool',
-        '_pubs_idx', '_sources_idx', '_quals_idx',
+        '_sources_pool', '_quals_pool',
+        '_sources_idx', '_quals_idx',
     )
 
     def __init__(self):
-        self._pubs_pool = []
         self._sources_pool = []
         self._quals_pool = []
-        self._pubs_idx = None
         self._sources_idx = None
         self._quals_idx = None
 
@@ -55,30 +54,20 @@ class EdgePropertyStore:
         """Build an EdgePropertyStore from a list of property dicts.
 
         Args:
-            props_list: List of dicts, each with keys like 'publications',
-                        'sources', 'qualifiers'. The 'predicate' key is
-                        ignored (stored separately in CSR arrays).
+            props_list: List of dicts, each with keys like 'sources',
+                        'qualifiers'. Only these two fields are stored;
+                        publications/attributes belong in LMDBPropertyStore.
         """
         store = cls()
         n = len(props_list)
 
-        pubs_intern = {}
         sources_intern = {}
         quals_intern = {}
 
-        pubs_indices = np.empty(n, dtype=np.int32)
         sources_indices = np.empty(n, dtype=np.int32)
         quals_indices = np.empty(n, dtype=np.int32)
 
         for i, props in enumerate(props_list):
-            # Intern publications
-            pubs = props.get("publications", [])
-            pubs_key = cls._make_hashable(pubs)
-            if pubs_key not in pubs_intern:
-                pubs_intern[pubs_key] = len(store._pubs_pool)
-                store._pubs_pool.append(pubs)
-            pubs_indices[i] = pubs_intern[pubs_key]
-
             # Intern sources
             sources = props.get("sources", [])
             sources_key = cls._make_hashable(sources)
@@ -95,16 +84,15 @@ class EdgePropertyStore:
                 store._quals_pool.append(quals)
             quals_indices[i] = quals_intern[quals_key]
 
-        store._pubs_idx = pubs_indices
         store._sources_idx = sources_indices
         store._quals_idx = quals_indices
 
         return store
 
     def __len__(self):
-        if self._pubs_idx is None:
+        if self._quals_idx is None:
             return 0
-        return len(self._pubs_idx)
+        return len(self._quals_idx)
 
     def __getitem__(self, key):
         if isinstance(key, slice):
@@ -113,18 +101,27 @@ class EdgePropertyStore:
         return self._get_props(key)
 
     def _get_props(self, idx):
-        """Get the full property dict for an edge at the given index."""
+        """Get qualifier and source properties for an edge at the given index.
+
+        Returns a dict with pool references (no new allocations beyond the
+        wrapper dict itself, which is cycle-free and freed by refcount).
+        """
         return {
-            "publications": self._pubs_pool[self._pubs_idx[idx]],
             "sources": self._sources_pool[self._sources_idx[idx]],
             "qualifiers": self._quals_pool[self._quals_idx[idx]],
         }
 
+    def get_qualifiers(self, idx):
+        """Get just the qualifiers for an edge. Zero-alloc pool reference."""
+        return self._quals_pool[self._quals_idx[idx]]
+
+    def get_sources(self, idx):
+        """Get just the sources for an edge. Zero-alloc pool reference."""
+        return self._sources_pool[self._sources_idx[idx]]
+
     def get_field(self, idx, key, default=None):
         """Get a single field value without creating a full dict."""
-        if key == "publications":
-            return self._pubs_pool[self._pubs_idx[idx]]
-        elif key == "sources":
+        if key == "sources":
             return self._sources_pool[self._sources_idx[idx]]
         elif key == "qualifiers":
             return self._quals_pool[self._quals_idx[idx]]
@@ -135,23 +132,16 @@ class EdgePropertyStore:
         n = len(self)
         return {
             "total_edges": n,
-            "unique_publications": len(self._pubs_pool),
             "unique_sources": len(self._sources_pool),
             "unique_qualifiers": len(self._quals_pool),
         }
 
     def save_mmap(self, directory: Path):
-        """Save to directory as mmap-friendly files.
-
-        Writes the three per-edge index arrays as .npy files (memory-mappable)
-        and the three small intern pools as a single pickle.
-        """
-        np.save(directory / "edge_pubs_idx.npy", self._pubs_idx)
+        """Save to directory as mmap-friendly files."""
         np.save(directory / "edge_sources_idx.npy", self._sources_idx)
         np.save(directory / "edge_quals_idx.npy", self._quals_idx)
 
         pools = {
-            "pubs_pool": self._pubs_pool,
             "sources_pool": self._sources_pool,
             "quals_pool": self._quals_pool,
         }
@@ -160,18 +150,9 @@ class EdgePropertyStore:
 
     @classmethod
     def load_mmap(cls, directory: Path, mmap_mode: str = "r"):
-        """Load from directory, memory-mapping the index arrays.
-
-        The per-edge index arrays are loaded via np.load with mmap_mode so
-        they stay on disk and are paged in on demand (and shared across
-        forked workers via copy-on-write).  The pools are small and loaded
-        fully into RAM.
-        """
+        """Load from directory, memory-mapping the index arrays."""
         store = cls()
 
-        store._pubs_idx = np.load(
-            directory / "edge_pubs_idx.npy", mmap_mode=mmap_mode
-        )
         store._sources_idx = np.load(
             directory / "edge_sources_idx.npy", mmap_mode=mmap_mode
         )
@@ -182,10 +163,61 @@ class EdgePropertyStore:
         with open(directory / "edge_property_pools.pkl", "rb") as f:
             pools = pickle.load(f)
 
-        store._pubs_pool = pools["pubs_pool"]
         store._sources_pool = pools["sources_pool"]
         store._quals_pool = pools["quals_pool"]
 
+        return store
+
+
+class EdgePropertyStoreBuilder:
+    """Incrementally builds an EdgePropertyStore one edge at a time.
+
+    Pre-allocates numpy index arrays (edge count known from pass 1),
+    fills them during pass 2 streaming, and supports reorder() for
+    CSR sort alignment.
+    """
+
+    def __init__(self, num_edges):
+        self._sources_pool = []
+        self._quals_pool = []
+        self._sources_intern = {}
+        self._quals_intern = {}
+        self._sources_idx = np.empty(num_edges, dtype=np.int32)
+        self._quals_idx = np.empty(num_edges, dtype=np.int32)
+
+    def add(self, pos, props):
+        """Intern one edge's qualifier and source properties at position pos."""
+        # Intern sources
+        sources = props.get("sources", [])
+        sources_key = EdgePropertyStore._make_hashable(sources)
+        if sources_key not in self._sources_intern:
+            self._sources_intern[sources_key] = len(self._sources_pool)
+            self._sources_pool.append(sources)
+        self._sources_idx[pos] = self._sources_intern[sources_key]
+
+        # Intern qualifiers
+        quals = props.get("qualifiers", [])
+        quals_key = EdgePropertyStore._make_hashable(quals)
+        if quals_key not in self._quals_intern:
+            self._quals_intern[quals_key] = len(self._quals_pool)
+            self._quals_pool.append(quals)
+        self._quals_idx[pos] = self._quals_intern[quals_key]
+
+    def reorder(self, permutation):
+        """Reorder index arrays to match CSR sort order."""
+        self._sources_idx = self._sources_idx[permutation]
+        self._quals_idx = self._quals_idx[permutation]
+
+    def build(self):
+        """Finalize to an EdgePropertyStore."""
+        store = EdgePropertyStore()
+        store._sources_pool = self._sources_pool
+        store._quals_pool = self._quals_pool
+        store._sources_idx = self._sources_idx
+        store._quals_idx = self._quals_idx
+        # Free intern dicts
+        self._sources_intern = None
+        self._quals_intern = None
         return store
 
 
@@ -196,6 +228,10 @@ class CSRGraph:
     Maintains two CSR structures:
     - Forward: node -> outgoing edges (who does this node point to?)
     - Reverse: node -> incoming edges (who points to this node?)
+
+    Edge properties are stored in two tiers:
+    - Hot path (qualifiers, sources): in-memory dedup store (EdgePropertyStore)
+    - Cold path (publications, attributes): disk-backed LMDB (LMDBPropertyStore)
     """
 
     def __init__(
@@ -227,6 +263,9 @@ class CSRGraph:
         self.predicate_to_idx = predicate_to_idx
         self.id_to_predicate = {idx: pred for pred, idx in predicate_to_idx.items()}
 
+        # LMDB store (cold path) — set later by loader or load_mmap
+        self.lmdb_store = None
+
         # Build both forward and reverse CSR structures
         print("Building forward CSR...")
         self._build_forward_csr(edges, edge_predicates, edge_properties)
@@ -256,20 +295,14 @@ class CSRGraph:
             [pred_id for src, dst, pred_id, _ in edges_with_props], dtype=np.int32
         )
 
-        # Build deduplicated edge property store
+        # Build deduplicated edge property store (qualifiers + sources only)
         props_list = [props for _, _, _, props in edges_with_props]
         self.edge_properties = EdgePropertyStore.from_property_list(props_list)
 
         stats = self.edge_properties.dedup_stats()
         print(f"  Edge property dedup: {stats['total_edges']:,} edges -> "
-              f"{stats['unique_publications']:,} unique publication lists, "
               f"{stats['unique_sources']:,} unique source configs, "
               f"{stats['unique_qualifiers']:,} unique qualifier combos")
-
-        # Build edge property index: (src, dst, pred_id) -> index
-        self.edge_prop_index = {}
-        for i, (src, dst, pred_id, _) in enumerate(edges_with_props):
-            self.edge_prop_index[(src, dst, pred_id)] = i
 
         # Build forward offsets
         self.fwd_offsets = np.zeros(self.num_nodes + 1, dtype=np.int64)
@@ -315,46 +348,66 @@ class CSRGraph:
             for i in range(current_dst + 1, self.num_nodes + 1):
                 self.rev_offsets[i] = len(reverse_edges)
 
+    # ------------------------------------------------------------------
+    # Binary search edge lookup (replaces edge_prop_index dict, saves ~7GB)
+    # ------------------------------------------------------------------
+
+    def _find_edge_index(self, src_idx, dst_idx, pred_id):
+        """Find CSR array index for an edge (src, dst, pred).
+
+        Since forward edges are sorted by (src, dst, pred), this uses
+        binary search within the source node's edge range.
+
+        Returns edge array index, or None if not found.
+        Typical cost: O(log(degree)), ~4-5 comparisons for avg degree 19.
+        """
+        start = int(self.fwd_offsets[src_idx])
+        end = int(self.fwd_offsets[src_idx + 1])
+
+        if start == end:
+            return None
+
+        # Binary search for dst_idx within targets[start:end]
+        targets_slice = self.fwd_targets[start:end]
+        left = int(np.searchsorted(targets_slice, dst_idx, side='left'))
+        right = int(np.searchsorted(targets_slice, dst_idx, side='right'))
+
+        if left == right:
+            return None  # dst_idx not found
+
+        # Linear scan within the (typically 1-3) edges to same dst for pred_id
+        for i in range(start + left, start + right):
+            if self.fwd_predicates[i] == pred_id:
+                return i
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Neighbor queries
+    # ------------------------------------------------------------------
+
     def neighbors(self, node_idx, predicate_filter=None):
         """
         Get neighbor indices for a node index (nodes this node points TO)
-
-        Args:
-            node_idx: Node index to get neighbors for
-            predicate_filter: Optional predicate string to filter edges
-
-        Returns:
-            numpy array of neighbor indices
         """
         start = self.fwd_offsets[node_idx]
         end = self.fwd_offsets[node_idx + 1]
 
         if predicate_filter is None:
-            # Return all neighbors
             return self.fwd_targets[start:end]
         else:
-            # Filter by predicate
             pred_id = self.predicate_to_idx.get(predicate_filter)
             if pred_id is None:
                 return np.array([], dtype=np.int32)
 
             neighbors = self.fwd_targets[start:end]
             predicates = self.fwd_predicates[start:end]
-
-            # Filter by predicate
             mask = predicates == pred_id
             return neighbors[mask]
 
     def incoming_neighbors(self, node_idx, predicate_filter=None):
         """
         Get incoming neighbors (nodes that point TO this node).
-
-        Args:
-            node_idx: Node index to get incoming neighbors for
-            predicate_filter: Optional predicate string to filter edges
-
-        Returns:
-            numpy array of source node indices
         """
         start = self.rev_offsets[node_idx]
         end = self.rev_offsets[node_idx + 1]
@@ -374,76 +427,63 @@ class CSRGraph:
     def neighbors_with_properties(
         self, node_idx: int, predicate_filter: Optional[list] = None
     ):
+        """Get neighbors with edge properties (qualifiers + sources).
+
+        Predicate filtering is done FIRST (in-memory from CSR arrays),
+        then qualifier/source properties are fetched only for matching
+        edges — avoiding unnecessary dedup store lookups.
+
+        Returns list of (neighbor_idx, predicate_str, edge_props) tuples
+        where edge_props = {"qualifiers": [...], "sources": [...]}.
+        The dict values are pool references (zero GC pressure).
         """
-        Get neighbors with edge properties and predicates
+        start = int(self.fwd_offsets[node_idx])
+        end = int(self.fwd_offsets[node_idx + 1])
 
-        Args:
-            node_idx: Node index to get neighbors for
-            predicate_filter: Optional predicate string to filter edges
+        result = []
+        for pos in range(start, end):
+            pred_id = int(self.fwd_predicates[pos])
+            pred_str = self.id_to_predicate[pred_id]
 
-        Returns:
-            List of (neighbor_idx, predicate_str, edge_props) tuples
-        """
-        start = self.fwd_offsets[node_idx]
-        end = self.fwd_offsets[node_idx + 1]
+            if predicate_filter is not None and pred_str not in predicate_filter:
+                continue
 
-        neighbors = self.fwd_targets[start:end]
-        pred_ids = self.fwd_predicates[start:end]
-        props = self.edge_properties[start:end]
-
-        # Convert predicate IDs to strings
-        predicates = [self.id_to_predicate[int(pid)] for pid in pred_ids]
-
-        result = list(zip(neighbors, predicates, props))
-
-        # Apply predicate filter if specified
-        if predicate_filter is not None:
-            result = [
-                (neighbor, pred, prop)
-                for neighbor, pred, prop in result
-                if pred in predicate_filter
-            ]
+            target = int(self.fwd_targets[pos])
+            props = self.edge_properties._get_props(pos)
+            result.append((target, pred_str, props))
 
         return result
 
     def incoming_neighbors_with_properties(
         self, node_idx, predicate_filter: Optional[list] = None
     ):
+        """Get incoming neighbors with edge properties (qualifiers + sources).
+
+        Uses binary search to find the forward edge index for property lookup,
+        replacing the old edge_prop_index dict.
         """
-        Get incoming neighbors with edge properties and predicates.
+        start = int(self.rev_offsets[node_idx])
+        end = int(self.rev_offsets[node_idx + 1])
 
-        Returns:
-            List of (source_idx, predicate_str, edge_props) tuples
-        """
-        start = self.rev_offsets[node_idx]
-        end = self.rev_offsets[node_idx + 1]
-
-        sources = self.rev_sources[start:end]
-        pred_ids = self.rev_predicates[start:end]
-
-        # Get properties from forward edge property list
         result = []
-        for src_idx, pred_id in zip(sources, pred_ids):
-            predicate = self.id_to_predicate[int(pred_id)]
-            # Look up properties from the forward edge
-            edge_idx = self.edge_prop_index.get((int(src_idx), node_idx, int(pred_id)))
-            props = self.edge_properties[edge_idx] if edge_idx is not None else {}
+        for pos in range(start, end):
+            src_idx = int(self.rev_sources[pos])
+            pred_id = int(self.rev_predicates[pos])
+            predicate = self.id_to_predicate[pred_id]
 
-            if predicate_filter is None or predicate in predicate_filter:
-                result.append((int(src_idx), predicate, props))
+            if predicate_filter is not None and predicate not in predicate_filter:
+                continue
+
+            # Find forward edge index via binary search
+            edge_idx = self._find_edge_index(src_idx, node_idx, pred_id)
+            props = self.edge_properties._get_props(edge_idx) if edge_idx is not None else {}
+
+            result.append((src_idx, predicate, props))
 
         return result
 
     def get_edges(self, node_idx):
-        """
-        Get all edges from a node as (neighbor_idx, predicate_str) tuples
-
-        Args:
-            node_idx: Source node index
-
-        Returns:
-            List of (neighbor_idx, predicate_str) tuples
-        """
+        """Get all edges from a node as (neighbor_idx, predicate_str) tuples."""
         start = self.fwd_offsets[node_idx]
         end = self.fwd_offsets[node_idx + 1]
 
@@ -468,94 +508,83 @@ class CSRGraph:
             for source, pred_id in zip(sources, pred_ids)
         ]
 
+    # ------------------------------------------------------------------
+    # Edge property accessors
+    # ------------------------------------------------------------------
+
     def get_edge_property(self, src_idx, dst_idx, predicate, key, default=None):
+        """Get a specific property for an edge.
+
+        For 'qualifiers' and 'sources': O(log(degree)) via dedup store.
+        For 'publications', 'attributes': O(log(degree)) + LMDB lookup.
         """
-        Get a specific property for an edge - O(1) lookup
-
-        Args:
-            src_idx: Source node index
-            dst_idx: Destination node index
-            predicate: Predicate string
-            key: Property key to retrieve
-            default: Default value if not found
-
-        Returns:
-            Property value or default
-        """
-        pred_id = self.predicate_to_idx.get(predicate)
-        if pred_id is None:
-            return default
-
-        edge_idx = self.edge_prop_index.get((src_idx, dst_idx, pred_id))
-        if edge_idx is None:
-            return default
-
-        # Predicate is stored in CSR arrays, not in edge properties
         if key == "predicate":
             return predicate
 
-        # Use efficient single-field access when available
-        if isinstance(self.edge_properties, EdgePropertyStore):
-            return self.edge_properties.get_field(edge_idx, key, default)
-        return self.edge_properties[edge_idx].get(key, default)
+        pred_id = self.predicate_to_idx.get(predicate)
+        if pred_id is None:
+            return default
+
+        edge_idx = self._find_edge_index(src_idx, dst_idx, pred_id)
+        if edge_idx is None:
+            return default
+
+        # Hot path fields from dedup store
+        result = self.edge_properties.get_field(edge_idx, key)
+        if result is not None:
+            return result
+
+        # Cold path fields from LMDB
+        if self.lmdb_store is not None:
+            detail = self.lmdb_store.get(edge_idx)
+            return detail.get(key, default)
+
+        return default
 
     def get_all_edge_properties(self, src_idx, dst_idx, predicate):
-        """
-        Get all properties for an edge - O(1) lookup
+        """Get all properties for an edge.
 
-        Args:
-            src_idx: Source node index
-            dst_idx: Destination node index
-            predicate: Predicate string
-
-        Returns:
-            Dict of all edge properties, or empty dict if edge not found.
-            Always includes 'predicate' key (synthesized from CSR arrays).
+        Merges hot-path (qualifiers, sources from dedup store) with
+        cold-path (publications, attributes from LMDB).
         """
         pred_id = self.predicate_to_idx.get(predicate)
         if pred_id is None:
             return {}
 
-        edge_idx = self.edge_prop_index.get((src_idx, dst_idx, pred_id))
+        edge_idx = self._find_edge_index(src_idx, dst_idx, pred_id)
         if edge_idx is None:
             return {}
 
-        # EdgePropertyStore.__getitem__ creates a new dict each time,
-        # so it's safe to add predicate to it without mutating the store
-        props = self.edge_properties[edge_idx]
+        # Start with hot-path data (pool references, no GC pressure)
+        props = self.edge_properties._get_props(edge_idx)
+
+        # Merge cold-path data from LMDB
+        if self.lmdb_store is not None:
+            detail = self.lmdb_store.get(edge_idx)
+            props.update(detail)
+
         props["predicate"] = predicate
         return props
 
     def get_all_edges_between(self, src_idx, dst_idx, predicate_filter: Optional[list] = None):
-        """
-        Get all edges (with different predicates) between two nodes
-
-        Args:
-            src_idx: Source node index
-            dst_idx: Destination node index
-
-        Returns:
-            List of (predicate_str, properties) tuples
-        """
-        t0 = time.perf_counter()
-        start = self.fwd_offsets[src_idx]
-        end = self.fwd_offsets[src_idx + 1]
+        """Get all edges (with different predicates) between two nodes."""
+        start = int(self.fwd_offsets[src_idx])
+        end = int(self.fwd_offsets[src_idx + 1])
 
         result = []
-        neighbors = self.fwd_targets[start:end]
-        pred_ids = self.fwd_predicates[start:end]
-        props = self.edge_properties[start:end]
-
-        for neighbor, pred_id, prop in zip(neighbors, pred_ids, props):
-            if neighbor == dst_idx:
-                predicate_str = self.id_to_predicate[int(pred_id)]
-                # Apply predicate filter if specified
+        for pos in range(start, end):
+            if int(self.fwd_targets[pos]) == dst_idx:
+                pred_id = int(self.fwd_predicates[pos])
+                predicate_str = self.id_to_predicate[pred_id]
                 if predicate_filter is None or predicate_str in predicate_filter:
-                    result.append((predicate_str, prop))
+                    props = self.edge_properties._get_props(pos)
+                    result.append((predicate_str, props))
 
-        t1 = time.perf_counter()
-        # print("Getting all edges in between took:", t1 - t0)
         return result
+
+    # ------------------------------------------------------------------
+    # Node property accessors
+    # ------------------------------------------------------------------
 
     def get_node_property(self, node_idx, key, default=None):
         """Get a specific property for a node"""
@@ -566,16 +595,7 @@ class CSRGraph:
         return self.node_properties.get(node_idx, {})
 
     def degree(self, node_idx, predicate_filter=None):
-        """
-        Get degree of a node, optionally filtered by predicate
-
-        Args:
-            node_idx: Node index
-            predicate_filter: Optional predicate string to count only specific edge types
-
-        Returns:
-            Integer degree count
-        """
+        """Get degree of a node, optionally filtered by predicate."""
         if predicate_filter is None:
             return self.fwd_offsets[node_idx + 1] - self.fwd_offsets[node_idx]
         else:
@@ -598,8 +618,12 @@ class CSRGraph:
 
         return sorted(pred_counts.items(), key=lambda x: x[1], reverse=True)
 
+    # ------------------------------------------------------------------
+    # Serialization
+    # ------------------------------------------------------------------
+
     def save(self, filepath):
-        """Save graph to disk for fast reloading"""
+        """Save graph to disk for fast reloading (pickle format)."""
         print(f"Saving graph to {filepath}...")
         data = {
             "num_nodes": self.num_nodes,
@@ -613,10 +637,9 @@ class CSRGraph:
             "rev_sources": self.rev_sources,
             "rev_predicates": self.rev_predicates,
             "rev_offsets": self.rev_offsets,
-            # Properties
+            # Properties (hot path dedup store)
             "edge_properties": self.edge_properties,
             "node_properties": self.node_properties,
-            "edge_prop_index": self.edge_prop_index,
         }
         with open(filepath, "wb") as f:
             pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -650,7 +673,6 @@ class CSRGraph:
             graph.rev_offsets = data["rev_offsets"]
         else:
             print("Warning: Loaded graph without reverse CSR. Rebuilding...")
-            # Rebuild reverse CSR from forward edges
             edges = []
             edge_preds = []
             for src in range(graph.num_nodes):
@@ -666,7 +688,6 @@ class CSRGraph:
         # Properties
         graph.edge_properties = data["edge_properties"]
         graph.node_properties = data["node_properties"]
-        graph.edge_prop_index = data.get("edge_prop_index", {})
 
         # Convert old list-of-dicts format to EdgePropertyStore
         if isinstance(graph.edge_properties, list):
@@ -675,10 +696,12 @@ class CSRGraph:
                 graph.edge_properties
             )
 
+        # No LMDB store for pickle format (legacy)
+        graph.lmdb_store = None
+
         if isinstance(graph.edge_properties, EdgePropertyStore):
             stats = graph.edge_properties.dedup_stats()
             print(f"  Edge property dedup: {stats['total_edges']:,} edges -> "
-                  f"{stats['unique_publications']:,} unique publication lists, "
                   f"{stats['unique_sources']:,} unique source configs, "
                   f"{stats['unique_qualifiers']:,} unique qualifier combos")
 
@@ -689,17 +712,13 @@ class CSRGraph:
         return graph
 
     def save_mmap(self, directory: Union[str, Path]):
-        """
-        Save graph in memory-mappable format for fast loading.
+        """Save graph in memory-mappable format for fast loading.
 
         Creates a directory with separate files:
         - NumPy arrays as .npy files (can be memory-mapped)
         - Metadata dictionaries as pickle
-        - Edge property index arrays as .npy files (memory-mapped)
-        - Edge property intern pools as small pickle
-
-        Args:
-            directory: Directory path to save graph files
+        - Edge qualifier/source dedup store (mmap-friendly)
+        - Edge detail properties as LMDB (if present)
         """
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
@@ -715,20 +734,17 @@ class CSRGraph:
         np.save(directory / "rev_predicates.npy", self.rev_predicates)
         np.save(directory / "rev_offsets.npy", self.rev_offsets)
 
-        # Save small metadata as pickle
+        # Save small metadata as pickle (no edge_prop_index — binary search instead)
         metadata = {
             "num_nodes": self.num_nodes,
             "node_id_to_idx": self.node_id_to_idx,
             "predicate_to_idx": self.predicate_to_idx,
             "node_properties": self.node_properties,
-            "edge_prop_index": self.edge_prop_index,
         }
         with open(directory / "metadata.pkl", "wb") as f:
             pickle.dump(metadata, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-        # Save edge properties as mmap-friendly components:
-        # - 3 numpy .npy index arrays (memory-mappable)
-        # - 1 small pickle with the intern pools
+        # Save hot-path edge properties (qualifier + source dedup store)
         if isinstance(self.edge_properties, EdgePropertyStore):
             self.edge_properties.save_mmap(directory)
         else:
@@ -736,36 +752,37 @@ class CSRGraph:
             with open(directory / "edge_properties.pkl", "wb") as f:
                 pickle.dump(self.edge_properties, f, protocol=pickle.HIGHEST_PROTOCOL)
 
+        # Copy LMDB store if present
+        if self.lmdb_store is not None:
+            lmdb_src = self.lmdb_store._path
+            lmdb_dst = directory / "edge_properties.lmdb"
+            if lmdb_src.resolve() != lmdb_dst.resolve():
+                if lmdb_dst.exists():
+                    shutil.rmtree(lmdb_dst)
+                shutil.copytree(lmdb_src, lmdb_dst)
+
         t1 = time.perf_counter()
         print(f"Graph saved in {t1 - t0:.2f}s")
 
         # Print file sizes
         total_size = 0
-        for f in directory.iterdir():
-            size = f.stat().st_size
-            total_size += size
-            print(f"  {f.name}: {size / 1024 / 1024:.1f} MB")
+        for f in sorted(directory.iterdir()):
+            if f.is_file():
+                size = f.stat().st_size
+                total_size += size
+                print(f"  {f.name}: {size / 1024 / 1024:.1f} MB")
+            elif f.is_dir():
+                dir_size = sum(ff.stat().st_size for ff in f.iterdir() if ff.is_file())
+                total_size += dir_size
+                print(f"  {f.name}/: {dir_size / 1024 / 1024:.1f} MB")
         print(f"  Total: {total_size / 1024 / 1024:.1f} MB")
 
     @staticmethod
     def load_mmap(directory: Union[str, Path], mmap_mode: str = "r"):
-        """
-        Load graph from memory-mapped format.
+        """Load graph from memory-mapped format.
 
-        This provides near-instant startup by memory-mapping the large NumPy arrays.
-        The OS will page in data on demand, and multiple processes can share
-        the same memory pages (great for multi-worker FastAPI).
-
-        Args:
-            directory: Directory containing graph files
-            mmap_mode: Memory-map mode for NumPy arrays:
-                - 'r': Read-only (default, recommended for serving)
-                - 'r+': Read-write (allows modification)
-                - 'c': Copy-on-write (modifications are private)
-                - None: Load fully into memory (no mmap)
-
-        Returns:
-            CSRGraph instance with memory-mapped arrays
+        Supports both the new hybrid format (dedup store + LMDB) and
+        the legacy format (full EdgePropertyStore with pubs/sources/quals).
         """
         directory = Path(directory)
         print(f"Loading graph from {directory} (mmap_mode={mmap_mode})...")
@@ -805,19 +822,18 @@ class CSRGraph:
             idx: pred for pred, idx in graph.predicate_to_idx.items()
         }
         graph.node_properties = metadata["node_properties"]
-        graph.edge_prop_index = metadata.get("edge_prop_index", {})
 
-        # Load edge properties - prefer new split mmap format, fall back
-        # to legacy single-pickle format
+        # Load edge properties - detect format
         t_props_start = time.perf_counter()
+        lmdb_path = directory / "edge_properties.lmdb"
 
         if (directory / "edge_property_pools.pkl").exists():
-            # New format: 3 mmap'd numpy arrays + small pools pickle
+            # New or legacy dedup format
             graph.edge_properties = EdgePropertyStore.load_mmap(
                 directory, mmap_mode=mmap_mode
             )
         elif (directory / "edge_properties.pkl").exists():
-            # Legacy format: one big pickle (EdgePropertyStore or list)
+            # Legacy format: one big pickle
             with open(directory / "edge_properties.pkl", "rb") as f:
                 graph.edge_properties = pickle.load(f)
             if isinstance(graph.edge_properties, list):
@@ -830,14 +846,22 @@ class CSRGraph:
                 f"No edge property files found in {directory}"
             )
 
+        # Load LMDB store if present
+        if lmdb_path.exists():
+            graph.lmdb_store = LMDBPropertyStore(lmdb_path, readonly=True)
+        else:
+            graph.lmdb_store = None
+
         t_props_end = time.perf_counter()
 
         if isinstance(graph.edge_properties, EdgePropertyStore):
             stats = graph.edge_properties.dedup_stats()
             print(f"  Edge property dedup: {stats['total_edges']:,} edges -> "
-                  f"{stats['unique_publications']:,} unique publication lists, "
                   f"{stats['unique_sources']:,} unique source configs, "
                   f"{stats['unique_qualifiers']:,} unique qualifier combos")
+
+        if graph.lmdb_store is not None:
+            print(f"  LMDB detail store: {lmdb_path}")
 
         t1 = time.perf_counter()
         print(

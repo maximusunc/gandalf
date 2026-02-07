@@ -19,6 +19,8 @@ classifiers = [
 ]
 dependencies = [
     "bmt>=1.4.6",
+    "lmdb>=1.4.0",
+    "msgpack>=1.0.0",
     "numpy>=1.20.0",
 ]
 

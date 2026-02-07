@@ -9,7 +9,8 @@ from gandalf.diagnostics import (
     analyze_predicates,
     diagnose_path_explosion,
 )
-from gandalf.graph import CSRGraph, EdgePropertyStore
+from gandalf.graph import CSRGraph, EdgePropertyStore, EdgePropertyStoreBuilder
+from gandalf.lmdb_store import LMDBPropertyStore
 from gandalf.loader import build_graph_from_jsonl
 from gandalf.query_planner import get_next_qedge
 from gandalf.search import (
@@ -34,6 +35,8 @@ __all__ = [
     # Core classes
     "CSRGraph",
     "EdgePropertyStore",
+    "EdgePropertyStoreBuilder",
+    "LMDBPropertyStore",
     # Loading
     "build_graph_from_jsonl",
     # Search
