@@ -58,30 +58,19 @@ def _extract_sources(data):
 
 
 def _extract_qualifiers(data):
-    """Extract qualifiers, supporting both JSONL formats.
+    """Extract qualifiers.
 
-    Format A: Top-level fields (object_aspect_qualifier, etc.)
-        -> Wrapped as [{"qualifier_set": [...]}] for search compatibility.
-    Format B: Nested 'qualifiers' array (already formatted)
-        -> Passed through as-is.
+    Format: Top-level fields (object_aspect_qualifier, etc.)
     """
-    # Format A: top-level qualifier fields
-    qualifier_set = []
+    qualifiers = []
     for field in _QUALIFIER_FIELDS:
         if field in data:
-            qualifier_set.append({
+            qualifiers.append({
                 "qualifier_type_id": f"biolink:{field}",
                 "qualifier_value": data[field],
             })
-    if qualifier_set:
-        return [{"qualifier_set": qualifier_set}]
 
-    # Format B: pre-formatted qualifiers array — pass through as-is
-    raw_qualifiers = data.get("qualifiers")
-    if raw_qualifiers and isinstance(raw_qualifiers, list):
-        return raw_qualifiers
-
-    return []
+    return qualifiers
 
 
 def _extract_attributes(data):
