@@ -45,16 +45,39 @@ _QUALIFIER_FIELDS = {
 
 
 def _extract_sources(data):
-    """Extract normalized source list from edge data."""
-    return [
+    """Extract normalized source list from edge data.
+
+    Ensures every source has an ``upstream_resource_ids`` list (defaults to
+    ``[]``) and prepends an ``infores:gandalf`` aggregator_knowledge_source
+    whose upstream points to the primary_knowledge_source(s).
+    """
+    raw = data.get("sources", [])
+
+    # Normalize: guarantee upstream_resource_ids on every source
+    sources = [
         {
             "resource_id": s["resource_id"],
             "resource_role": s["resource_role"],
-            **({"upstream_resource_ids": s["upstream_resource_ids"]}
-               if "upstream_resource_ids" in s else {})
+            "upstream_resource_ids": s.get("upstream_resource_ids", []),
         }
-        for s in data.get("sources", [])
+        for s in raw
     ]
+
+    # Collect primary knowledge source IDs for gandalf's upstream
+    primary_ids = [
+        s["resource_id"]
+        for s in sources
+        if s["resource_role"] == "primary_knowledge_source"
+    ]
+
+    # Prepend gandalf as aggregator_knowledge_source
+    gandalf_source = {
+        "resource_id": "infores:gandalf",
+        "resource_role": "aggregator_knowledge_source",
+        "upstream_resource_ids": primary_ids,
+    }
+
+    return [gandalf_source] + sources
 
 
 def _extract_qualifiers(data):
