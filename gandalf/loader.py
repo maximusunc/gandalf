@@ -45,16 +45,47 @@ _QUALIFIER_FIELDS = {
 
 
 def _extract_sources(data):
-    """Extract normalized source list from edge data."""
-    return [
+    """Extract normalized source list from edge data.
+
+    Ensures every source has an ``upstream_resource_ids`` list (defaults to
+    ``[]``) and prepends an ``infores:gandalf`` aggregator_knowledge_source
+    whose upstream points to the top of the existing source chain (i.e. the
+    source(s) not referenced in any other source's upstream_resource_ids).
+    """
+    raw = data.get("sources", [])
+
+    # Normalize: guarantee upstream_resource_ids on every source
+    sources = [
         {
             "resource_id": s["resource_id"],
             "resource_role": s["resource_role"],
-            **({"upstream_resource_ids": s["upstream_resource_ids"]}
-               if "upstream_resource_ids" in s else {})
+            "upstream_resource_ids": s.get("upstream_resource_ids", []),
         }
-        for s in data.get("sources", [])
+        for s in raw
     ]
+
+    # Find the top of the source chain: sources whose resource_id is NOT
+    # referenced in any other source's upstream_resource_ids.  These are the
+    # "leaf" providers that no one else aggregates from yet.
+    all_upstream = {
+        uid
+        for s in sources
+        for uid in s["upstream_resource_ids"]
+    }
+    top_ids = [
+        s["resource_id"]
+        for s in sources
+        if s["resource_id"] not in all_upstream
+    ]
+
+    # Prepend gandalf as aggregator_knowledge_source
+    gandalf_source = {
+        "resource_id": "infores:gandalf",
+        "resource_role": "aggregator_knowledge_source",
+        "upstream_resource_ids": top_ids,
+    }
+
+    return [gandalf_source] + sources
 
 
 def _extract_qualifiers(data):

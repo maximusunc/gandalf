@@ -112,13 +112,30 @@ class TestEdgeProperties:
         assert predicate == "biolink:treats"
 
     def test_edge_source_property(self, graph):
-        """Should correctly store knowledge source."""
+        """Should correctly store knowledge source with gandalf aggregator."""
         src_idx = graph.node_id_to_idx["CHEBI:6801"]
         dst_idx = graph.node_id_to_idx["MONDO:0005148"]
         sources = graph.get_edge_property(src_idx, dst_idx, "biolink:treats", "sources")
         assert sources is not None
-        assert len(sources) > 0
-        assert sources[0]["resource_id"] == "infores:drugcentral"
+        assert len(sources) >= 2
+
+        # First source should be gandalf as aggregator
+        assert sources[0]["resource_id"] == "infores:gandalf"
+        assert sources[0]["resource_role"] == "aggregator_knowledge_source"
+        assert sources[0]["upstream_resource_ids"] == ["infores:drugcentral"]
+
+        # Second source is the original primary knowledge source
+        assert sources[1]["resource_id"] == "infores:drugcentral"
+        assert sources[1]["resource_role"] == "primary_knowledge_source"
+
+    def test_edge_sources_all_have_upstream_resource_ids(self, graph):
+        """Every source entry should have an upstream_resource_ids list."""
+        src_idx = graph.node_id_to_idx["CHEBI:6801"]
+        dst_idx = graph.node_id_to_idx["MONDO:0005148"]
+        sources = graph.get_edge_property(src_idx, dst_idx, "biolink:treats", "sources")
+        for source in sources:
+            assert "upstream_resource_ids" in source
+            assert isinstance(source["upstream_resource_ids"], list)
 
     def test_edge_publications_property(self, graph):
         """Should correctly store publications."""
