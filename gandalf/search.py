@@ -13,6 +13,11 @@ from bmt.toolkit import Toolkit
 from gandalf.graph import CSRGraph
 from gandalf.query_planner import get_next_qedge, remove_orphaned
 
+# When path count exceeds this threshold, skip edge attribute enrichment
+# (sources, qualifiers, publications, attributes from LMDB) and only include
+# predicates. This avoids expensive per-edge property lookups on large result sets.
+LARGE_RESULT_PATH_THRESHOLD = 50_000
+
 
 class QualifierExpander:
     """
@@ -1775,9 +1780,20 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
     if num_paths == 0:
         return []
 
+    # Check if we exceed the large result threshold — if so, skip expensive
+    # per-edge property lookups (edge attributes, sources, qualifiers, LMDB
+    # publications/attributes) and only include predicates.
+    lightweight = num_paths > LARGE_RESULT_PATH_THRESHOLD
+
     # Build node property cache
     if verbose:
-        print(f"  Enriching {num_paths:,} paths...")
+        if lightweight:
+            print(
+                f"  Enriching {num_paths:,} paths (lightweight mode: "
+                f">{LARGE_RESULT_PATH_THRESHOLD:,} paths, skipping edge attributes)..."
+            )
+        else:
+            print(f"  Enriching {num_paths:,} paths...")
 
     t_cache_start = time.perf_counter()
 
@@ -1853,15 +1869,24 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
                     actual_subj_idx = query_subj_idx
                     actual_obj_idx = query_obj_idx
 
-                # Get all edge properties using actual edge direction
-                edge_props = graph.get_all_edge_properties(
-                    int(actual_subj_idx), int(actual_obj_idx), predicate
-                ).copy()
+                if lightweight:
+                    # Only include predicate and structural info — skip
+                    # edge attribute lookups (sources, qualifiers, LMDB data)
+                    edge_props = {
+                        "predicate": predicate,
+                        "subject": node_cache[actual_subj_idx]["id"],
+                        "object": node_cache[actual_obj_idx]["id"],
+                    }
+                else:
+                    # Get all edge properties using actual edge direction
+                    edge_props = graph.get_all_edge_properties(
+                        int(actual_subj_idx), int(actual_obj_idx), predicate
+                    ).copy()
 
-                # Ensure required fields are present with actual edge direction
-                edge_props["predicate"] = predicate
-                edge_props["subject"] = node_cache[actual_subj_idx]["id"]
-                edge_props["object"] = node_cache[actual_obj_idx]["id"]
+                    # Ensure required fields are present with actual edge direction
+                    edge_props["predicate"] = predicate
+                    edge_props["subject"] = node_cache[actual_subj_idx]["id"]
+                    edge_props["object"] = node_cache[actual_obj_idx]["id"]
 
                 edges[qedge_id] = edge_props
 
