@@ -957,7 +957,7 @@ def _rewrite_for_subclass(query_graph, subclass_depth=1):
         }
 
 
-def lookup(graph, query: dict, bmt=None, verbose=True, subclass=False, subclass_depth=1):
+def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_depth=1):
     """
     Take an arbitrary Translator query graph and return all matching paths.
 
@@ -992,7 +992,8 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=False, subclass_
     # Create qualifier expander for handling qualifier value hierarchy at query time
     qualifier_expander = QualifierExpander(bmt)
 
-    query_graph = query["message"]["query_graph"]
+    original_query_graph = query["message"]["query_graph"]
+    query_graph = copy.deepcopy(original_query_graph)
     subqgraph = copy.deepcopy(query_graph)
 
     # Rewrite query graph for subclass expansion if requested
@@ -1001,7 +1002,7 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=False, subclass_
             print(f"Rewriting query graph for subclass expansion (depth={subclass_depth})")
         _rewrite_for_subclass(subqgraph, subclass_depth=subclass_depth)
         # Use the rewritten graph as the query graph for the rest of the pipeline
-        query_graph = subqgraph
+        query_graph = copy.deepcopy(subqgraph)
 
     # Store results for each edge query
     # edge_id -> list of (subject_idx, predicate, object_idx) tuples
@@ -1148,7 +1149,7 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=False, subclass_
 
     response = {
         "message": {
-            "query_graph": query_graph,
+            "query_graph": original_query_graph,
             "knowledge_graph": {
                 "nodes": {},
                 "edges": {},
