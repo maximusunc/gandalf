@@ -31,7 +31,7 @@ class TestBuildGraphFromJsonl:
         """Should load all unique nodes from edges."""
         # Nodes in edges: CHEBI:6801, MONDO:0005148, NCBIGene:5468, NCBIGene:3643,
         # HP:0001943, CHEBI:17234, GO:0006006, NCBIGene:2645, NCBIGene:7124 (TNF)
-        assert graph.num_nodes == 9
+        assert graph.num_nodes == 11
 
     def test_loads_edges(self, graph):
         """Should load edges into the graph."""
@@ -162,6 +162,7 @@ class TestGraphStructure:
         assert "NCBIGene:3643" in neighbor_ids  # INSR - qualifier test edge
         assert "NCBIGene:2645" in neighbor_ids  # GCK - qualifier test edge
         assert "NCBIGene:7124" in neighbor_ids  # TNF - qualifier test edge
+        assert "MONDO:0005015" in neighbor_ids
 
     def test_neighbors_with_predicate_filter(self, graph):
         """Should filter neighbors by predicate."""
@@ -170,35 +171,37 @@ class TestGraphStructure:
 
         neighbor_ids = {graph.idx_to_node_id[int(n)] for n in neighbors}
         assert "MONDO:0005148" in neighbor_ids
+        assert "MONDO:0005015" in neighbor_ids
         # Should not include affects edges
-        assert len(neighbor_ids) == 1
+        assert len(neighbor_ids) == 2
 
     def test_degree_calculation(self, graph):
         """Should correctly calculate node degree."""
         metformin_idx = graph.node_id_to_idx["CHEBI:6801"]
         degree = graph.degree(metformin_idx)
-        # Metformin has 8 outgoing edges:
+        # Metformin has 9 outgoing edges:
         # - treats, ameliorates, preventative (to MONDO:0005148)
         # - affects NCBIGene:5468 (PPARG)
         # - affects CHEBI:17234 (Glucose)
         # - affects NCBIGene:3643 (INSR) with qualifiers
         # - affects NCBIGene:2645 (GCK) with qualifiers
         # - affects NCBIGene:7124 (TNF) with qualifiers
-        assert degree == 8
+        # - treats (to MONDO:0005015)
+        assert degree == 9
 
     def test_degree_with_predicate_filter(self, graph):
         """Should correctly calculate filtered degree."""
         metformin_idx = graph.node_id_to_idx["CHEBI:6801"]
         degree = graph.degree(metformin_idx, predicate_filter="biolink:treats")
-        assert degree == 1
+        assert degree == 2
 
     def test_get_edges_returns_tuples(self, graph):
         """Should return edges as (neighbor_idx, predicate) tuples."""
         metformin_idx = graph.node_id_to_idx["CHEBI:6801"]
         edges = graph.get_edges(metformin_idx)
 
-        # Metformin has 8 outgoing edges (including qualifier test edges)
-        assert len(edges) == 8
+        # Metformin has 9 outgoing edges (including qualifier test edges)
+        assert len(edges) == 9
         for neighbor_idx, predicate in edges:
             assert isinstance(neighbor_idx, int)
             assert isinstance(predicate, str)
@@ -236,8 +239,8 @@ class TestGraphSaveLoad:
 
             metformin_idx = loaded_graph.node_id_to_idx["CHEBI:6801"]
             neighbors = loaded_graph.neighbors(metformin_idx)
-            # Metformin has 8 outgoing edges (including qualifier test edges)
-            assert len(neighbors) == 8
+            # Metformin has 9 outgoing edges (including qualifier test edges)
+            assert len(neighbors) == 9
         finally:
             os.unlink(temp_path)
 
@@ -287,8 +290,8 @@ class TestGraphMmapSaveLoad:
 
             metformin_idx = loaded_graph.node_id_to_idx["CHEBI:6801"]
             neighbors = loaded_graph.neighbors(metformin_idx)
-            # Metformin has 8 outgoing edges (including qualifier test edges)
-            assert len(neighbors) == 8
+            # Metformin has 9 outgoing edges (including qualifier test edges)
+            assert len(neighbors) == 9
 
     def test_mmap_loaded_graph_edge_properties(self, graph):
         """Should correctly load edge properties in mmap format."""
@@ -340,7 +343,7 @@ class TestGraphMmapSaveLoad:
             assert loaded_graph.num_nodes == graph.num_nodes
             metformin_idx = loaded_graph.node_id_to_idx["CHEBI:6801"]
             neighbors = loaded_graph.neighbors(metformin_idx)
-            assert len(neighbors) == 8
+            assert len(neighbors) == 9
 
 
 class TestEdgeCases:

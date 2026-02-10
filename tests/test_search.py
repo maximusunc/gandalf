@@ -1473,7 +1473,7 @@ class TestSubclassHandling:
     - CHEBI:6801 (Metformin) --treats--> MONDO:0005015 (Diabetes Mellitus)
     """
 
-    def test_subclass_off_by_default(self, graph, bmt):
+    def test_subclass_off(self, graph, bmt):
         """Without subclass=True, querying for Diabetes Mellitus only returns exact matches."""
         query = {
             "message": {
@@ -1493,7 +1493,7 @@ class TestSubclassHandling:
             },
         }
 
-        response = lookup(graph, query, bmt=bmt, verbose=False)
+        response = lookup(graph, query, bmt=bmt, verbose=False, subclass=False)
         results = response["message"]["results"]
 
         # Only exact match: Metformin treats Diabetes Mellitus
