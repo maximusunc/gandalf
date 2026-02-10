@@ -102,14 +102,18 @@ async def custom_swagger_ui_html(req: Request) -> HTMLResponse:
 @APP.post("/query")
 def sync_lookup(request: dict):
     """Do a lookup."""
-    response = lookup(GRAPH, request, bmt=BMT)
+    subclass = request.get("subclass", False)
+    subclass_depth = request.get("subclass_depth", 1)
+    response = lookup(GRAPH, request, bmt=BMT, subclass=subclass, subclass_depth=subclass_depth)
 
     return response
 
 
 def async_lookup(callback_url: str, query: dict):
     """Do an async lookup."""
-    response = lookup(GRAPH, query, bmt=BMT)
+    subclass = query.get("subclass", False)
+    subclass_depth = query.get("subclass_depth", 1)
+    response = lookup(GRAPH, query, bmt=BMT, subclass=subclass, subclass_depth=subclass_depth)
 
     try:
         with httpx.Client(
