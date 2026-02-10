@@ -903,18 +903,74 @@ def do_one_hop(graph: CSRGraph, start_id: str, verbose=True):
     return neighbors
 
 
-def lookup(graph, query: dict, bmt=None, verbose=True):
+def _rewrite_for_subclass(query_graph, subclass_depth=1):
+    """Rewrite query graph to add subclass expansion for pinned nodes.
+
+    For each pinned node (one with ``ids``), creates a synthetic superclass
+    node that holds the original IDs and a variable-depth ``subclass_of``
+    edge connecting the original node to the superclass.  This allows the
+    search to match both the exact node and any of its subclass descendants.
+
+    Mirrors the reasoner-transpiler ``match_query`` rewriting logic.
+
+    Args:
+        query_graph: The query graph dict (mutated in-place).
+        subclass_depth: Maximum number of ``subclass_of`` hops to traverse.
+    """
+    nodes = query_graph["nodes"]
+    edges = query_graph["edges"]
+
+    # Nodes already involved in explicit subclass_of / superclass_of edges
+    # should not be rewritten (user specified them intentionally).
+    excluded: set[str] = set()
+    for edge in edges.values():
+        preds = edge.get("predicates", [])
+        if "biolink:subclass_of" in preds or "biolink:superclass_of" in preds:
+            excluded.add(edge["subject"])
+            excluded.add(edge["object"])
+
+    pinned_qnodes = [
+        qnode_id
+        for qnode_id, qnode in list(nodes.items())
+        if qnode.get("ids") and qnode_id not in excluded
+    ]
+
+    for qnode_id in pinned_qnodes:
+        original = nodes[qnode_id]
+
+        superclass_id = f"{qnode_id}_superclass"
+        nodes[superclass_id] = {
+            "ids": original.pop("ids"),
+            "_superclass": True,
+        }
+        # Move categories to superclass node if present
+        if "categories" in original:
+            nodes[superclass_id]["categories"] = original.pop("categories")
+
+        subclass_edge_id = f"{qnode_id}_subclass_edge"
+        edges[subclass_edge_id] = {
+            "subject": qnode_id,
+            "object": superclass_id,
+            "predicates": ["biolink:subclass_of"],
+            "_subclass": True,
+            "_subclass_depth": subclass_depth,
+        }
+
+
+def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_depth=1):
     """
     Take an arbitrary Translator query graph and return all matching paths.
 
     Args:
         graph: CSRGraph instance
-        query_graph: Query graph with nodes and edges
+        query: Full TRAPI request dict containing message.query_graph
         bmt: Biolink Model Toolkit instance (optional, will create if not provided)
         verbose: Print progress information
+        subclass: If True, expand pinned nodes to include subclass descendants
+        subclass_depth: Maximum number of subclass_of hops to traverse (default 1)
 
     Returns:
-        List of enriched path dictionaries matching the query graph structure
+        TRAPI response dict with message containing results, knowledge_graph, etc.
     """
     t_start = time.perf_counter()
 
@@ -936,8 +992,17 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
     # Create qualifier expander for handling qualifier value hierarchy at query time
     qualifier_expander = QualifierExpander(bmt)
 
-    query_graph = query["message"]["query_graph"]
+    original_query_graph = query["message"]["query_graph"]
+    query_graph = copy.deepcopy(original_query_graph)
     subqgraph = copy.deepcopy(query_graph)
+
+    # Rewrite query graph for subclass expansion if requested
+    if subclass and subqgraph["edges"]:
+        if verbose:
+            print(f"Rewriting query graph for subclass expansion (depth={subclass_depth})")
+        _rewrite_for_subclass(subqgraph, subclass_depth=subclass_depth)
+        # Use the rewritten graph as the query graph for the rest of the pipeline
+        query_graph = copy.deepcopy(subqgraph)
 
     # Store results for each edge query
     # edge_id -> list of (subject_idx, predicate, object_idx) tuples
@@ -985,46 +1050,54 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
                 if graph.get_node_idx(node_id) is not None
             ]
 
-        # Get allowed predicates using reasoner-transpiler rules:
-        # 1. Handle 'related_to' as "any predicate"
-        # 2. Expand to descendants filtered to canonical OR symmetric only
-        # 3. Also expand inverse predicates for bidirectional matching
-        query_predicates = next_edge.get("predicates", [])
-        forward_predicates, inverse_predicates = predicate_expander.expand_predicates(
-            query_predicates
-        )
-
-        # Forward predicates are used for direct edge matching
-        # Inverse predicates are used for reverse direction matching
-        # Keep them separate to avoid confusion in reverse_pred_map construction
-        allowed_predicates = forward_predicates
-
-        if verbose and query_predicates:
-            print(f"  Query predicates: {query_predicates}")
-            print(f"  Expanded to {len(forward_predicates)} forward, {len(inverse_predicates)} inverse predicates")
-
-        # Store inverse predicates for this edge (for path reconstruction)
-        edge_inverse_preds[next_edge_id] = set(inverse_predicates)
-
-        # Get qualifier constraints for this edge and expand to include descendant values
-        qualifier_constraints = next_edge.get("qualifier_constraints", [])
-        if qualifier_constraints:
-            qualifier_constraints = qualifier_expander.expand_qualifier_constraints(
-                qualifier_constraints
+        # Handle subclass edges with dedicated traversal
+        if next_edge.get("_subclass"):
+            subclass_edge_depth = next_edge.get("_subclass_depth", 1)
+            edge_matches = _query_subclass_edge(
+                graph, start_node_idxes, end_node_idxes, subclass_edge_depth, verbose
+            )
+            edge_inverse_preds[next_edge_id] = set()
+        else:
+            # Get allowed predicates using reasoner-transpiler rules:
+            # 1. Handle 'related_to' as "any predicate"
+            # 2. Expand to descendants filtered to canonical OR symmetric only
+            # 3. Also expand inverse predicates for bidirectional matching
+            query_predicates = next_edge.get("predicates", [])
+            forward_predicates, inverse_predicates = predicate_expander.expand_predicates(
+                query_predicates
             )
 
-        # Query for matching edges
-        edge_matches = _query_edge(
-            graph,
-            start_node_idxes,
-            end_node_idxes,
-            start_node.get("categories", []),
-            end_node.get("categories", []),
-            allowed_predicates,
-            qualifier_constraints,
-            verbose,
-            inverse_predicates=inverse_predicates,
-        )
+            # Forward predicates are used for direct edge matching
+            # Inverse predicates are used for reverse direction matching
+            # Keep them separate to avoid confusion in reverse_pred_map construction
+            allowed_predicates = forward_predicates
+
+            if verbose and query_predicates:
+                print(f"  Query predicates: {query_predicates}")
+                print(f"  Expanded to {len(forward_predicates)} forward, {len(inverse_predicates)} inverse predicates")
+
+            # Store inverse predicates for this edge (for path reconstruction)
+            edge_inverse_preds[next_edge_id] = set(inverse_predicates)
+
+            # Get qualifier constraints for this edge and expand to include descendant values
+            qualifier_constraints = next_edge.get("qualifier_constraints", [])
+            if qualifier_constraints:
+                qualifier_constraints = qualifier_expander.expand_qualifier_constraints(
+                    qualifier_constraints
+                )
+
+            # Query for matching edges
+            edge_matches = _query_edge(
+                graph,
+                start_node_idxes,
+                end_node_idxes,
+                start_node.get("categories", []),
+                end_node.get("categories", []),
+                allowed_predicates,
+                qualifier_constraints,
+                verbose,
+                inverse_predicates=inverse_predicates,
+            )
 
         # Store results for this edge
         edge_results[next_edge_id] = edge_matches
@@ -1076,14 +1149,48 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
 
     response = {
         "message": {
-            "query_graph": query_graph,
+            "query_graph": original_query_graph,
             "knowledge_graph": {
                 "nodes": {},
                 "edges": {},
             },
-            "results": []
+            "results": [],
+            "auxiliary_graphs": {},
         }
     }
+
+    # Pre-compute subclass metadata for result building
+    superclass_qnodes = {
+        qnode_id for qnode_id, qnode in query_graph["nodes"].items()
+        if qnode.get("_superclass")
+    }
+    subclass_qedges = {
+        qedge_id for qedge_id, qedge in query_graph["edges"].items()
+        if qedge.get("_subclass")
+    }
+    # Map: original qnode_id -> superclass qnode_id
+    qnode_to_superclass = {}
+    # Map: original qedge_id -> subclass qedge_id (for finding subclass edges attached to real edges)
+    qedge_attached_subclass = defaultdict(list)
+    for qedge_id, qedge in query_graph["edges"].items():
+        if qedge.get("_subclass"):
+            child_qnode = qedge["subject"]   # e.g. "n0"
+            parent_qnode = qedge["object"]   # e.g. "n0_superclass"
+            qnode_to_superclass[child_qnode] = parent_qnode
+    # For each real (non-subclass) edge, find attached subclass edges
+    for qedge_id, qedge in query_graph["edges"].items():
+        if qedge.get("_subclass"):
+            continue
+        subj = qedge["subject"]
+        obj = qedge["object"]
+        if subj in qnode_to_superclass:
+            qedge_attached_subclass[qedge_id].append(
+                ("subject", f"{subj}_subclass_edge", qnode_to_superclass[subj])
+            )
+        if obj in qnode_to_superclass:
+            qedge_attached_subclass[qedge_id].append(
+                ("object", f"{obj}_subclass_edge", qnode_to_superclass[obj])
+            )
 
     # Group paths by unique node binding combinations
     # Key: tuple of (qnode_id, node_id) pairs sorted by qnode_id
@@ -1091,9 +1198,13 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
     node_binding_groups = defaultdict(list)
 
     for path in paths:
-        # Create a hashable key from node bindings
+        # Create a hashable key from node bindings — exclude superclass nodes
         node_key = tuple(
-            sorted((qnode_id, node["id"]) for qnode_id, node in path["nodes"].items())
+            sorted(
+                (qnode_id, node["id"])
+                for qnode_id, node in path["nodes"].items()
+                if qnode_id not in superclass_qnodes
+            )
         )
         node_binding_groups[node_key].append(path)
 
@@ -1120,26 +1231,36 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
                 }],
             }
 
-            # Add node bindings (same for all paths in group)
-            for node_id, node in first_path["nodes"].items():
+            # Add node bindings — skip superclass nodes, substitute IDs
+            for qnode_id, node in first_path["nodes"].items():
+                if qnode_id in superclass_qnodes:
+                    # Don't expose synthetic superclass nodes in bindings
+                    continue
+
+                # Add node to knowledge graph
                 response["message"]["knowledge_graph"]["nodes"][node["id"]] = node
-                result["node_bindings"][node_id] = [
-                    {
-                        "id": node["id"],
-                        "attributes": [],
-                    },
+
+                # If this qnode has a superclass counterpart with a different result ID,
+                # use the superclass ID in the binding (it's the originally queried entity)
+                bound_id = node["id"]
+                if qnode_id in qnode_to_superclass:
+                    superclass_qnode = qnode_to_superclass[qnode_id]
+                    superclass_node = first_path["nodes"].get(superclass_qnode)
+                    if superclass_node and superclass_node["id"] != node["id"]:
+                        bound_id = superclass_node["id"]
+                        # Also add the superclass node to the knowledge graph
+                        response["message"]["knowledge_graph"]["nodes"][superclass_node["id"]] = superclass_node
+
+                result["node_bindings"][qnode_id] = [
+                    {"id": bound_id, "attributes": []},
                 ]
 
             # Aggregate edge bindings from all paths in group
-            # For each query edge, collect all matching edges
             edge_bindings_by_qedge = defaultdict(list)
 
             for path in grouped_paths:
                 for edge_id, edge in path["edges"].items():
-                    # Create a unique key for this edge to avoid duplicates
                     edge_key = (edge["subject"], edge["predicate"], edge["object"])
-
-                    # Check if we already have this exact edge
                     existing_keys = [
                         (e["subject"], e["predicate"], e["object"])
                         for e in edge_bindings_by_qedge[edge_id]
@@ -1149,16 +1270,92 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
 
             # Add edges to knowledge graph and result bindings
             for edge_id, edges in edge_bindings_by_qedge.items():
+                # Skip subclass edges from direct bindings
+                if edge_id in subclass_qedges:
+                    continue
+
                 result["analyses"][0]["edge_bindings"][edge_id] = []
+
                 for edge in edges:
                     edge_uuid = str(uuid.uuid4())[:8]
                     response["message"]["knowledge_graph"]["edges"][edge_uuid] = edge
-                    result["analyses"][0]["edge_bindings"][edge_id].append(
-                        {
-                            "id": edge_uuid,
-                            "attributes": [],
-                        }
-                    )
+
+                    # Check if this edge has attached subclass edges
+                    attached = qedge_attached_subclass.get(edge_id, [])
+                    if attached:
+                        # Collect subclass edge IDs from the current path
+                        subclass_edge_uuids = []
+                        superclass_node_overrides = {}
+
+                        for (which_end, sc_edge_id, sc_qnode_id) in attached:
+                            sc_edges = edge_bindings_by_qedge.get(sc_edge_id, [])
+                            for sc_edge in sc_edges:
+                                # Skip self-loops (depth-0, no actual subclass hop)
+                                if sc_edge["subject"] == sc_edge["object"]:
+                                    continue
+                                sc_uuid = str(uuid.uuid4())[:8]
+                                response["message"]["knowledge_graph"]["edges"][sc_uuid] = sc_edge
+                                subclass_edge_uuids.append(sc_uuid)
+
+                            # Get the superclass node ID for endpoint override
+                            for path in grouped_paths:
+                                sc_node = path["nodes"].get(sc_qnode_id)
+                                if sc_node:
+                                    superclass_node_overrides[which_end] = sc_node["id"]
+                                    break
+
+                        if subclass_edge_uuids:
+                            # Create composite inferred edge
+                            composite_edge_ids = [edge_uuid] + subclass_edge_uuids
+                            composite_edge_id = "_".join(composite_edge_ids)
+                            aux_graph_id = f"aux_{composite_edge_id}"
+
+                            if aux_graph_id not in response["message"]["auxiliary_graphs"]:
+                                response["message"]["auxiliary_graphs"][aux_graph_id] = {
+                                    "edges": composite_edge_ids,
+                                    "attributes": [],
+                                }
+
+                            if composite_edge_id not in response["message"]["knowledge_graph"]["edges"]:
+                                inferred_edge = {
+                                    "subject": superclass_node_overrides.get("subject", edge["subject"]),
+                                    "predicate": edge["predicate"],
+                                    "object": superclass_node_overrides.get("object", edge["object"]),
+                                    "attributes": [
+                                        {
+                                            "attribute_type_id": "biolink:knowledge_level",
+                                            "value": "logical_entailment",
+                                        },
+                                        {
+                                            "attribute_type_id": "biolink:agent_type",
+                                            "value": "automated_agent",
+                                        },
+                                        {
+                                            "attribute_type_id": "biolink:support_graphs",
+                                            "value": [aux_graph_id],
+                                        },
+                                    ],
+                                    "sources": [
+                                        {
+                                            "resource_id": "infores:gandalf",
+                                            "resource_role": "primary_knowledge_source",
+                                        }
+                                    ],
+                                }
+                                response["message"]["knowledge_graph"]["edges"][composite_edge_id] = inferred_edge
+
+                            result["analyses"][0]["edge_bindings"][edge_id].append(
+                                {"id": composite_edge_id, "attributes": []}
+                            )
+                        else:
+                            # Subclass edges were all self-loops (depth-0), use normal binding
+                            result["analyses"][0]["edge_bindings"][edge_id].append(
+                                {"id": edge_uuid, "attributes": []}
+                            )
+                    else:
+                        result["analyses"][0]["edge_bindings"][edge_id].append(
+                            {"id": edge_uuid, "attributes": []}
+                        )
 
             response["message"]["results"].append(result)
     finally:
@@ -1180,6 +1377,67 @@ def lookup(graph, query: dict, bmt=None, verbose=True):
               f"{gc_summary['total_collected']} objects collected")
 
     return response
+
+
+def _query_subclass_edge(graph, start_idxes, end_idxes, depth, verbose):
+    """Traverse ``subclass_of`` edges to find subclass relationships.
+
+    The synthetic subclass edge connects a child node (subject) to a
+    superclass node (object).  The superclass node holds the original
+    pinned IDs, so ``end_idxes`` will be pinned.
+
+    We perform a BFS starting from each pinned end (superclass) node,
+    following **incoming** ``subclass_of`` edges up to *depth* hops.
+    Depth 0 means the node itself (identity — no hop needed).
+
+    Args:
+        graph: CSRGraph instance
+        start_idxes: Indices for the child (subject) side, or None
+        end_idxes: Indices for the superclass (object) side
+        depth: Maximum subclass_of hops
+        verbose: Print progress
+
+    Returns:
+        List of (child_idx, "biolink:subclass_of", parent_idx, False) tuples.
+        The depth-0 self-match is included as (node_idx, "biolink:subclass_of", node_idx, False).
+    """
+    matches = []
+
+    # Resolve the subclass_of predicate index once
+    subclass_pred = "biolink:subclass_of"
+
+    if end_idxes is None:
+        return matches
+
+    for superclass_idx in end_idxes:
+        # BFS: current frontier → next frontier, up to `depth` levels
+        # Depth 0 = identity match (the node itself)
+        frontier = {superclass_idx}
+        visited = {superclass_idx}
+
+        # Always include the depth-0 self-match
+        matches.append((superclass_idx, subclass_pred, superclass_idx, False))
+
+        for _hop in range(depth):
+            next_frontier = set()
+            for node_idx in frontier:
+                # Walk incoming subclass_of edges: child --subclass_of--> node_idx
+                for child_idx, predicate, _props in graph.incoming_neighbors_with_properties(node_idx):
+                    if predicate != subclass_pred:
+                        continue
+                    if child_idx in visited:
+                        continue
+                    visited.add(child_idx)
+                    next_frontier.add(child_idx)
+                    matches.append((child_idx, subclass_pred, superclass_idx, False))
+            frontier = next_frontier
+            if not frontier:
+                break
+
+    if verbose:
+        print(f"  Subclass traversal: found {len(matches)} matches (depth={depth})")
+
+    return matches
 
 
 def _query_edge(
