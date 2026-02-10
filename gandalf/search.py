@@ -1021,8 +1021,27 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
 
     # Process edges one at a time
     while len(subqgraph["edges"].keys()) > 0:
-        # Get next edge to query
-        next_edge_id, next_edge = get_next_qedge(subqgraph)
+        # Prioritize subclass edges: process them before regular edges to
+        # ensure nodes are properly expanded before being used in other
+        # edge queries.  Without this, the query planner may process a
+        # regular edge while a node is still unpinned (its IDs were moved
+        # to the synthetic superclass node during subclass rewriting).
+        # That yields unconstrained results whose node indices may not
+        # overlap with the later subclass self-match, causing the path
+        # reconstruction join to produce zero paths even when valid paths
+        # exist through the original edges.
+        subclass_edge_id = None
+        for eid, e in subqgraph["edges"].items():
+            if e.get("_subclass"):
+                subclass_edge_id = eid
+                break
+
+        if subclass_edge_id is not None:
+            next_edge_id = subclass_edge_id
+            next_edge = subqgraph["edges"][next_edge_id]
+        else:
+            # Get next edge to query
+            next_edge_id, next_edge = get_next_qedge(subqgraph)
 
         if verbose:
             print(

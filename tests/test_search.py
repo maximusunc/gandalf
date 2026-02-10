@@ -1864,3 +1864,99 @@ class TestSubclassHandling:
         response = lookup(graph, query, bmt=bmt, verbose=False)
         assert "auxiliary_graphs" in response["message"]
         assert isinstance(response["message"]["auxiliary_graphs"], dict)
+
+    def test_subclass_multihop_all_pinned_does_not_lose_paths(self, graph, bmt):
+        """Subclass expansion on a multi-hop query with all nodes pinned must not
+        lose paths that exist through the original edges.
+
+        Regression test: when the subclass rewrite moves a node's IDs to its
+        synthetic superclass node, the node becomes temporarily unpinned.  If the
+        query planner processes a regular edge that touches that node before the
+        corresponding subclass edge, the regular edge may find results that do not
+        include the original node, and the later subclass self-match creates an
+        empty intersection during path reconstruction.
+
+        Query: Metformin --affects--> Gene --gene_associated_with_condition--> Disease
+        With subclass_depth=2 on the Disease end (Cardiovascular Disease), the
+        expansion should reach Type 2 Diabetes and find valid paths.
+        """
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},  # Metformin
+                        "n1": {"categories": ["biolink:Gene"]},
+                        "n2": {"ids": ["MONDO:0004995"]},  # Cardiovascular Disease
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:affects"],
+                        },
+                        "e1": {
+                            "subject": "n1",
+                            "object": "n2",
+                            "predicates": ["biolink:gene_associated_with_condition"],
+                        },
+                    },
+                },
+            },
+        }
+
+        # Without subclass: no gene is directly associated with Cardiovascular
+        # Disease in the fixture, so 0 results.
+        response_no = lookup(graph, query, bmt=bmt, verbose=False, subclass=False)
+        results_no = response_no["message"]["results"]
+        assert len(results_no) == 0
+
+        # With subclass depth=2: Cardiovascular Disease -> Diabetes Mellitus
+        # -> Type 2 Diabetes.  Metformin affects several genes that are
+        # associated with Type 2 Diabetes, so there should be results.
+        response_yes = lookup(
+            graph, query, bmt=bmt, verbose=False, subclass=True, subclass_depth=2
+        )
+        results_yes = response_yes["message"]["results"]
+        assert len(results_yes) >= 1
+
+        # Verify the intermediate gene binding makes sense
+        gene_ids = {
+            r["node_bindings"]["n1"][0]["id"] for r in results_yes
+        }
+        # At least one of the genes associated with T2D must appear
+        expected_genes = {"NCBIGene:5468", "NCBIGene:3643", "NCBIGene:2645"}
+        assert gene_ids & expected_genes
+
+    def test_subclass_never_fewer_results_than_exact(self, graph, bmt):
+        """Subclass expansion should always find >= as many results as exact matching.
+
+        This invariant must hold for any query: enabling subclass expansion is
+        strictly additive.  A self-match (node is its own 'subclass') ensures
+        the exact paths are always included.
+        """
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},  # Metformin
+                        "n1": {"ids": ["MONDO:0005148"]},  # Type 2 Diabetes
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:treats"],
+                        },
+                    },
+                },
+            },
+        }
+
+        response_exact = lookup(graph, query, bmt=bmt, verbose=False, subclass=False)
+        response_sub = lookup(
+            graph, query, bmt=bmt, verbose=False, subclass=True, subclass_depth=1
+        )
+
+        assert len(response_sub["message"]["results"]) >= len(
+            response_exact["message"]["results"]
+        )
