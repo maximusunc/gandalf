@@ -1076,36 +1076,28 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
                 print(f"  Query predicates: {query_predicates}")
                 print(f"  Expanded to {len(forward_predicates)} forward, {len(inverse_predicates)} inverse predicates")
 
-            # If the query specified predicates but expansion produced nothing
-            # in both directions, no edges can possibly match — skip querying.
-            if query_predicates and not forward_predicates and not inverse_predicates:
-                if verbose:
-                    print(f"  All expanded predicates filtered out, returning 0 matches for this edge")
-                edge_matches = []
-                edge_inverse_preds[next_edge_id] = set()
-            else:
-                # Store inverse predicates for this edge (for path reconstruction)
-                edge_inverse_preds[next_edge_id] = set(inverse_predicates)
+            # Store inverse predicates for this edge (for path reconstruction)
+            edge_inverse_preds[next_edge_id] = set(inverse_predicates)
 
-                # Get qualifier constraints for this edge and expand to include descendant values
-                qualifier_constraints = next_edge.get("qualifier_constraints", [])
-                if qualifier_constraints:
-                    qualifier_constraints = qualifier_expander.expand_qualifier_constraints(
-                        qualifier_constraints
-                    )
-
-                # Query for matching edges
-                edge_matches = _query_edge(
-                    graph,
-                    start_node_idxes,
-                    end_node_idxes,
-                    start_node.get("categories", []),
-                    end_node.get("categories", []),
-                    allowed_predicates,
-                    qualifier_constraints,
-                    verbose,
-                    inverse_predicates=inverse_predicates,
+            # Get qualifier constraints for this edge and expand to include descendant values
+            qualifier_constraints = next_edge.get("qualifier_constraints", [])
+            if qualifier_constraints:
+                qualifier_constraints = qualifier_expander.expand_qualifier_constraints(
+                    qualifier_constraints
                 )
+
+            # Query for matching edges
+            edge_matches = _query_edge(
+                graph,
+                start_node_idxes,
+                end_node_idxes,
+                start_node.get("categories", []),
+                end_node.get("categories", []),
+                allowed_predicates,
+                qualifier_constraints,
+                verbose,
+                inverse_predicates=inverse_predicates,
+            )
 
         # Store results for this edge
         edge_results[next_edge_id] = edge_matches
