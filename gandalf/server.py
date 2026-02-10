@@ -102,7 +102,7 @@ async def custom_swagger_ui_html(req: Request) -> HTMLResponse:
 @APP.post("/query")
 def sync_lookup(request: dict):
     """Do a lookup."""
-    subclass = request.get("subclass", False)
+    subclass = request.get("subclass", True)
     subclass_depth = request.get("subclass_depth", 1)
     response = lookup(GRAPH, request, bmt=BMT, subclass=subclass, subclass_depth=subclass_depth)
 
@@ -111,7 +111,7 @@ def sync_lookup(request: dict):
 
 def async_lookup(callback_url: str, query: dict):
     """Do an async lookup."""
-    subclass = query.get("subclass", False)
+    subclass = query.get("subclass", True)
     subclass_depth = query.get("subclass_depth", 1)
     response = lookup(GRAPH, query, bmt=BMT, subclass=subclass, subclass_depth=subclass_depth)
 
