@@ -1255,17 +1255,36 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
                     {"id": bound_id, "attributes": []},
                 ]
 
-            # Aggregate edge bindings from all paths in group
+            # Aggregate edge bindings from all paths in group.
+            # Edges sharing (subject, predicate, object) but with different
+            # qualifiers or sources are distinct and must be kept.
             edge_bindings_by_qedge = defaultdict(list)
+            edge_seen_keys = defaultdict(set)  # qedge_id -> set of hashable keys
 
             for path in grouped_paths:
                 for edge_id, edge in path["edges"].items():
-                    edge_key = (edge["subject"], edge["predicate"], edge["object"])
-                    existing_keys = [
-                        (e["subject"], e["predicate"], e["object"])
-                        for e in edge_bindings_by_qedge[edge_id]
-                    ]
-                    if edge_key not in existing_keys:
+                    # Build a key that distinguishes edges with different
+                    # qualifiers / sources even when (subj, pred, obj) match.
+                    quals = edge.get("qualifiers") or []
+                    quals_key = tuple(
+                        sorted(
+                            (q.get("qualifier_type_id", ""), q.get("qualifier_value", ""))
+                            for q in quals
+                        )
+                    )
+                    sources = edge.get("sources") or []
+                    sources_key = tuple(
+                        sorted(
+                            (s.get("resource_id", ""), s.get("resource_role", ""))
+                            for s in sources
+                        )
+                    )
+                    edge_key = (
+                        edge["subject"], edge["predicate"], edge["object"],
+                        quals_key, sources_key,
+                    )
+                    if edge_key not in edge_seen_keys[edge_id]:
+                        edge_seen_keys[edge_id].add(edge_key)
                         edge_bindings_by_qedge[edge_id].append(edge)
 
             # Add edges to knowledge graph and result bindings
