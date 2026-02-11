@@ -319,19 +319,52 @@ class CSRGraph:
                 self.fwd_offsets[i] = len(edges_with_props)
 
     def _build_reverse_csr(self, edges, edge_predicates):
-        """Build reverse adjacency list (target -> sources)."""
-        # Create reverse edges: swap source and destination
+        """Build reverse adjacency list (target -> sources).
+
+        Also builds ``rev_to_fwd`` – an int32 array that maps each reverse-CSR
+        position to its corresponding forward-CSR position.  This enables O(1)
+        property lookups for reverse-direction traversals and correctly handles
+        duplicate (src, dst, pred) edges with different qualifiers / sources.
+        """
+        num_edges = len(edges)
+        # Create reverse edges with original index for rev_to_fwd mapping
+        # (dst, src, pred_id, original_index)
         reverse_edges = [
-            (dst, src, pred_id) for (src, dst), pred_id in zip(edges, edge_predicates)
+            (dst, src, pred_id, orig_idx)
+            for orig_idx, ((src, dst), pred_id) in enumerate(zip(edges, edge_predicates))
         ]
         reverse_edges.sort(key=lambda x: (x[0], x[1], x[2]))
 
         # Build reverse CSR arrays
         self.rev_sources = np.array(
-            [src for dst, src, _ in reverse_edges], dtype=np.int32
+            [src for dst, src, _, _ in reverse_edges], dtype=np.int32
         )
         self.rev_predicates = np.array(
-            [pred_id for dst, src, pred_id in reverse_edges], dtype=np.int32
+            [pred_id for dst, src, pred_id, _ in reverse_edges], dtype=np.int32
+        )
+
+        # Build rev_to_fwd: map each reverse position to its forward position.
+        # The forward CSR was built from edges sorted by (src, dst, pred).
+        # We need to map each original edge index to its forward position.
+        # _fwd_sort_order[orig_idx] = forward CSR position of that edge.
+        if hasattr(self, '_fwd_sort_order') and self._fwd_sort_order is not None:
+            fwd_pos = self._fwd_sort_order  # already inverse-mapped
+        else:
+            # Fallback: build fwd_pos from the forward CSR structure.
+            # For each forward position, determine which original edge it is.
+            fwd_pos = np.empty(num_edges, dtype=np.int32)
+            # In the constructor path, edges were sorted by (src,dst,pred)
+            # so we need to compute the sort permutation and invert it.
+            sorted_edges = sorted(
+                range(num_edges),
+                key=lambda i: (edges[i][0], edges[i][1], int(edge_predicates[i])),
+            )
+            for fwd_idx, orig_idx in enumerate(sorted_edges):
+                fwd_pos[orig_idx] = fwd_idx
+
+        self.rev_to_fwd = np.array(
+            [fwd_pos[orig_idx] for _, _, _, orig_idx in reverse_edges],
+            dtype=np.int32,
         )
 
         # Build reverse offsets
@@ -339,7 +372,7 @@ class CSRGraph:
 
         if len(reverse_edges) > 0:
             current_dst = 0
-            for i, (dst, src, _) in enumerate(reverse_edges):
+            for i, (dst, src, _, _) in enumerate(reverse_edges):
                 while current_dst < dst:
                     self.rev_offsets[current_dst + 1] = i
                     current_dst += 1
@@ -347,6 +380,42 @@ class CSRGraph:
 
             for i in range(current_dst + 1, self.num_nodes + 1):
                 self.rev_offsets[i] = len(reverse_edges)
+
+    def _rebuild_rev_to_fwd(self):
+        """Rebuild ``rev_to_fwd`` from existing forward and reverse CSR arrays.
+
+        For each reverse-CSR position, find the corresponding forward-CSR
+        position by matching (src, dst, pred) and tracking ordinal within
+        groups of duplicate edges.
+        """
+        num_edges = len(self.fwd_targets)
+        self.rev_to_fwd = np.empty(num_edges, dtype=np.int32)
+
+        for node_idx in range(self.num_nodes):
+            rev_start = int(self.rev_offsets[node_idx])
+            rev_end = int(self.rev_offsets[node_idx + 1])
+
+            # For each reverse edge to this node, find the matching forward position.
+            # Track how many times we've seen each (src, pred) pair to handle duplicates.
+            seen_counts = {}
+            for rev_pos in range(rev_start, rev_end):
+                src = int(self.rev_sources[rev_pos])
+                pred = int(self.rev_predicates[rev_pos])
+                key = (src, pred)
+                ordinal = seen_counts.get(key, 0)
+                seen_counts[key] = ordinal + 1
+
+                # Find the (ordinal)-th forward edge with this (src, dst=node_idx, pred)
+                fwd_start = int(self.fwd_offsets[src])
+                fwd_end = int(self.fwd_offsets[src + 1])
+                count = 0
+                for fwd_pos in range(fwd_start, fwd_end):
+                    if (int(self.fwd_targets[fwd_pos]) == node_idx
+                            and int(self.fwd_predicates[fwd_pos]) == pred):
+                        if count == ordinal:
+                            self.rev_to_fwd[rev_pos] = fwd_pos
+                            break
+                        count += 1
 
     # ------------------------------------------------------------------
     # Binary search edge lookup (replaces edge_prop_index dict, saves ~7GB)
@@ -433,9 +502,11 @@ class CSRGraph:
         then qualifier/source properties are fetched only for matching
         edges — avoiding unnecessary dedup store lookups.
 
-        Returns list of (neighbor_idx, predicate_str, edge_props) tuples
-        where edge_props = {"qualifiers": [...], "sources": [...]}.
+        Returns list of (neighbor_idx, predicate_str, edge_props, fwd_edge_idx)
+        tuples where edge_props = {"qualifiers": [...], "sources": [...]}.
         The dict values are pool references (zero GC pressure).
+        ``fwd_edge_idx`` is the forward-CSR array position — unique per edge
+        even when (src, dst, pred) repeats with different qualifiers/sources.
         """
         start = int(self.fwd_offsets[node_idx])
         end = int(self.fwd_offsets[node_idx + 1])
@@ -450,7 +521,7 @@ class CSRGraph:
 
             target = int(self.fwd_targets[pos])
             props = self.edge_properties._get_props(pos)
-            result.append((target, pred_str, props))
+            result.append((target, pred_str, props, pos))
 
         return result
 
@@ -459,8 +530,12 @@ class CSRGraph:
     ):
         """Get incoming neighbors with edge properties (qualifiers + sources).
 
-        Uses binary search to find the forward edge index for property lookup,
-        replacing the old edge_prop_index dict.
+        Uses the ``rev_to_fwd`` mapping for O(1) property lookup.  This
+        correctly handles duplicate (src, dst, pred) edges that differ only
+        in qualifiers / sources — each reverse-CSR position maps to its own
+        unique forward-CSR position.
+
+        Returns list of (src_idx, predicate, edge_props, fwd_edge_idx) tuples.
         """
         start = int(self.rev_offsets[node_idx])
         end = int(self.rev_offsets[node_idx + 1])
@@ -474,11 +549,11 @@ class CSRGraph:
             if predicate_filter is not None and predicate not in predicate_filter:
                 continue
 
-            # Find forward edge index via binary search
-            edge_idx = self._find_edge_index(src_idx, node_idx, pred_id)
-            props = self.edge_properties._get_props(edge_idx) if edge_idx is not None else {}
+            # O(1) forward edge index lookup via rev_to_fwd mapping
+            fwd_idx = int(self.rev_to_fwd[pos])
+            props = self.edge_properties._get_props(fwd_idx)
 
-            result.append((src_idx, predicate, props))
+            result.append((src_idx, predicate, props, fwd_idx))
 
         return result
 
@@ -566,8 +641,28 @@ class CSRGraph:
         props["predicate"] = predicate
         return props
 
+    def get_edge_properties_by_index(self, fwd_edge_idx):
+        """Get all properties for an edge by its forward-CSR array position.
+
+        This is O(1) for hot-path data (qualifiers, sources) and a single
+        LMDB lookup for cold-path data (publications, attributes).  Prefer
+        this over ``get_all_edge_properties`` when you already have the
+        forward edge index (e.g. from ``neighbors_with_properties``).
+        """
+        fwd_edge_idx = int(fwd_edge_idx)
+        props = self.edge_properties._get_props(fwd_edge_idx)
+
+        pred_id = int(self.fwd_predicates[fwd_edge_idx])
+        props["predicate"] = self.id_to_predicate[pred_id]
+
+        if self.lmdb_store is not None:
+            detail = self.lmdb_store.get(fwd_edge_idx)
+            props.update(detail)
+
+        return props
+
     def get_all_edges_between(self, src_idx, dst_idx, predicate_filter: Optional[list] = None):
-        """Get all edges (with different predicates) between two nodes."""
+        """Get all edges (with different predicates or qualifiers) between two nodes."""
         start = int(self.fwd_offsets[src_idx])
         end = int(self.fwd_offsets[src_idx + 1])
 
@@ -637,6 +732,7 @@ class CSRGraph:
             "rev_sources": self.rev_sources,
             "rev_predicates": self.rev_predicates,
             "rev_offsets": self.rev_offsets,
+            "rev_to_fwd": self.rev_to_fwd,
             # Properties (hot path dedup store)
             "edge_properties": self.edge_properties,
             "node_properties": self.node_properties,
@@ -671,6 +767,12 @@ class CSRGraph:
             graph.rev_sources = data["rev_sources"]
             graph.rev_predicates = data["rev_predicates"]
             graph.rev_offsets = data["rev_offsets"]
+            if "rev_to_fwd" in data:
+                graph.rev_to_fwd = data["rev_to_fwd"]
+            else:
+                # Rebuild rev_to_fwd from existing CSR data
+                print("  Rebuilding rev_to_fwd mapping...")
+                graph._rebuild_rev_to_fwd()
         else:
             print("Warning: Loaded graph without reverse CSR. Rebuilding...")
             edges = []
@@ -733,6 +835,7 @@ class CSRGraph:
         np.save(directory / "rev_sources.npy", self.rev_sources)
         np.save(directory / "rev_predicates.npy", self.rev_predicates)
         np.save(directory / "rev_offsets.npy", self.rev_offsets)
+        np.save(directory / "rev_to_fwd.npy", self.rev_to_fwd)
 
         # Save small metadata as pickle (no edge_prop_index — binary search instead)
         metadata = {
@@ -809,6 +912,11 @@ class CSRGraph:
         graph.rev_offsets = np.load(
             directory / "rev_offsets.npy", mmap_mode=mmap_mode
         )
+        rev_to_fwd_path = directory / "rev_to_fwd.npy"
+        if rev_to_fwd_path.exists():
+            graph.rev_to_fwd = np.load(rev_to_fwd_path, mmap_mode=mmap_mode)
+        else:
+            graph.rev_to_fwd = None  # rebuilt after full load
 
         # Load metadata
         with open(directory / "metadata.pkl", "rb") as f:
@@ -862,6 +970,11 @@ class CSRGraph:
 
         if graph.lmdb_store is not None:
             print(f"  LMDB detail store: {lmdb_path}")
+
+        # Rebuild rev_to_fwd if not present (legacy format)
+        if graph.rev_to_fwd is None:
+            print("  Rebuilding rev_to_fwd mapping...")
+            graph._rebuild_rev_to_fwd()
 
         t1 = time.perf_counter()
         print(

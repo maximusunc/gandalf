@@ -753,7 +753,7 @@ def find_3hop_paths_filtered(
     # Get all edges from start, filter by predicate
     forward_1_filtered = []  # List of (n1_idx, predicate) tuples
 
-    for n1_idx, predicate, _ in graph.neighbors_with_properties(start_idx):
+    for n1_idx, predicate, _, _ in graph.neighbors_with_properties(start_idx):
         if n1_idx == end_idx:
             continue
         if is_predicate_allowed(predicate):
@@ -770,7 +770,7 @@ def find_3hop_paths_filtered(
     forward_paths = defaultdict(list)
 
     for n1_idx, pred_01 in forward_1_filtered:
-        for n2_idx, pred_12, _ in graph.neighbors_with_properties(n1_idx):
+        for n2_idx, pred_12, _, _ in graph.neighbors_with_properties(n1_idx):
             if n2_idx == start_idx:
                 continue
             if is_predicate_allowed(pred_12):
@@ -1114,7 +1114,7 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
         discovered_subjects = set()
         discovered_objects = set()
 
-        for subj_idx, pred, obj_idx, _via_inverse in edge_matches:
+        for subj_idx, pred, obj_idx, _via_inverse, _fwd_edge_idx in edge_matches:
             discovered_subjects.add(graph.get_node_id(subj_idx))
             discovered_objects.add(graph.get_node_id(obj_idx))
 
@@ -1422,7 +1422,7 @@ def _query_subclass_edge(graph, start_idxes, end_idxes, depth, verbose):
             next_frontier = set()
             for node_idx in frontier:
                 # Walk incoming subclass_of edges: child --subclass_of--> node_idx
-                for child_idx, predicate, _props in graph.incoming_neighbors_with_properties(node_idx):
+                for child_idx, predicate, _props, _fwd_eidx in graph.incoming_neighbors_with_properties(node_idx):
                     if predicate != subclass_pred:
                         continue
                     if child_idx in visited:
@@ -1470,23 +1470,29 @@ def _query_edge(
         inverse_predicates: List of inverse predicate strings for reverse direction matching
 
     Returns:
-        List of (subject_idx, predicate, object_idx, via_inverse) tuples where
-        via_inverse indicates if the edge was found through inverse/symmetric lookup
+        List of (subject_idx, predicate, object_idx, via_inverse, fwd_edge_idx) tuples where
+        via_inverse indicates if the edge was found through inverse/symmetric lookup and
+        fwd_edge_idx is the forward-CSR array position (unique per physical edge).
     """
     matches = []
-    seen_edges = set()  # Track (subj, pred, obj) to avoid duplicates
+    seen_edges = set()  # Track (subj, pred, obj, fwd_edge_idx) to avoid duplicates
 
     # Build set of inverse predicates for quick lookup
     # When we find an inverse predicate in reverse direction, we report it using
     # the stored predicate (since that's what's actually in the graph)
     inverse_pred_set = set(inverse_predicates) if inverse_predicates else set()
 
-    def add_match(subj_idx, predicate, obj_idx, via_inverse=False):
-        """Add a match, avoiding duplicates. Includes via_inverse flag."""
-        key = (subj_idx, predicate, obj_idx)
+    def add_match(subj_idx, predicate, obj_idx, fwd_edge_idx, via_inverse=False):
+        """Add a match, avoiding duplicates. Includes via_inverse flag.
+
+        Dedup key includes ``fwd_edge_idx`` so that edges with the same
+        (subj, pred, obj) but different qualifiers / sources are kept as
+        separate matches.
+        """
+        key = (subj_idx, predicate, obj_idx, fwd_edge_idx)
         if key not in seen_edges:
             seen_edges.add(key)
-            matches.append((subj_idx, predicate, obj_idx, via_inverse))
+            matches.append((subj_idx, predicate, obj_idx, via_inverse, fwd_edge_idx))
 
     # Case 1: Start pinned, end unpinned
     if start_idxes is not None and end_idxes is None:
@@ -1503,7 +1509,7 @@ def _query_edge(
             node_neighbors = 0
 
             # Check outgoing edges (direct matches)
-            for obj_idx, predicate, props in graph.neighbors_with_properties(start_idx):
+            for obj_idx, predicate, props, fwd_edge_idx in graph.neighbors_with_properties(start_idx):
                 node_neighbors += 1
                 # Check predicate
                 if allowed_predicates and predicate not in allowed_predicates:
@@ -1523,12 +1529,12 @@ def _query_edge(
                     ):
                         continue
 
-                add_match(start_idx, predicate, obj_idx)
+                add_match(start_idx, predicate, obj_idx, fwd_edge_idx)
 
             # Check incoming edges for symmetric/inverse predicates
             # An incoming edge with inverse(P) represents an outgoing edge with P
             if inverse_pred_set:
-                for other_idx, stored_pred, props in graph.incoming_neighbors_with_properties(start_idx):
+                for other_idx, stored_pred, props, fwd_edge_idx in graph.incoming_neighbors_with_properties(start_idx):
                     node_neighbors += 1
 
                     # Check if stored predicate is one of our inverse predicates
@@ -1552,7 +1558,7 @@ def _query_edge(
                     # Report the actual edge as stored in the graph
                     # The edge is: other_idx --[stored_pred]--> start_idx
                     # Mark as via_inverse since found through inverse lookup
-                    add_match(other_idx, stored_pred, start_idx, via_inverse=True)
+                    add_match(other_idx, stored_pred, start_idx, fwd_edge_idx, via_inverse=True)
 
             t_node_end = time.perf_counter()
             node_time = t_node_end - t_node_start
@@ -1585,7 +1591,7 @@ def _query_edge(
             node_neighbors = 0
 
             # Check incoming edges (direct matches)
-            for subj_idx, predicate, props in graph.incoming_neighbors_with_properties(
+            for subj_idx, predicate, props, fwd_edge_idx in graph.incoming_neighbors_with_properties(
                 end_idx
             ):
                 node_neighbors += 1
@@ -1607,12 +1613,12 @@ def _query_edge(
                     ):
                         continue
 
-                add_match(subj_idx, predicate, end_idx)
+                add_match(subj_idx, predicate, end_idx, fwd_edge_idx)
 
             # Check outgoing edges for symmetric/inverse predicates
             # An outgoing edge with inverse(P) represents an incoming edge with P
             if inverse_pred_set:
-                for other_idx, stored_pred, props in graph.neighbors_with_properties(end_idx):
+                for other_idx, stored_pred, props, fwd_edge_idx in graph.neighbors_with_properties(end_idx):
                     node_neighbors += 1
 
                     # Check if stored predicate is one of our inverse predicates
@@ -1636,7 +1642,7 @@ def _query_edge(
                     # Report the actual edge as stored in the graph
                     # The edge is: end_idx --[stored_pred]--> other_idx
                     # Mark as via_inverse since found through inverse lookup
-                    add_match(end_idx, stored_pred, other_idx, via_inverse=True)
+                    add_match(end_idx, stored_pred, other_idx, fwd_edge_idx, via_inverse=True)
 
             t_node_end = time.perf_counter()
             node_time = t_node_end - t_node_start
@@ -1662,24 +1668,24 @@ def _query_edge(
         t0 = time.perf_counter()
 
         # Build forward edges with predicates and props for qualifier checking
-        # obj_idx -> [(subj_idx, predicate, props), ...]
+        # obj_idx -> [(subj_idx, predicate, props, fwd_edge_idx), ...]
         forward_edges = defaultdict(list)
 
         t_neighbors_start = time.perf_counter()
         total_neighbors = 0
         for start_idx in start_idxes:
-            for obj_idx, predicate, props in graph.neighbors_with_properties(start_idx):
+            for obj_idx, predicate, props, fwd_edge_idx in graph.neighbors_with_properties(start_idx):
                 total_neighbors += 1
                 if allowed_predicates and predicate not in allowed_predicates:
                     continue
-                forward_edges[obj_idx].append((start_idx, predicate, props))
+                forward_edges[obj_idx].append((start_idx, predicate, props, fwd_edge_idx))
 
         # Also check reverse direction for symmetric/inverse predicates
         # Look for edges: end_node --inverse(P)--> start_node
         if inverse_pred_set:
             start_set = set(start_idxes)
             for end_idx in end_idxes:
-                for obj_idx, stored_pred, props in graph.neighbors_with_properties(end_idx):
+                for obj_idx, stored_pred, props, fwd_edge_idx in graph.neighbors_with_properties(end_idx):
                     total_neighbors += 1
                     # Only consider if obj_idx is one of our start nodes
                     if obj_idx not in start_set:
@@ -1698,7 +1704,7 @@ def _query_edge(
                     # The edge is: end_idx --[stored_pred]--> obj_idx
                     # (where obj_idx is a start node)
                     # Mark as via_inverse since found through inverse lookup
-                    add_match(end_idx, stored_pred, obj_idx, via_inverse=True)
+                    add_match(end_idx, stored_pred, obj_idx, fwd_edge_idx, via_inverse=True)
 
         t_neighbors_end = time.perf_counter()
         if verbose:
@@ -1711,7 +1717,7 @@ def _query_edge(
 
         for obj_idx in forward_edges.keys():
             if obj_idx in end_set:
-                for subj_idx, predicate, props in forward_edges[obj_idx]:
+                for subj_idx, predicate, props, fwd_edge_idx in forward_edges[obj_idx]:
                     # Check qualifier constraints
                     if qualifier_constraints:
                         edge_qualifiers = props.get("qualifiers", [])
@@ -1719,7 +1725,7 @@ def _query_edge(
                             edge_qualifiers, qualifier_constraints
                         ):
                             continue
-                    add_match(subj_idx, predicate, obj_idx)
+                    add_match(subj_idx, predicate, obj_idx, fwd_edge_idx)
 
         t1 = time.perf_counter()
         if verbose:
@@ -1743,7 +1749,7 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
     Args:
         graph: CSRGraph instance
         query_graph: Original query graph
-        edge_results: Dict of edge_id -> [(subj_idx, pred, obj_idx, via_inverse), ...]
+        edge_results: Dict of edge_id -> [(subj_idx, pred, obj_idx, via_inverse, fwd_edge_idx), ...]
         edge_order: List of edge IDs in original query order
         verbose: Print progress
         edge_inverse_preds: (Deprecated, kept for compatibility) Dict of edge_id -> set of inverse predicates
@@ -1806,10 +1812,11 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
     paths_nodes = np.zeros((num_paths, max_nodes), dtype=np.int32)
     paths_preds = np.zeros((num_paths, num_edges), dtype=np.int32)
     paths_via_inverse = np.zeros((num_paths, num_edges), dtype=np.bool_)
+    paths_fwd_edge_idx = np.zeros((num_paths, num_edges), dtype=np.int32)
 
     # Fill in first edge data
     # For inverse matches, the actual edge has subject/object swapped relative to query
-    for i, (subj_idx, predicate, obj_idx, via_inverse) in enumerate(first_results):
+    for i, (subj_idx, predicate, obj_idx, via_inverse, fwd_edge_idx) in enumerate(first_results):
         if via_inverse:
             # Inverse match: actual edge is (subj, pred, obj) but query expects reversed
             # subj in actual edge corresponds to query's object
@@ -1822,6 +1829,7 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
             paths_nodes[i, 1] = obj_idx
         paths_preds[i, 0] = get_pred_idx(predicate)
         paths_via_inverse[i, 0] = via_inverse
+        paths_fwd_edge_idx[i, 0] = fwd_edge_idx
 
     if verbose:
         print(f"  Starting with {num_paths:,} paths from edge '{first_edge_id}'")
@@ -1848,14 +1856,14 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
         # Normalize edge data to query-aligned direction
         # For inverse matches (via_inverse=True), the actual edge (subj, pred, obj)
         # represents the query direction (obj, pred, subj), so we swap
-        # We keep the via_inverse flag to use during enrichment
+        # We keep the via_inverse flag and fwd_edge_idx to use during enrichment
         normalized_edge_data = []
-        for subj_idx, predicate, obj_idx, via_inverse in edge_data:
+        for subj_idx, predicate, obj_idx, via_inverse, fwd_edge_idx in edge_data:
             if via_inverse:
                 # Inverse: swap to query-aligned direction
-                normalized_edge_data.append((obj_idx, predicate, subj_idx, via_inverse))
+                normalized_edge_data.append((obj_idx, predicate, subj_idx, via_inverse, fwd_edge_idx))
             else:
-                normalized_edge_data.append((subj_idx, predicate, obj_idx, via_inverse))
+                normalized_edge_data.append((subj_idx, predicate, obj_idx, via_inverse, fwd_edge_idx))
         edge_data = normalized_edge_data
 
         if subj_in_paths and obj_in_paths:
@@ -1863,20 +1871,21 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
             subj_col = qnode_to_col[subj_qnode]
             obj_col = qnode_to_col[obj_qnode]
 
-            # Build index: (subj_idx, obj_idx) -> [(pred_idx, via_inverse), ...]
+            # Build index: (subj_idx, obj_idx) -> [(pred_idx, via_inverse, fwd_edge_idx), ...]
             edge_index = defaultdict(list)
-            for subj_idx, predicate, obj_idx, via_inverse in edge_data:
-                edge_index[(subj_idx, obj_idx)].append((get_pred_idx(predicate), via_inverse))
+            for subj_idx, predicate, obj_idx, via_inverse, fwd_edge_idx in edge_data:
+                edge_index[(subj_idx, obj_idx)].append((get_pred_idx(predicate), via_inverse, fwd_edge_idx))
 
             # Find matching paths
             new_nodes_list = []
             new_preds_list = []
             new_via_inverse_list = []
+            new_fwd_edge_idx_list = []
 
             for path_idx in range(len(paths_nodes)):
                 key = (paths_nodes[path_idx, subj_col], paths_nodes[path_idx, obj_col])
                 if key in edge_index:
-                    for pred_idx, via_inverse in edge_index[key]:
+                    for pred_idx, via_inverse, fwd_edge_idx in edge_index[key]:
                         new_nodes_list.append(paths_nodes[path_idx].copy())
                         new_preds = paths_preds[path_idx].copy()
                         new_preds[join_idx] = pred_idx
@@ -1884,15 +1893,20 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
                         new_via_inv = paths_via_inverse[path_idx].copy()
                         new_via_inv[join_idx] = via_inverse
                         new_via_inverse_list.append(new_via_inv)
+                        new_fwd_eidx = paths_fwd_edge_idx[path_idx].copy()
+                        new_fwd_eidx[join_idx] = fwd_edge_idx
+                        new_fwd_edge_idx_list.append(new_fwd_eidx)
 
             if new_nodes_list:
                 paths_nodes = np.array(new_nodes_list, dtype=np.int32)
                 paths_preds = np.array(new_preds_list, dtype=np.int32)
                 paths_via_inverse = np.array(new_via_inverse_list, dtype=np.bool_)
+                paths_fwd_edge_idx = np.array(new_fwd_edge_idx_list, dtype=np.int32)
             else:
                 paths_nodes = np.zeros((0, max_nodes), dtype=np.int32)
                 paths_preds = np.zeros((0, num_edges), dtype=np.int32)
                 paths_via_inverse = np.zeros((0, num_edges), dtype=np.bool_)
+                paths_fwd_edge_idx = np.zeros((0, num_edges), dtype=np.int32)
 
         elif subj_in_paths:
             # Join on subject node, add object node
@@ -1904,20 +1918,21 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
                 num_node_cols += 1
             obj_col = qnode_to_col[obj_qnode]
 
-            # Build index: subj_idx -> [(pred_idx, obj_idx, via_inverse), ...]
+            # Build index: subj_idx -> [(pred_idx, obj_idx, via_inverse, fwd_edge_idx), ...]
             edge_index = defaultdict(list)
-            for subj_idx, predicate, obj_idx, via_inverse in edge_data:
-                edge_index[subj_idx].append((get_pred_idx(predicate), obj_idx, via_inverse))
+            for subj_idx, predicate, obj_idx, via_inverse, fwd_edge_idx in edge_data:
+                edge_index[subj_idx].append((get_pred_idx(predicate), obj_idx, via_inverse, fwd_edge_idx))
 
             # Find matching paths
             new_nodes_list = []
             new_preds_list = []
             new_via_inverse_list = []
+            new_fwd_edge_idx_list = []
 
             for path_idx in range(len(paths_nodes)):
                 subj_idx = paths_nodes[path_idx, subj_col]
                 if subj_idx in edge_index:
-                    for pred_idx, obj_idx, via_inverse in edge_index[subj_idx]:
+                    for pred_idx, obj_idx, via_inverse, fwd_edge_idx in edge_index[subj_idx]:
                         new_nodes = paths_nodes[path_idx].copy()
                         new_nodes[obj_col] = obj_idx
                         new_nodes_list.append(new_nodes)
@@ -1927,15 +1942,20 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
                         new_via_inv = paths_via_inverse[path_idx].copy()
                         new_via_inv[join_idx] = via_inverse
                         new_via_inverse_list.append(new_via_inv)
+                        new_fwd_eidx = paths_fwd_edge_idx[path_idx].copy()
+                        new_fwd_eidx[join_idx] = fwd_edge_idx
+                        new_fwd_edge_idx_list.append(new_fwd_eidx)
 
             if new_nodes_list:
                 paths_nodes = np.array(new_nodes_list, dtype=np.int32)
                 paths_preds = np.array(new_preds_list, dtype=np.int32)
                 paths_via_inverse = np.array(new_via_inverse_list, dtype=np.bool_)
+                paths_fwd_edge_idx = np.array(new_fwd_edge_idx_list, dtype=np.int32)
             else:
                 paths_nodes = np.zeros((0, max_nodes), dtype=np.int32)
                 paths_preds = np.zeros((0, num_edges), dtype=np.int32)
                 paths_via_inverse = np.zeros((0, num_edges), dtype=np.bool_)
+                paths_fwd_edge_idx = np.zeros((0, num_edges), dtype=np.int32)
 
         elif obj_in_paths:
             # Join on object node, add subject node
@@ -1947,20 +1967,21 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
                 num_node_cols += 1
             subj_col = qnode_to_col[subj_qnode]
 
-            # Build index: obj_idx -> [(subj_idx, pred_idx, via_inverse), ...]
+            # Build index: obj_idx -> [(subj_idx, pred_idx, via_inverse, fwd_edge_idx), ...]
             edge_index = defaultdict(list)
-            for subj_idx, predicate, obj_idx, via_inverse in edge_data:
-                edge_index[obj_idx].append((subj_idx, get_pred_idx(predicate), via_inverse))
+            for subj_idx, predicate, obj_idx, via_inverse, fwd_edge_idx in edge_data:
+                edge_index[obj_idx].append((subj_idx, get_pred_idx(predicate), via_inverse, fwd_edge_idx))
 
             # Find matching paths
             new_nodes_list = []
             new_preds_list = []
             new_via_inverse_list = []
+            new_fwd_edge_idx_list = []
 
             for path_idx in range(len(paths_nodes)):
                 obj_idx = paths_nodes[path_idx, obj_col]
                 if obj_idx in edge_index:
-                    for subj_idx, pred_idx, via_inverse in edge_index[obj_idx]:
+                    for subj_idx, pred_idx, via_inverse, fwd_edge_idx in edge_index[obj_idx]:
                         new_nodes = paths_nodes[path_idx].copy()
                         new_nodes[subj_col] = subj_idx
                         new_nodes_list.append(new_nodes)
@@ -1970,15 +1991,20 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
                         new_via_inv = paths_via_inverse[path_idx].copy()
                         new_via_inv[join_idx] = via_inverse
                         new_via_inverse_list.append(new_via_inv)
+                        new_fwd_eidx = paths_fwd_edge_idx[path_idx].copy()
+                        new_fwd_eidx[join_idx] = fwd_edge_idx
+                        new_fwd_edge_idx_list.append(new_fwd_eidx)
 
             if new_nodes_list:
                 paths_nodes = np.array(new_nodes_list, dtype=np.int32)
                 paths_preds = np.array(new_preds_list, dtype=np.int32)
                 paths_via_inverse = np.array(new_via_inverse_list, dtype=np.bool_)
+                paths_fwd_edge_idx = np.array(new_fwd_edge_idx_list, dtype=np.int32)
             else:
                 paths_nodes = np.zeros((0, max_nodes), dtype=np.int32)
                 paths_preds = np.zeros((0, num_edges), dtype=np.int32)
                 paths_via_inverse = np.zeros((0, num_edges), dtype=np.bool_)
+                paths_fwd_edge_idx = np.zeros((0, num_edges), dtype=np.int32)
 
         else:
             # Neither node in paths - cartesian product
@@ -1998,9 +2024,10 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
             new_nodes_list = []
             new_preds_list = []
             new_via_inverse_list = []
+            new_fwd_edge_idx_list = []
 
             for path_idx in range(len(paths_nodes)):
-                for subj_idx, predicate, obj_idx, via_inverse in edge_data:
+                for subj_idx, predicate, obj_idx, via_inverse, fwd_edge_idx in edge_data:
                     new_nodes = paths_nodes[path_idx].copy()
                     new_nodes[subj_col] = subj_idx
                     new_nodes[obj_col] = obj_idx
@@ -2011,15 +2038,20 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
                     new_via_inv = paths_via_inverse[path_idx].copy()
                     new_via_inv[join_idx] = via_inverse
                     new_via_inverse_list.append(new_via_inv)
+                    new_fwd_eidx = paths_fwd_edge_idx[path_idx].copy()
+                    new_fwd_eidx[join_idx] = fwd_edge_idx
+                    new_fwd_edge_idx_list.append(new_fwd_eidx)
 
             if new_nodes_list:
                 paths_nodes = np.array(new_nodes_list, dtype=np.int32)
                 paths_preds = np.array(new_preds_list, dtype=np.int32)
                 paths_via_inverse = np.array(new_via_inverse_list, dtype=np.bool_)
+                paths_fwd_edge_idx = np.array(new_fwd_edge_idx_list, dtype=np.int32)
             else:
                 paths_nodes = np.zeros((0, max_nodes), dtype=np.int32)
                 paths_preds = np.zeros((0, num_edges), dtype=np.int32)
                 paths_via_inverse = np.zeros((0, num_edges), dtype=np.bool_)
+                paths_fwd_edge_idx = np.zeros((0, num_edges), dtype=np.int32)
 
         t_join_end = time.perf_counter()
         if verbose:
@@ -2136,10 +2168,9 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
                         "object": node_cache[actual_obj_idx]["id"],
                     }
                 else:
-                    # Get all edge properties using actual edge direction
-                    edge_props = graph.get_all_edge_properties(
-                        int(actual_subj_idx), int(actual_obj_idx), predicate
-                    ).copy()
+                    # O(1) property lookup using forward edge index
+                    fwd_eidx = int(paths_fwd_edge_idx[path_idx, col])
+                    edge_props = graph.get_edge_properties_by_index(fwd_eidx).copy()
 
                     # Ensure required fields are present with actual edge direction
                     edge_props["predicate"] = predicate
