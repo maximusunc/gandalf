@@ -4,6 +4,7 @@ Gandalf - Fast 3-hop path finding in large knowledge graphs
 
 __version__ = "0.1.0"
 
+from gandalf.enrichment import enrich_knowledge_graph
 from gandalf.diagnostics import (
     analyze_node_types,
     analyze_predicates,
@@ -37,6 +38,8 @@ __all__ = [
     "EdgePropertyStore",
     "EdgePropertyStoreBuilder",
     "LMDBPropertyStore",
+    # Enrichment
+    "enrich_knowledge_graph",
     # Loading
     "build_graph_from_jsonl",
     # Search
