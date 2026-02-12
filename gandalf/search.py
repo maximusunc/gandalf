@@ -1417,8 +1417,8 @@ def _query_subclass_edge(graph, start_idxes, end_idxes, depth, verbose):
         verbose: Print progress
 
     Returns:
-        List of (child_idx, "biolink:subclass_of", parent_idx, False) tuples.
-        The depth-0 self-match is included as (node_idx, "biolink:subclass_of", node_idx, False).
+        List of (child_idx, "biolink:subclass_of", parent_idx, False, fwd_edge_idx) tuples.
+        The depth-0 self-match is included with fwd_edge_idx=-1 (no real edge).
     """
     matches = []
 
@@ -1434,21 +1434,21 @@ def _query_subclass_edge(graph, start_idxes, end_idxes, depth, verbose):
         frontier = {superclass_idx}
         visited = {superclass_idx}
 
-        # Always include the depth-0 self-match
-        matches.append((superclass_idx, subclass_pred, superclass_idx, False))
+        # Always include the depth-0 self-match (no real edge, sentinel -1)
+        matches.append((superclass_idx, subclass_pred, superclass_idx, False, -1))
 
         for _hop in range(depth):
             next_frontier = set()
             for node_idx in frontier:
                 # Walk incoming subclass_of edges: child --subclass_of--> node_idx
-                for child_idx, predicate, _props, _fwd_eidx in graph.incoming_neighbors_with_properties(node_idx):
+                for child_idx, predicate, _props, fwd_eidx in graph.incoming_neighbors_with_properties(node_idx):
                     if predicate != subclass_pred:
                         continue
                     if child_idx in visited:
                         continue
                     visited.add(child_idx)
                     next_frontier.add(child_idx)
-                    matches.append((child_idx, subclass_pred, superclass_idx, False))
+                    matches.append((child_idx, subclass_pred, superclass_idx, False, fwd_eidx))
             frontier = next_frontier
             if not frontier:
                 break
@@ -2189,7 +2189,12 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
                 else:
                     # O(1) property lookup using forward edge index
                     fwd_eidx = int(paths_fwd_edge_idx[path_idx, col])
-                    edge_props = graph.get_edge_properties_by_index(fwd_eidx).copy()
+                    if fwd_eidx < 0:
+                        # Synthetic edge (e.g. subclass self-match) with no
+                        # real CSR position — build minimal props.
+                        edge_props = {}
+                    else:
+                        edge_props = graph.get_edge_properties_by_index(fwd_eidx).copy()
 
                     # Ensure required fields are present with actual edge direction
                     edge_props["predicate"] = predicate
