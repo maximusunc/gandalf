@@ -34,9 +34,9 @@ class TestBuildGraphFromJsonl:
         assert graph.num_nodes == 11
 
     def test_loads_edges(self, graph):
-        """Should load edges into the graph."""
-        # 10 edges in file, some may be duplicated for symmetric predicates
-        assert len(graph.fwd_targets) >= 10
+        """Should load edges into the graph, including duplicate (s,o,p) edges."""
+        # 20 edges in file (includes duplicate s,o,p with different qualifiers/sources)
+        assert len(graph.fwd_targets) == 20
 
     def test_node_id_to_idx_mapping(self, graph):
         """Should create bidirectional node ID mapping."""
@@ -172,36 +172,41 @@ class TestGraphStructure:
         neighbor_ids = {graph.idx_to_node_id[int(n)] for n in neighbors}
         assert "MONDO:0005148" in neighbor_ids
         assert "MONDO:0005015" in neighbor_ids
-        # Should not include affects edges
-        assert len(neighbor_ids) == 2
+        # 3 treats edges total (2 to MONDO:0005148 with different sources, 1 to MONDO:0005015)
+        assert len(neighbors) == 3
 
     def test_degree_calculation(self, graph):
         """Should correctly calculate node degree."""
         metformin_idx = graph.node_id_to_idx["CHEBI:6801"]
         degree = graph.degree(metformin_idx)
-        # Metformin has 9 outgoing edges:
-        # - treats, ameliorates, preventative (to MONDO:0005148)
+        # Metformin has 11 outgoing edges:
+        # - treats MONDO:0005148 (drugcentral)
+        # - treats MONDO:0005148 (chembl) — duplicate s,o,p, different source
+        # - ameliorates MONDO:0005148
+        # - preventative MONDO:0005148
         # - affects NCBIGene:5468 (PPARG)
         # - affects CHEBI:17234 (Glucose)
-        # - affects NCBIGene:3643 (INSR) with qualifiers
+        # - affects NCBIGene:3643 (INSR) with qualifiers (activity/increased, from ctd)
+        # - affects NCBIGene:3643 (INSR) with qualifiers (abundance/decreased, from hetio)
         # - affects NCBIGene:2645 (GCK) with qualifiers
         # - affects NCBIGene:7124 (TNF) with qualifiers
-        # - treats (to MONDO:0005015)
-        assert degree == 9
+        # - treats MONDO:0005015
+        assert degree == 11
 
     def test_degree_with_predicate_filter(self, graph):
         """Should correctly calculate filtered degree."""
         metformin_idx = graph.node_id_to_idx["CHEBI:6801"]
         degree = graph.degree(metformin_idx, predicate_filter="biolink:treats")
-        assert degree == 2
+        # 3 treats edges: 2 to MONDO:0005148 (different sources) + 1 to MONDO:0005015
+        assert degree == 3
 
     def test_get_edges_returns_tuples(self, graph):
         """Should return edges as (neighbor_idx, predicate) tuples."""
         metformin_idx = graph.node_id_to_idx["CHEBI:6801"]
         edges = graph.get_edges(metformin_idx)
 
-        # Metformin has 9 outgoing edges (including qualifier test edges)
-        assert len(edges) == 9
+        # Metformin has 11 outgoing edges (including duplicate s,o,p edges)
+        assert len(edges) == 11
         for neighbor_idx, predicate in edges:
             assert isinstance(neighbor_idx, int)
             assert isinstance(predicate, str)
@@ -239,8 +244,8 @@ class TestGraphSaveLoad:
 
             metformin_idx = loaded_graph.node_id_to_idx["CHEBI:6801"]
             neighbors = loaded_graph.neighbors(metformin_idx)
-            # Metformin has 9 outgoing edges (including qualifier test edges)
-            assert len(neighbors) == 9
+            # Metformin has 11 outgoing edges (including duplicate s,o,p edges)
+            assert len(neighbors) == 11
         finally:
             os.unlink(temp_path)
 
@@ -261,6 +266,7 @@ class TestGraphMmapSaveLoad:
                 "rev_sources.npy",
                 "rev_predicates.npy",
                 "rev_offsets.npy",
+                "rev_to_fwd.npy",
                 "metadata.pkl",
                 # Edge properties stored as split mmap-friendly components
                 "edge_sources_idx.npy",
@@ -290,8 +296,8 @@ class TestGraphMmapSaveLoad:
 
             metformin_idx = loaded_graph.node_id_to_idx["CHEBI:6801"]
             neighbors = loaded_graph.neighbors(metformin_idx)
-            # Metformin has 9 outgoing edges (including qualifier test edges)
-            assert len(neighbors) == 9
+            # Metformin has 11 outgoing edges (including duplicate s,o,p edges)
+            assert len(neighbors) == 11
 
     def test_mmap_loaded_graph_edge_properties(self, graph):
         """Should correctly load edge properties in mmap format."""
@@ -343,7 +349,117 @@ class TestGraphMmapSaveLoad:
             assert loaded_graph.num_nodes == graph.num_nodes
             metformin_idx = loaded_graph.node_id_to_idx["CHEBI:6801"]
             neighbors = loaded_graph.neighbors(metformin_idx)
-            assert len(neighbors) == 9
+            assert len(neighbors) == 11
+
+
+class TestDuplicateEdges:
+    """Tests for edges sharing (subject, object, predicate) but with different qualifiers/sources."""
+
+    def test_duplicate_treats_edges_both_stored(self, graph):
+        """Two treats edges (CHEBI:6801 -> MONDO:0005148) with different sources should both exist."""
+        metformin_idx = graph.node_id_to_idx["CHEBI:6801"]
+        diabetes_idx = graph.node_id_to_idx["MONDO:0005148"]
+
+        # get_all_edges_between returns ALL edges, including duplicates
+        treats_edges = graph.get_all_edges_between(
+            metformin_idx, diabetes_idx, predicate_filter=["biolink:treats"]
+        )
+        assert len(treats_edges) == 2
+
+        # Each edge should have different sources
+        source_ids = set()
+        for _pred, props in treats_edges:
+            primary = [s for s in props["sources"] if s["resource_role"] == "primary_knowledge_source"]
+            assert len(primary) == 1
+            source_ids.add(primary[0]["resource_id"])
+
+        assert source_ids == {"infores:drugcentral", "infores:chembl"}
+
+    def test_duplicate_affects_edges_different_qualifiers(self, graph):
+        """Two affects edges (CHEBI:6801 -> NCBIGene:3643) with different qualifiers should both exist."""
+        metformin_idx = graph.node_id_to_idx["CHEBI:6801"]
+        insr_idx = graph.node_id_to_idx["NCBIGene:3643"]
+
+        affects_edges = graph.get_all_edges_between(
+            metformin_idx, insr_idx, predicate_filter=["biolink:affects"]
+        )
+        assert len(affects_edges) == 2
+
+        # Extract qualifier combinations
+        qualifier_combos = set()
+        for _pred, props in affects_edges:
+            quals = props.get("qualifiers", [])
+            combo = tuple(sorted((q["qualifier_type_id"], q["qualifier_value"]) for q in quals))
+            qualifier_combos.add(combo)
+
+        assert len(qualifier_combos) == 2  # Two distinct qualifier combinations
+
+    def test_forward_neighbors_return_all_duplicate_edges(self, graph):
+        """neighbors_with_properties should return both duplicate edges."""
+        metformin_idx = graph.node_id_to_idx["CHEBI:6801"]
+        diabetes_idx = graph.node_id_to_idx["MONDO:0005148"]
+
+        treats_results = [
+            (target, pred, props, eidx)
+            for target, pred, props, eidx in graph.neighbors_with_properties(metformin_idx)
+            if target == diabetes_idx and pred == "biolink:treats"
+        ]
+        assert len(treats_results) == 2
+        # Each should have a unique fwd_edge_idx
+        assert treats_results[0][3] != treats_results[1][3]
+
+    def test_reverse_neighbors_return_all_duplicate_edges(self, graph):
+        """incoming_neighbors_with_properties should return both duplicate edges."""
+        metformin_idx = graph.node_id_to_idx["CHEBI:6801"]
+        diabetes_idx = graph.node_id_to_idx["MONDO:0005148"]
+
+        treats_results = [
+            (src, pred, props, eidx)
+            for src, pred, props, eidx in graph.incoming_neighbors_with_properties(diabetes_idx)
+            if src == metformin_idx and pred == "biolink:treats"
+        ]
+        assert len(treats_results) == 2
+        # Each should have correct, distinct properties
+        source_ids = set()
+        for _, _, props, _ in treats_results:
+            primary = [s for s in props["sources"] if s["resource_role"] == "primary_knowledge_source"]
+            source_ids.add(primary[0]["resource_id"])
+        assert source_ids == {"infores:drugcentral", "infores:chembl"}
+
+    def test_get_edge_properties_by_index(self, graph):
+        """get_edge_properties_by_index should return correct props for each duplicate."""
+        metformin_idx = graph.node_id_to_idx["CHEBI:6801"]
+
+        edge_indices = []
+        for target, pred, props, eidx in graph.neighbors_with_properties(metformin_idx):
+            if pred == "biolink:treats" and graph.idx_to_node_id[target] == "MONDO:0005148":
+                edge_indices.append(eidx)
+
+        assert len(edge_indices) == 2
+        props_a = graph.get_edge_properties_by_index(edge_indices[0])
+        props_b = graph.get_edge_properties_by_index(edge_indices[1])
+        assert props_a["sources"] != props_b["sources"]
+
+    def test_rev_to_fwd_roundtrip_mmap(self, graph):
+        """rev_to_fwd should survive save/load mmap roundtrip and produce correct results."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            graph.save_mmap(temp_dir)
+            loaded = CSRGraph.load_mmap(temp_dir)
+
+            metformin_idx = loaded.node_id_to_idx["CHEBI:6801"]
+            diabetes_idx = loaded.node_id_to_idx["MONDO:0005148"]
+
+            treats_results = [
+                (src, pred, props, eidx)
+                for src, pred, props, eidx in loaded.incoming_neighbors_with_properties(diabetes_idx)
+                if src == metformin_idx and pred == "biolink:treats"
+            ]
+            assert len(treats_results) == 2
+            source_ids = set()
+            for _, _, props, _ in treats_results:
+                primary = [s for s in props["sources"] if s["resource_role"] == "primary_knowledge_source"]
+                source_ids.add(primary[0]["resource_id"])
+            assert source_ids == {"infores:drugcentral", "infores:chembl"}
 
 
 class TestEdgeCases:

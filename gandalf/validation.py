@@ -381,7 +381,7 @@ def diagnose_graph_edge_storage(
     lines.append("Outgoing edges (neighbors_with_properties):")
     try:
         out_count = 0
-        for neighbor_idx, predicate, props in graph.neighbors_with_properties(node_idx):
+        for neighbor_idx, predicate, props, _fwd_edge_idx in graph.neighbors_with_properties(node_idx):
             if out_count >= max_neighbors:
                 lines.append(f"  ... (limited to {max_neighbors})")
                 break
@@ -400,7 +400,7 @@ def diagnose_graph_edge_storage(
     lines.append("Incoming edges (incoming_neighbors_with_properties):")
     try:
         in_count = 0
-        for neighbor_idx, predicate, props in graph.incoming_neighbors_with_properties(node_idx):
+        for neighbor_idx, predicate, props, _fwd_edge_idx in graph.incoming_neighbors_with_properties(node_idx):
             if in_count >= max_neighbors:
                 lines.append(f"  ... (limited to {max_neighbors})")
                 break

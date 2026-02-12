@@ -288,7 +288,7 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path):
 
     # Clean up temp LMDB
     shutil.rmtree(temp_lmdb_path)
-    del sort_order
+    # NOTE: sort_order is kept alive — needed for rev_to_fwd mapping below.
 
     # Build CSR offset arrays using searchsorted
     print("  Building CSR offsets...")
@@ -318,6 +318,16 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path):
         boundaries = np.searchsorted(rev_dst_sorted, np.arange(num_nodes + 1))
         rev_offsets = boundaries.astype(np.int64)
 
+    # Build rev_to_fwd mapping: for each reverse-CSR position, store the
+    # corresponding forward-CSR position.  Forward positions are simply
+    # 0..E-1 (the arrays are already in forward-sorted order).  The
+    # inverse of sort_order maps original-edge-index → forward position.
+    print("  Building rev_to_fwd mapping...")
+    fwd_pos = np.empty(edge_count, dtype=np.int32)
+    fwd_pos[sort_order] = np.arange(edge_count, dtype=np.int32)
+    rev_to_fwd = fwd_pos[rev_order]
+    del fwd_pos, sort_order
+
     del edge_src, rev_dst_sorted, rev_order
 
     # Assemble the graph
@@ -337,6 +347,7 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path):
     graph.rev_sources = rev_sources
     graph.rev_predicates = rev_predicates
     graph.rev_offsets = rev_offsets
+    graph.rev_to_fwd = rev_to_fwd
 
     graph.edge_properties = edge_properties
     graph.lmdb_store = lmdb_store
