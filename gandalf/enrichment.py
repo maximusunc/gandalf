@@ -44,7 +44,7 @@ def enrich_knowledge_graph(message: dict, graph: CSRGraph) -> dict:
     Returns:
         The same *message* dict, now enriched.
     """
-    kg = message.get("knowledge_graph", {})
+    kg = message.get("message", {}).get("knowledge_graph", {})
 
     _enrich_nodes(kg.get("nodes", {}), graph)
     _enrich_edges(kg.get("edges", {}), graph)
