@@ -50,11 +50,6 @@ Automat finds 4 chemicals, all from **text-mining-provider-cooccurrence**:
 through medroxyprogesterone (5 paths), Gemcitabine (13 paths), and solution (5 paths) is
 entirely absent from Gandalf's results.
 
-**Root cause**: Gandalf's underlying graph data does not contain the text-mining-sourced
-`treats` edges connecting these chemicals to MONDO:0007186 (Heartburn). The loader
-(`gandalf/loader.py`) loads ALL edges from input KGX files without filtering, so these edges
-were never present in the input data provided to Gandalf.
-
 ### 2. Missing intermediary biological entities (`i` nodes)
 
 Gandalf finds 6 unique intermediary genes; Automat finds 23.
@@ -67,19 +62,12 @@ SPATA2, RPL17, PLA2G1B, CXCL1, VEGFB, VEGFD, CD80, PCNA, SETD2
 Even for the shared `e` chemical macrogol, Gandalf is missing paths through many of these
 intermediary genes because it lacks the corresponding `affects` edges.
 
-**Root cause**: Same as above — the `affects` edges connecting these genes to the relevant
-chemicals are not in Gandalf's input graph data.
-
 ### 3. Missing `SN` chemicals (target nodes)
 
 Gandalf resolves 5 SN chemicals; Automat resolves 12.
 
 **Missing SN chemicals** (7): Peracetic acid, solution, Oxygen, elemental oxygen,
 metal cation, medroxyprogesterone, Gemcitabine
-
-Note that some missing SN chemicals (medroxyprogesterone, Gemcitabine, solution) also
-appear as `e` chemicals in Automat but not Gandalf, indicating these chemicals participate
-in multiple roles across the query pattern.
 
 ### 4. Gandalf has one unique path not in Automat
 
@@ -99,39 +87,66 @@ correctly expands `decreased` to match `downregulated` using BMT hierarchy. This
 working as intended and allows Gandalf to find paths through signor-sourced edges that
 use `downregulated` as the qualifier value.
 
-## Codebase Analysis: Is this a bug or a data issue?
+## Root Cause: Nested qualifier format silently dropped during loading
 
-### Query resolution pipeline is correct
+### The Bug
 
-After reviewing the query-time code in detail:
+Commit `5a97186` ("Fix qualifier loading based on real edges") removed support for the
+**nested `qualifiers` array format** from `_extract_qualifiers()` in `gandalf/loader.py`.
+
+The original code handled two KGX qualifier formats:
+- **Format A** (top-level fields): `"object_aspect_qualifier": "activity"`
+- **Format B** (nested array): `"qualifiers": [{"qualifier_type_id": "...", "qualifier_value": "..."}]`
+
+After the commit, only Format A is handled. Edges using Format B have their qualifiers
+**silently dropped** — the loader sees the `qualifiers` field but explicitly skips it
+(in `_extract_attributes`, `field == "qualifiers" → continue`), and `_extract_qualifiers`
+no longer reads from it.
+
+### How This Causes Missing Paths
+
+1. **edge_0** (`treats`, no qualifier constraints): Text-mining `treats` edges are found
+   regardless of qualifier format, because this edge has no qualifier constraints.
+
+2. **edge_1 and edge_2** (`affects`, qualifier constraints: `decreased activity_or_abundance`):
+   Text-mining `affects` edges using the nested qualifier format are stored with **empty
+   qualifier lists**. When the query applies qualifier constraints, these edges fail the
+   qualifier check in `_edge_matches_qualifier_constraints()` and are filtered out.
+
+3. Without matching `affects` edges for the intermediary genes, no complete paths can be
+   formed through those chemicals, even though the `treats` edges exist.
+
+### The Fix
+
+Restored nested qualifier format support in `_extract_qualifiers()`. The function now:
+1. Checks for top-level qualifier fields first (existing behavior)
+2. If none found, checks for a nested `qualifiers` array
+3. Extracts qualifier dicts from the nested array
+4. Returns a flat list of qualifier dicts (consistent with current storage/matching format)
+
+Top-level fields take priority when both formats are present, preserving backward
+compatibility.
+
+### Files Changed
+
+- `gandalf/loader.py`: Restored Format B support in `_extract_qualifiers()`
+- `tests/test_loader.py`: Added `TestExtractQualifiers` class with tests for both formats
+
+## Codebase Analysis: Query Resolution Pipeline
+
+The query-time code was reviewed in detail and is correct:
 
 - **Predicate expansion** (`PredicateExpander`, `search.py:145-300`): Correctly expands
-  `biolink:affects` to descendants filtered to canonical/symmetric. The `affects` predicate
-  itself is always included.
+  `biolink:affects` to descendants filtered to canonical/symmetric.
 
 - **Qualifier matching** (`_edge_matches_qualifier_constraints`, `search.py:374-444`):
-  Correctly implements OR between qualifier_sets and AND within each set. Qualifier value
-  expansion via BMT works correctly.
+  Correctly implements OR between qualifier_sets and AND within each set.
 
-- **Edge querying** (`_query_edge`, `search.py:1462-1757`): All three cases (start pinned,
-  end pinned, both pinned) correctly handle both forward and inverse predicate directions.
+- **Edge querying** (`_query_edge`, `search.py:1462-1757`): All three cases correctly
+  handle both forward and inverse predicate directions.
 
 - **Path reconstruction** (`_reconstruct_paths`, `search.py:1760-2215`): Join order
-  optimization and path assembly are sound. No path truncation or result limits that would
-  drop valid paths.
+  optimization and path assembly are sound. No path truncation.
 
-- **Data loading** (`loader.py`): Three-pass streaming architecture loads ALL edges from
-  input KGX files. No filtering by knowledge source, predicate, or edge properties.
-
-### Conclusion: Data issue, not a code issue
-
-The missing paths are caused by **differences in input data**, not by bugs in Gandalf's
-query resolution logic. Specifically:
-
-1. Gandalf's KGX input does not include text-mining-provider-cooccurrence `treats` edges
-   for medroxyprogesterone, Gemcitabine, and solution → Heartburn
-2. Gandalf's KGX input is missing many `affects` edges between intermediary genes and
-   chemicals that Automat has
-
-To resolve the gap, Gandalf's input data pipeline would need to include the text-mining
-knowledge source edges that Automat serves.
+- **Data loading** (`loader.py`): Loads ALL edges. No filtering by knowledge source or
+  predicate. The only issue was the qualifier extraction format gap (now fixed).
