@@ -5,7 +5,7 @@ import os
 import pytest
 
 from gandalf.loader import build_graph_from_jsonl
-from gandalf.search import lookup, _edge_matches_qualifier_constraints, QualifierExpander
+from gandalf.search import lookup, _edge_matches_qualifier_constraints, QualifierExpander, CategoryExpander
 
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -1864,3 +1864,107 @@ class TestSubclassHandling:
         response = lookup(graph, query, bmt=bmt, verbose=False)
         assert "auxiliary_graphs" in response["message"]
         assert isinstance(response["message"]["auxiliary_graphs"], dict)
+
+
+class TestCategoryExpansion:
+    """Tests for hierarchy-aware category matching.
+
+    Node categories in KGX often use specific types (e.g., SmallMolecule, Gene)
+    while TRAPI queries use broader ancestor categories (e.g., ChemicalEntity,
+    BiologicalEntity). The CategoryExpander should bridge this gap.
+    """
+
+    def test_category_expander_includes_descendants(self, bmt):
+        """ChemicalEntity should expand to include SmallMolecule, Drug, etc."""
+        expander = CategoryExpander(bmt)
+        expanded = expander.expand_categories(["biolink:ChemicalEntity"])
+        expanded_set = set(expanded)
+        assert "biolink:ChemicalEntity" in expanded_set
+        assert "biolink:SmallMolecule" in expanded_set
+
+    def test_category_expander_biological_entity(self, bmt):
+        """BiologicalEntity should expand to include Gene, Protein, etc."""
+        expander = CategoryExpander(bmt)
+        expanded = expander.expand_categories(["biolink:BiologicalEntity"])
+        expanded_set = set(expanded)
+        assert "biolink:BiologicalEntity" in expanded_set
+        assert "biolink:Gene" in expanded_set
+
+    def test_category_expander_empty_input(self, bmt):
+        """Empty categories should return empty."""
+        expander = CategoryExpander(bmt)
+        assert expander.expand_categories([]) == []
+
+    def test_category_expander_caches_results(self, bmt):
+        """Repeated expansion should use cache."""
+        expander = CategoryExpander(bmt)
+        result1 = expander.expand_categories(["biolink:ChemicalEntity"])
+        result2 = expander.expand_categories(["biolink:ChemicalEntity"])
+        assert set(result1) == set(result2)
+
+    def test_query_with_ancestor_category_matches_specific_nodes(self, graph, bmt):
+        """Query for ChemicalEntity should find nodes with only SmallMolecule category.
+
+        Metformin (CHEBI:6801) has categories ["biolink:SmallMolecule", "biolink:Drug"]
+        but NOT "biolink:ChemicalEntity". A query asking for ChemicalEntity should
+        still find it via category hierarchy expansion.
+        """
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"categories": ["biolink:ChemicalEntity"]},
+                        "n1": {"ids": ["MONDO:0005148"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:treats"],
+                        },
+                    },
+                },
+            },
+        }
+
+        response = lookup(graph, query, bmt=bmt, verbose=False)
+        results = response["message"]["results"]
+
+        # Should find Metformin even though it only has SmallMolecule category
+        assert len(results) >= 1
+        node_ids = set()
+        for result in results:
+            for binding in result["node_bindings"]["n0"]:
+                node_ids.add(binding["id"])
+        assert "CHEBI:6801" in node_ids
+
+    def test_query_with_biological_entity_matches_gene_nodes(self, graph, bmt):
+        """Query for BiologicalEntity should find nodes with only Gene category.
+
+        Gene nodes have categories ["biolink:Gene", "biolink:GeneOrGeneProduct"]
+        but NOT "biolink:BiologicalEntity". A query using BiologicalEntity should
+        still match them.
+        """
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {"categories": ["biolink:BiologicalEntity"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:affects"],
+                        },
+                    },
+                },
+            },
+        }
+
+        response = lookup(graph, query, bmt=bmt, verbose=False)
+        results = response["message"]["results"]
+
+        # Should find gene nodes even though they only have Gene category
+        assert len(results) >= 1

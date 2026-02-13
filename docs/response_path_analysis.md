@@ -87,66 +87,87 @@ correctly expands `decreased` to match `downregulated` using BMT hierarchy. This
 working as intended and allows Gandalf to find paths through signor-sourced edges that
 use `downregulated` as the qualifier value.
 
-## Root Cause: Nested qualifier format silently dropped during loading
+## Root Cause: Exact category matching misses nodes with specific categories
 
 ### The Bug
 
-Commit `5a97186` ("Fix qualifier loading based on real edges") removed support for the
-**nested `qualifiers` array format** from `_extract_qualifiers()` in `gandalf/loader.py`.
+`_query_edge()` in `gandalf/search.py` uses **exact string matching** when checking
+whether a node's categories satisfy the query's category constraints:
 
-The original code handled two KGX qualifier formats:
-- **Format A** (top-level fields): `"object_aspect_qualifier": "activity"`
-- **Format B** (nested array): `"qualifiers": [{"qualifier_type_id": "...", "qualifier_value": "..."}]`
+```python
+if not any(cat in subj_cats for cat in start_categories):
+    continue
+```
 
-After the commit, only Format A is handled. Edges using Format B have their qualifiers
-**silently dropped** — the loader sees the `qualifiers` field but explicitly skips it
-(in `_extract_attributes`, `field == "qualifiers" → continue`), and `_extract_qualifiers`
-no longer reads from it.
+TRAPI queries typically use broad Biolink Model ancestor categories like
+`biolink:ChemicalEntity` or `biolink:BiologicalEntity`. However, node categories in
+KGX data use specific descendant types:
+
+| Node | Categories in KGX data | Query category |
+|------|----------------------|----------------|
+| CHEBI:6716 (medroxyprogesterone) | `["biolink:SmallMolecule"]` | `biolink:ChemicalEntity` |
+| NCBIGene:4312 (MMP1) | `["biolink:Gene", "biolink:GeneOrGeneProduct"]` | `biolink:BiologicalEntity` |
+
+Since `"biolink:ChemicalEntity"` is not literally present in `["biolink:SmallMolecule"]`,
+the exact-match check fails and the edge is filtered out — even though SmallMolecule **is**
+a descendant of ChemicalEntity in the Biolink hierarchy.
 
 ### How This Causes Missing Paths
 
-1. **edge_0** (`treats`, no qualifier constraints): Text-mining `treats` edges are found
-   regardless of qualifier format, because this edge has no qualifier constraints.
+1. **edge_0** (`treats`): Text-mining `treats` edges between chemicals and Heartburn
+   are filtered out because the chemical nodes (e.g., medroxyprogesterone, Gemcitabine,
+   solution) have specific categories like `SmallMolecule` that don't match the query's
+   `ChemicalEntity`.
 
-2. **edge_1 and edge_2** (`affects`, qualifier constraints: `decreased activity_or_abundance`):
-   Text-mining `affects` edges using the nested qualifier format are stored with **empty
-   qualifier lists**. When the query applies qualifier constraints, these edges fail the
-   qualifier check in `_edge_matches_qualifier_constraints()` and are filtered out.
+2. **edge_1 and edge_2** (`affects`): Similarly, intermediary biological entities have
+   categories like `Gene` or `GeneOrGeneProduct` that don't match the query's
+   `BiologicalEntity`.
 
-3. Without matching `affects` edges for the intermediary genes, no complete paths can be
-   formed through those chemicals, even though the `treats` edges exist.
+3. Without the category match, edges are silently skipped. This means chemicals that
+   could form complete paths through intermediary genes are never considered, resulting
+   in 27 of 36 expected paths being missing.
 
 ### The Fix
 
-Restored nested qualifier format support in `_extract_qualifiers()`. The function now:
-1. Checks for top-level qualifier fields first (existing behavior)
-2. If none found, checks for a nested `qualifiers` array
-3. Extracts qualifier dicts from the nested array
-4. Returns a flat list of qualifier dicts (consistent with current storage/matching format)
+Added a `CategoryExpander` class to `gandalf/search.py` (following the same pattern as
+the existing `QualifierExpander` and `PredicateExpander`). The expander uses BMT's
+`get_descendants()` to expand each query category to include all of its Biolink Model
+descendants before the category check in `_query_edge()`.
 
-Top-level fields take priority when both formats are present, preserving backward
-compatibility.
+For example, expanding `biolink:ChemicalEntity` produces a set that includes
+`biolink:SmallMolecule`, `biolink:Drug`, `biolink:MolecularMixture`, etc. The expanded
+set is passed to `_query_edge()`, so the existing exact-match logic now correctly matches
+nodes with specific categories.
+
+The expansion is:
+- Performed once per unique category (results are cached)
+- Applied at the `lookup()` call site before passing categories to `_query_edge()`
+- Consistent with how Automat and other TRAPI services handle category matching
 
 ### Files Changed
 
-- `gandalf/loader.py`: Restored Format B support in `_extract_qualifiers()`
-- `tests/test_loader.py`: Added `TestExtractQualifiers` class with tests for both formats
+- `gandalf/search.py`: Added `CategoryExpander` class; integrated into `lookup()`
+- `tests/test_search.py`: Added `TestCategoryExpansion` class with unit and integration tests
 
 ## Codebase Analysis: Query Resolution Pipeline
 
-The query-time code was reviewed in detail and is correct:
+The rest of the query-time code was reviewed in detail and is correct:
 
-- **Predicate expansion** (`PredicateExpander`, `search.py:145-300`): Correctly expands
+- **Predicate expansion** (`PredicateExpander`, `search.py:187-345`): Correctly expands
   `biolink:affects` to descendants filtered to canonical/symmetric.
 
-- **Qualifier matching** (`_edge_matches_qualifier_constraints`, `search.py:374-444`):
+- **Qualifier matching** (`_edge_matches_qualifier_constraints`, `search.py:416-486`):
   Correctly implements OR between qualifier_sets and AND within each set.
 
-- **Edge querying** (`_query_edge`, `search.py:1462-1757`): All three cases correctly
-  handle both forward and inverse predicate directions.
+- **Qualifier expansion** (`QualifierExpander`, `search.py:22-141`): Correctly expands
+  qualifier values (e.g., `decreased` matches `downregulated`) using BMT hierarchy.
 
-- **Path reconstruction** (`_reconstruct_paths`, `search.py:1760-2215`): Join order
+- **Edge querying** (`_query_edge`, `search.py:1504-1799`): All three cases correctly
+  handle both forward and inverse predicate directions. Category matching now works
+  correctly with expanded categories.
+
+- **Path reconstruction** (`_reconstruct_paths`, `search.py:1802-2257`): Join order
   optimization and path assembly are sound. No path truncation.
 
 - **Data loading** (`loader.py`): Loads ALL edges. No filtering by knowledge source or
-  predicate. The only issue was the qualifier extraction format gap (now fixed).
+  predicate. Loading is correct; the issue was query-time category matching.

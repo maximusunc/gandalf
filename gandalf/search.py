@@ -142,6 +142,48 @@ class QualifierExpander:
         return expanded_constraints
 
 
+class CategoryExpander:
+    """
+    Expands query categories to include descendant categories from the Biolink Model.
+
+    Node categories in KGX data often use specific types (e.g., biolink:SmallMolecule,
+    biolink:Gene) while TRAPI queries use broader ancestor categories (e.g.,
+    biolink:ChemicalEntity, biolink:BiologicalEntity). This expander bridges the gap
+    by expanding each query category to include all its descendants.
+
+    For example, expanding "biolink:ChemicalEntity" produces a set that also includes
+    "biolink:SmallMolecule", "biolink:Drug", "biolink:MolecularMixture", etc.
+    """
+
+    def __init__(self, bmt: Toolkit):
+        self.bmt = bmt
+        self._cache: dict[str, set[str]] = {}
+
+    def expand_categories(self, categories: list[str]) -> list[str]:
+        """Expand a list of categories to include all descendants.
+
+        Args:
+            categories: List of Biolink category CURIEs from the query.
+
+        Returns:
+            Expanded list including original categories and all descendants.
+        """
+        if not categories:
+            return categories
+
+        expanded = set(categories)
+        for cat in categories:
+            if cat not in self._cache:
+                try:
+                    descendants = self.bmt.get_descendants(cat, formatted=True)
+                    self._cache[cat] = set(descendants) if descendants else set()
+                except Exception:
+                    self._cache[cat] = set()
+            expanded.update(self._cache[cat])
+
+        return list(expanded)
+
+
 class PredicateExpander:
     """
     Handles predicate expansion for symmetric and inverse predicates at query time.
@@ -992,6 +1034,9 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
     # Create qualifier expander for handling qualifier value hierarchy at query time
     qualifier_expander = QualifierExpander(bmt)
 
+    # Create category expander for hierarchy-aware category matching at query time
+    category_expander = CategoryExpander(bmt)
+
     original_query_graph = query["message"]["query_graph"]
     query_graph = copy.deepcopy(original_query_graph)
     subqgraph = copy.deepcopy(query_graph)
@@ -1086,13 +1131,23 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
                     qualifier_constraints
                 )
 
+            # Expand node categories to include descendants for hierarchy-aware matching.
+            # E.g., query for "biolink:ChemicalEntity" also matches nodes with
+            # "biolink:SmallMolecule" or "biolink:Drug" categories.
+            start_categories = category_expander.expand_categories(
+                start_node.get("categories", [])
+            )
+            end_categories = category_expander.expand_categories(
+                end_node.get("categories", [])
+            )
+
             # Query for matching edges
             edge_matches = _query_edge(
                 graph,
                 start_node_idxes,
                 end_node_idxes,
-                start_node.get("categories", []),
-                end_node.get("categories", []),
+                start_categories,
+                end_categories,
                 allowed_predicates,
                 qualifier_constraints,
                 verbose,
