@@ -15,7 +15,7 @@ GANDALF (Graph Analysis Navigator for Discovery And Link Finding) is a Python li
 
 ## Installation
 ```bash
-pip install -U pip setuptools wheels
+pip install -U pip setuptools wheel
 pip install -r requirements.txt
 pip install -r requirements-dev.txt
 # Install (development mode)
