@@ -23,6 +23,7 @@ from gandalf.search import (
 from gandalf.validation import (
     ValidationError,
     ValidationResult,
+    compare_trapi_messages,
     debug_missing_edge,
     diagnose_graph_edge_storage,
     find_edge_in_graph,
@@ -56,6 +57,7 @@ __all__ = [
     # Validation
     "ValidationError",
     "ValidationResult",
+    "compare_trapi_messages",
     "validate_trapi_response",
     "validate_edge_list",
     "validate_node_exists",
