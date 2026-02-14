@@ -481,46 +481,6 @@ def find_edge_in_graph(
     return results
 
 
-def compare_trapi_messages(
-    message_a: dict,
-    message_b: dict,
-) -> list[str]:
-    """Find results/paths in message_a that are not present in message_b.
-
-    Each result is identified by its unique node binding combination (the set
-    of ``(qnode_id, node_id)`` pairs from ``node_bindings``).  For every
-    result in *message_a* whose node-binding fingerprint does not appear in
-    *message_b*, a human-readable path string is returned showing the node
-    IDs, edge predicates, and any edge qualifiers along the path.
-
-    Args:
-        message_a: TRAPI message dict (must contain ``query_graph``,
-            ``knowledge_graph``, and ``results``).
-        message_b: TRAPI message dict to compare against.
-
-    Returns:
-        List of human-readable path descriptions for results present in
-        *message_a* but missing from *message_b*.
-    """
-    # Build node-binding fingerprints from message_b for O(1) lookup.
-    b_fingerprints: set[frozenset[tuple[str, str]]] = set()
-    for result in message_b.get("results", []):
-        b_fingerprints.add(_result_node_fingerprint(result))
-
-    kg_edges = message_a.get("knowledge_graph", {}).get("edges", {})
-    query_graph = message_a.get("query_graph", {})
-    qnode_order, qedge_order = _get_qgraph_path_order(query_graph)
-
-    missing: list[str] = []
-    for result in message_a.get("results", []):
-        if _result_node_fingerprint(result) not in b_fingerprints:
-            missing.append(
-                _format_result_path(result, kg_edges, qnode_order, qedge_order)
-            )
-
-    return missing
-
-
 def _result_node_fingerprint(
     result: dict,
 ) -> frozenset[tuple[str, str]]:
@@ -665,6 +625,46 @@ def _format_edge_bindings(
             descriptions.append(predicate)
 
     return " | ".join(descriptions)
+
+
+def compare_trapi_messages(
+    message_a: dict,
+    message_b: dict,
+) -> list[str]:
+    """Find results/paths in message_a that are not present in message_b.
+
+    Each result is identified by its unique node binding combination (the set
+    of ``(qnode_id, node_id)`` pairs from ``node_bindings``).  For every
+    result in *message_a* whose node-binding fingerprint does not appear in
+    *message_b*, a human-readable path string is returned showing the node
+    IDs, edge predicates, and any edge qualifiers along the path.
+
+    Args:
+        message_a: TRAPI message dict (must contain ``query_graph``,
+            ``knowledge_graph``, and ``results``).
+        message_b: TRAPI message dict to compare against.
+
+    Returns:
+        List of human-readable path descriptions for results present in
+        *message_a* but missing from *message_b*.
+    """
+    # Build node-binding fingerprints from message_b for O(1) lookup.
+    b_fingerprints: set[frozenset[tuple[str, str]]] = set()
+    for result in message_b.get("results", []):
+        b_fingerprints.add(_result_node_fingerprint(result))
+
+    kg_edges = message_a.get("knowledge_graph", {}).get("edges", {})
+    query_graph = message_a.get("query_graph", {})
+    qnode_order, qedge_order = _get_qgraph_path_order(query_graph)
+
+    missing: list[str] = []
+    for result in message_a.get("results", []):
+        if _result_node_fingerprint(result) not in b_fingerprints:
+            missing.append(
+                _format_result_path(result, kg_edges, qnode_order, qedge_order)
+            )
+
+    return missing
 
 
 def debug_missing_edge(
