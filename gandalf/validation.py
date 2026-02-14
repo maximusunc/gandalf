@@ -481,6 +481,192 @@ def find_edge_in_graph(
     return results
 
 
+def compare_trapi_messages(
+    message_a: dict,
+    message_b: dict,
+) -> list[str]:
+    """Find results/paths in message_a that are not present in message_b.
+
+    Each result is identified by its unique node binding combination (the set
+    of ``(qnode_id, node_id)`` pairs from ``node_bindings``).  For every
+    result in *message_a* whose node-binding fingerprint does not appear in
+    *message_b*, a human-readable path string is returned showing the node
+    IDs, edge predicates, and any edge qualifiers along the path.
+
+    Args:
+        message_a: TRAPI message dict (must contain ``query_graph``,
+            ``knowledge_graph``, and ``results``).
+        message_b: TRAPI message dict to compare against.
+
+    Returns:
+        List of human-readable path descriptions for results present in
+        *message_a* but missing from *message_b*.
+    """
+    # Build node-binding fingerprints from message_b for O(1) lookup.
+    b_fingerprints: set[frozenset[tuple[str, str]]] = set()
+    for result in message_b.get("results", []):
+        b_fingerprints.add(_result_node_fingerprint(result))
+
+    kg_edges = message_a.get("knowledge_graph", {}).get("edges", {})
+    query_graph = message_a.get("query_graph", {})
+    qnode_order, qedge_order = _get_qgraph_path_order(query_graph)
+
+    missing: list[str] = []
+    for result in message_a.get("results", []):
+        if _result_node_fingerprint(result) not in b_fingerprints:
+            missing.append(
+                _format_result_path(result, kg_edges, qnode_order, qedge_order)
+            )
+
+    return missing
+
+
+def _result_node_fingerprint(
+    result: dict,
+) -> frozenset[tuple[str, str]]:
+    """Create a hashable fingerprint from a result's node bindings."""
+    pairs: list[tuple[str, str]] = []
+    for qnode_id, bindings in result.get("node_bindings", {}).items():
+        for binding in bindings:
+            pairs.append((qnode_id, binding.get("id", "")))
+    return frozenset(pairs)
+
+
+def _get_qgraph_path_order(
+    query_graph: dict,
+) -> tuple[list[str], list[str]]:
+    """Determine a linear ordering of qnode and qedge IDs from the query graph.
+
+    Walks the query graph edges to produce ``(ordered_qnode_ids,
+    ordered_qedge_ids)`` suitable for rendering a chain-like path.
+    Falls back to sorted IDs when the graph is cyclic or empty.
+    """
+    qedges = query_graph.get("edges", {})
+    if not qedges:
+        return sorted(query_graph.get("nodes", {}).keys()), []
+
+    # Map each subject qnode to its outgoing (qedge_id, object_qnode).
+    subj_to_edge: dict[str, tuple[str, str]] = {}
+    subj_set: set[str] = set()
+    obj_set: set[str] = set()
+
+    for qedge_id, qedge in qedges.items():
+        subj = qedge["subject"]
+        obj = qedge["object"]
+        subj_to_edge[subj] = (qedge_id, obj)
+        subj_set.add(subj)
+        obj_set.add(obj)
+
+    # Start node: appears as a subject but never as an object.
+    start_nodes = subj_set - obj_set
+    if not start_nodes:
+        return sorted(query_graph.get("nodes", {}).keys()), sorted(qedges.keys())
+
+    start = sorted(start_nodes)[0]
+
+    ordered_qnodes: list[str] = [start]
+    ordered_qedges: list[str] = []
+    current = start
+    visited: set[str] = {start}
+
+    while current in subj_to_edge:
+        qedge_id, next_node = subj_to_edge[current]
+        ordered_qedges.append(qedge_id)
+        if next_node in visited:
+            break
+        ordered_qnodes.append(next_node)
+        visited.add(next_node)
+        current = next_node
+
+    return ordered_qnodes, ordered_qedges
+
+
+def _format_result_path(
+    result: dict,
+    kg_edges: dict,
+    qnode_order: list[str],
+    qedge_order: list[str],
+) -> str:
+    """Format a TRAPI result as a human-readable path string.
+
+    Produces output like::
+
+        CHEBI:6801 --(biolink:affects [object_aspect_qualifier: activity])--> NCBIGene:5468
+    """
+    node_bindings = result.get("node_bindings", {})
+
+    # Fall back to sorted qnode IDs when no ordering is available.
+    if not qnode_order:
+        qnode_order = sorted(node_bindings.keys())
+
+    # Collect edge bindings from the first analysis block.
+    edge_bindings: dict = {}
+    analyses = result.get("analyses", [])
+    if analyses:
+        edge_bindings = analyses[0].get("edge_bindings", {})
+
+    # Map qnode_id -> bound node ID.
+    qnode_to_id: dict[str, str] = {}
+    for qnode_id, bindings in node_bindings.items():
+        if bindings:
+            qnode_to_id[qnode_id] = bindings[0].get("id", "?")
+
+    parts: list[str] = []
+    for i, qnode_id in enumerate(qnode_order):
+        parts.append(qnode_to_id.get(qnode_id, "?"))
+
+        if i < len(qedge_order):
+            qedge_id = qedge_order[i]
+            edge_label = _format_edge_bindings(qedge_id, edge_bindings, kg_edges)
+            parts.append(f" --({edge_label})--> ")
+
+    return "".join(parts)
+
+
+def _format_edge_bindings(
+    qedge_id: str,
+    edge_bindings: dict,
+    kg_edges: dict,
+) -> str:
+    """Format all edge bindings for a single qedge as a compact label.
+
+    Multiple distinct predicate/qualifier combinations are separated by
+    ``" | "``.
+    """
+    bindings = edge_bindings.get(qedge_id, [])
+    if not bindings:
+        return "?"
+
+    descriptions: list[str] = []
+    seen: set[tuple[str, str]] = set()
+
+    for binding in bindings:
+        edge_id = binding.get("id")
+        edge = kg_edges.get(edge_id, {}) if edge_id else {}
+
+        predicate = edge.get("predicate", "?")
+        qualifiers = edge.get("qualifiers") or []
+
+        qual_parts: list[str] = []
+        for q in qualifiers:
+            q_type = q.get("qualifier_type_id", "").replace("biolink:", "")
+            q_val = q.get("qualifier_value", "")
+            qual_parts.append(f"{q_type}: {q_val}")
+
+        quals_str = ", ".join(sorted(qual_parts))
+        key = (predicate, quals_str)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if quals_str:
+            descriptions.append(f"{predicate} [{quals_str}]")
+        else:
+            descriptions.append(predicate)
+
+    return " | ".join(descriptions)
+
+
 def debug_missing_edge(
     graph: CSRGraph,
     subject_id: str,
