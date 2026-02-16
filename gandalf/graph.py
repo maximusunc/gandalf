@@ -266,6 +266,9 @@ class CSRGraph:
         # LMDB store (cold path) — set later by loader or load_mmap
         self.lmdb_store = None
 
+        # Edge IDs from the original data — set later by loader or load_mmap
+        self.edge_ids = None
+
         # Build both forward and reverse CSR structures
         print("Building forward CSR...")
         self._build_forward_csr(edges, edge_predicates, edge_properties)
@@ -661,6 +664,12 @@ class CSRGraph:
 
         return props
 
+    def get_edge_id(self, fwd_edge_idx):
+        """Return the original edge ID for a forward-CSR position, or None."""
+        if self.edge_ids is not None:
+            return self.edge_ids[int(fwd_edge_idx)]
+        return None
+
     def get_all_edges_between(self, src_idx, dst_idx, predicate_filter: Optional[list] = None):
         """Get all edges (with different predicates or qualifiers) between two nodes."""
         start = int(self.fwd_offsets[src_idx])
@@ -855,6 +864,11 @@ class CSRGraph:
             with open(directory / "edge_properties.pkl", "wb") as f:
                 pickle.dump(self.edge_properties, f, protocol=pickle.HIGHEST_PROTOCOL)
 
+        # Save edge IDs if present
+        if self.edge_ids is not None:
+            with open(directory / "edge_ids.pkl", "wb") as f:
+                pickle.dump(self.edge_ids, f, protocol=pickle.HIGHEST_PROTOCOL)
+
         # Copy LMDB store if present
         if self.lmdb_store is not None:
             lmdb_src = self.lmdb_store._path
@@ -959,6 +973,14 @@ class CSRGraph:
             graph.lmdb_store = LMDBPropertyStore(lmdb_path, readonly=True)
         else:
             graph.lmdb_store = None
+
+        # Load edge IDs if present
+        edge_ids_path = directory / "edge_ids.pkl"
+        if edge_ids_path.exists():
+            with open(edge_ids_path, "rb") as f:
+                graph.edge_ids = pickle.load(f)
+        else:
+            graph.edge_ids = None
 
         t_props_end = time.perf_counter()
 

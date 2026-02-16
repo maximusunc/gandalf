@@ -188,6 +188,9 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path):
     dst_indices = np.empty(edge_count, dtype=np.int32)
     pred_indices = np.empty(edge_count, dtype=np.int32)
 
+    # Edge IDs from the JSONL "id" field (indexed by original line order)
+    edge_ids = [None] * edge_count
+
     # Incremental dedup builder for qualifiers + sources (hot path)
     prop_builder = EdgePropertyStoreBuilder(edge_count)
 
@@ -214,6 +217,9 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path):
                 src_indices[i] = node_id_to_idx[data["subject"]]
                 dst_indices[i] = node_id_to_idx[data["object"]]
                 pred_indices[i] = predicate_to_idx[data["predicate"]]
+
+                # Capture edge ID from JSONL (if present)
+                edge_ids[i] = data.get("id")
 
                 # Extract properties
                 sources = _extract_sources(data)
@@ -264,6 +270,10 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path):
 
     # Free unsorted arrays
     del src_indices, dst_indices, pred_indices
+
+    # Reorder edge IDs to match CSR sort order
+    edge_ids_sorted = [edge_ids[sort_order[j]] for j in range(edge_count)]
+    del edge_ids
 
     # Reorder dedup store indices to match CSR order
     prop_builder.reorder(sort_order)
@@ -350,6 +360,7 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path):
     graph.rev_to_fwd = rev_to_fwd
 
     graph.edge_properties = edge_properties
+    graph.edge_ids = edge_ids_sorted
     graph.lmdb_store = lmdb_store
 
     # Print statistics

@@ -1287,7 +1287,10 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
                         edge_seen_keys[edge_id].add(edge_key)
                         edge_bindings_by_qedge[edge_id].append(edge)
 
-            # Add edges to knowledge graph and result bindings
+            # Add edges to knowledge graph and result bindings.
+            # Use the original edge ID from the data when available so that
+            # the same physical edge is stored once in the KG and referenced
+            # by every result that uses it.
             for edge_id, edges in edge_bindings_by_qedge.items():
                 # Skip subclass edges from direct bindings
                 if edge_id in subclass_qedges:
@@ -1296,14 +1299,14 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
                 result["analyses"][0]["edge_bindings"][edge_id] = []
 
                 for edge in edges:
-                    edge_uuid = str(uuid.uuid4())[:8]
-                    response["message"]["knowledge_graph"]["edges"][edge_uuid] = edge
+                    edge_kg_id = edge.pop("_edge_id", None) or str(uuid.uuid4())[:8]
+                    response["message"]["knowledge_graph"]["edges"][edge_kg_id] = edge
 
                     # Check if this edge has attached subclass edges
                     attached = qedge_attached_subclass.get(edge_id, [])
                     if attached:
                         # Collect subclass edge IDs from the current path
-                        subclass_edge_uuids = []
+                        subclass_edge_kg_ids = []
                         superclass_node_overrides = {}
 
                         for (which_end, sc_edge_id, sc_qnode_id) in attached:
@@ -1312,9 +1315,11 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
                                 # Skip self-loops (depth-0, no actual subclass hop)
                                 if sc_edge["subject"] == sc_edge["object"]:
                                     continue
-                                sc_uuid = str(uuid.uuid4())[:8]
-                                response["message"]["knowledge_graph"]["edges"][sc_uuid] = sc_edge
-                                subclass_edge_uuids.append(sc_uuid)
+                                # Use .get() (not .pop()) because the same sc_edge
+                                # dict may be referenced by multiple regular edges.
+                                sc_kg_id = sc_edge.get("_edge_id") or str(uuid.uuid4())[:8]
+                                response["message"]["knowledge_graph"]["edges"][sc_kg_id] = sc_edge
+                                subclass_edge_kg_ids.append(sc_kg_id)
 
                             # Get the superclass node ID for endpoint override
                             for path in grouped_paths:
@@ -1323,9 +1328,9 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
                                     superclass_node_overrides[which_end] = sc_node["id"]
                                     break
 
-                        if subclass_edge_uuids:
+                        if subclass_edge_kg_ids:
                             # Create composite inferred edge
-                            composite_edge_ids = [edge_uuid] + subclass_edge_uuids
+                            composite_edge_ids = [edge_kg_id] + subclass_edge_kg_ids
                             composite_edge_id = "_".join(composite_edge_ids)
                             aux_graph_id = f"aux_{composite_edge_id}"
 
@@ -1369,11 +1374,11 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
                         else:
                             # Subclass edges were all self-loops (depth-0), use normal binding
                             result["analyses"][0]["edge_bindings"][edge_id].append(
-                                {"id": edge_uuid, "attributes": []}
+                                {"id": edge_kg_id, "attributes": []}
                             )
                     else:
                         result["analyses"][0]["edge_bindings"][edge_id].append(
-                            {"id": edge_uuid, "attributes": []}
+                            {"id": edge_kg_id, "attributes": []}
                         )
 
             response["message"]["results"].append(result)
@@ -1381,6 +1386,11 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
         # Re-enable GC if it was enabled before
         if gc_was_enabled:
             gc.enable()
+
+    # Strip internal _edge_id markers from KG edges so they don't leak
+    # into the TRAPI response.
+    for edge in response["message"]["knowledge_graph"]["edges"].values():
+        edge.pop("_edge_id", None)
 
     t_built = time.perf_counter()
     if verbose:
@@ -2178,6 +2188,8 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
                     actual_subj_idx = query_subj_idx
                     actual_obj_idx = query_obj_idx
 
+                fwd_eidx = int(paths_fwd_edge_idx[path_idx, col])
+
                 if lightweight:
                     # Only include predicate and structural info — skip
                     # edge attribute lookups (sources, qualifiers, LMDB data)
@@ -2188,7 +2200,6 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
                     }
                 else:
                     # O(1) property lookup using forward edge index
-                    fwd_eidx = int(paths_fwd_edge_idx[path_idx, col])
                     if fwd_eidx < 0:
                         # Synthetic edge (e.g. subclass self-match) with no
                         # real CSR position — build minimal props.
@@ -2200,6 +2211,13 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
                     edge_props["predicate"] = predicate
                     edge_props["subject"] = node_cache[actual_subj_idx]["id"]
                     edge_props["object"] = node_cache[actual_obj_idx]["id"]
+
+                # Attach the original edge ID (if available) for use
+                # during knowledge graph construction.
+                if fwd_eidx >= 0:
+                    orig_id = graph.get_edge_id(fwd_eidx)
+                    if orig_id is not None:
+                        edge_props["_edge_id"] = orig_id
 
                 edges[qedge_id] = edge_props
 
