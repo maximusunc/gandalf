@@ -325,7 +325,7 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path):
     print("  Building rev_to_fwd mapping...")
     fwd_pos = np.empty(edge_count, dtype=np.int32)
     fwd_pos[sort_order] = np.arange(edge_count, dtype=np.int32)
-    rev_to_fwd = fwd_pos[rev_order]
+    rev_to_fwd = rev_order.astype(np.int32)
     del fwd_pos, sort_order
 
     del edge_src, rev_dst_sorted, rev_order
