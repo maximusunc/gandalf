@@ -247,7 +247,7 @@ class PredicateExpander:
         descendants = self.get_descendants(predicate)
         return [d for d in descendants if self.is_canonical_or_symmetric(d)]
 
-    def expand_predicates(self, predicates: list[str]) -> tuple[list[str], list[str]]:
+    def expand_predicates(self, predicates: list[str]) -> tuple[list[str], list[str] | None]:
         """
         Expand predicates following reasoner-transpiler rules.
 
@@ -264,10 +264,12 @@ class PredicateExpander:
         Returns:
             Tuple of (forward_predicates, inverse_predicates) where:
             - forward_predicates: Predicates to match in the forward direction
+              (empty list means match all)
             - inverse_predicates: Predicates to match in the reverse direction
+              (empty list means match all, None means don't check inverse)
         """
-        # Handle 'related_to' as "any predicate"
-        if 'biolink:related_to' in predicates:
+        # Handle 'related_to' or no predicates as "any predicate" in both directions
+        if not predicates or 'biolink:related_to' in predicates:
             return [], []
 
         # Collect inverse predicates
@@ -297,7 +299,9 @@ class PredicateExpander:
         forward_unique = list(dict.fromkeys(forward_expanded))
         inverse_unique = list(dict.fromkeys(inverse_expanded))
 
-        return forward_unique, inverse_unique
+        # Return None for inverse when there are no inverse predicates to check,
+        # to distinguish from the empty-list wildcard used by related_to
+        return forward_unique, inverse_unique if inverse_unique else None
 
     def get_predicates_for_incoming_edges(self, predicates: list[str]) -> set[str]:
         """
@@ -1074,10 +1078,10 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
 
             if verbose and query_predicates:
                 print(f"  Query predicates: {query_predicates}")
-                print(f"  Expanded to {len(forward_predicates)} forward, {len(inverse_predicates)} inverse predicates")
+                print(f"  Expanded to {len(forward_predicates)} forward, {len(inverse_predicates) if inverse_predicates is not None else 0} inverse predicates")
 
             # Store inverse predicates for this edge (for path reconstruction)
-            edge_inverse_preds[next_edge_id] = set(inverse_predicates)
+            edge_inverse_preds[next_edge_id] = set(inverse_predicates) if inverse_predicates is not None else set()
 
             # Get qualifier constraints for this edge and expand to include descendant values
             qualifier_constraints = next_edge.get("qualifier_constraints", [])
@@ -1496,7 +1500,9 @@ def _query_edge(
         allowed_predicates: List of forward predicate strings (canonical/symmetric descendants)
         qualifier_constraints: List of qualifier constraint dicts from query
         verbose: Print progress information
-        inverse_predicates: List of inverse predicate strings for reverse direction matching
+        inverse_predicates: List of inverse predicate strings for reverse direction
+            matching. None means don't check inverse direction. Empty list means
+            match all predicates in inverse direction (wildcard).
 
     Returns:
         List of (subject_idx, predicate, object_idx, via_inverse, fwd_edge_idx) tuples where
@@ -1506,9 +1512,11 @@ def _query_edge(
     matches = []
     seen_edges = set()  # Track (subj, pred, obj, fwd_edge_idx) to avoid duplicates
 
-    # Build set of inverse predicates for quick lookup
-    # When we find an inverse predicate in reverse direction, we report it using
-    # the stored predicate (since that's what's actually in the graph)
+    # Build set of inverse predicates for quick lookup.
+    # None  -> don't check inverse direction at all (default)
+    # []    -> match ALL predicates in inverse direction (wildcard, e.g. related_to)
+    # [pred]-> match only the listed predicates in inverse direction
+    check_inverse = inverse_predicates is not None
     inverse_pred_set = set(inverse_predicates) if inverse_predicates else set()
 
     def add_match(subj_idx, predicate, obj_idx, fwd_edge_idx, via_inverse=False):
@@ -1562,12 +1570,12 @@ def _query_edge(
 
             # Check incoming edges for symmetric/inverse predicates
             # An incoming edge with inverse(P) represents an outgoing edge with P
-            if inverse_pred_set:
+            if check_inverse:
                 for other_idx, stored_pred, props, fwd_edge_idx in graph.incoming_neighbors_with_properties(start_idx):
                     node_neighbors += 1
 
                     # Check if stored predicate is one of our inverse predicates
-                    if stored_pred not in inverse_pred_set:
+                    if inverse_pred_set and stored_pred not in inverse_pred_set:
                         continue
 
                     # Check object categories (the "other" node becomes our object)
@@ -1646,12 +1654,12 @@ def _query_edge(
 
             # Check outgoing edges for symmetric/inverse predicates
             # An outgoing edge with inverse(P) represents an incoming edge with P
-            if inverse_pred_set:
+            if check_inverse:
                 for other_idx, stored_pred, props, fwd_edge_idx in graph.neighbors_with_properties(end_idx):
                     node_neighbors += 1
 
                     # Check if stored predicate is one of our inverse predicates
-                    if stored_pred not in inverse_pred_set:
+                    if inverse_pred_set and stored_pred not in inverse_pred_set:
                         continue
 
                     # Check subject categories (the "other" node becomes our subject)
@@ -1711,7 +1719,7 @@ def _query_edge(
 
         # Also check reverse direction for symmetric/inverse predicates
         # Look for edges: end_node --inverse(P)--> start_node
-        if inverse_pred_set:
+        if check_inverse:
             start_set = set(start_idxes)
             for end_idx in end_idxes:
                 for obj_idx, stored_pred, props, fwd_edge_idx in graph.neighbors_with_properties(end_idx):
@@ -1720,7 +1728,7 @@ def _query_edge(
                     if obj_idx not in start_set:
                         continue
                     # Check if stored predicate is one of our inverse predicates
-                    if stored_pred not in inverse_pred_set:
+                    if inverse_pred_set and stored_pred not in inverse_pred_set:
                         continue
                     # Check qualifier constraints before adding
                     if qualifier_constraints:
