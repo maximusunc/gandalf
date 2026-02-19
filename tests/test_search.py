@@ -2126,3 +2126,147 @@ class TestRelatedToPredicateExpansion:
         assert "NCBIGene:5468" in intermediate_ids, (
             "Should find PPARG via inverse lookup on first hop"
         )
+
+    def test_related_to_two_hop_symmetric_result_count(self, graph, bmt):
+        """Two-hop related_to queries should return the same results regardless of direction.
+
+        Query A: CHEBI:6801 --related_to--> Gene --related_to--> NCBIGene:3643
+        Query B: NCBIGene:3643 --related_to--> Gene --related_to--> CHEBI:6801
+        Should find the same intermediate Gene nodes.
+        """
+        query_a = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                        "n2": {"ids": ["NCBIGene:3643"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:related_to"],
+                        },
+                        "e1": {
+                            "subject": "n1",
+                            "object": "n2",
+                            "predicates": ["biolink:related_to"],
+                        },
+                    },
+                },
+            },
+        }
+
+        query_b = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["NCBIGene:3643"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                        "n2": {"ids": ["CHEBI:6801"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:related_to"],
+                        },
+                        "e1": {
+                            "subject": "n1",
+                            "object": "n2",
+                            "predicates": ["biolink:related_to"],
+                        },
+                    },
+                },
+            },
+        }
+
+        response_a = lookup(graph, query_a, bmt=bmt, verbose=False)
+        response_b = lookup(graph, query_b, bmt=bmt, verbose=False)
+
+        intermediates_a = {r["node_bindings"]["n1"][0]["id"]
+                          for r in response_a["message"]["results"]}
+        intermediates_b = {r["node_bindings"]["n1"][0]["id"]
+                          for r in response_b["message"]["results"]}
+
+        assert intermediates_a == intermediates_b, (
+            f"Forward and reverse two-hop queries should find the same intermediate "
+            f"nodes, but got {intermediates_a} vs {intermediates_b}"
+        )
+        assert len(response_a["message"]["results"]) == len(response_b["message"]["results"]), (
+            f"Forward and reverse two-hop queries should return the same number of "
+            f"results, but got {len(response_a['message']['results'])} vs "
+            f"{len(response_b['message']['results'])}"
+        )
+
+    def test_related_to_two_hop_inverse_intermediate_pinning(self, graph, bmt):
+        """Verify intermediate nodes are correctly pinned when first hop uses inverse.
+
+        Query: MONDO:0005148 --related_to--> Gene --related_to--> CHEBI:6801
+        First hop must use inverse to find Gene nodes (edges stored as Gene -> MONDO).
+        Those Gene nodes must then correctly pin the second hop.
+        The reversed query should produce the same results.
+        """
+        query_forward = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["MONDO:0005148"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                        "n2": {"ids": ["CHEBI:6801"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:related_to"],
+                        },
+                        "e1": {
+                            "subject": "n1",
+                            "object": "n2",
+                            "predicates": ["biolink:related_to"],
+                        },
+                    },
+                },
+            },
+        }
+
+        query_reversed = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                        "n2": {"ids": ["MONDO:0005148"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:related_to"],
+                        },
+                        "e1": {
+                            "subject": "n1",
+                            "object": "n2",
+                            "predicates": ["biolink:related_to"],
+                        },
+                    },
+                },
+            },
+        }
+
+        response_fwd = lookup(graph, query_forward, bmt=bmt, verbose=False)
+        response_rev = lookup(graph, query_reversed, bmt=bmt, verbose=False)
+
+        intermediates_fwd = {r["node_bindings"]["n1"][0]["id"]
+                            for r in response_fwd["message"]["results"]}
+        intermediates_rev = {r["node_bindings"]["n1"][0]["id"]
+                            for r in response_rev["message"]["results"]}
+
+        # Both directions should find genes that connect MONDO:0005148 and CHEBI:6801
+        assert len(intermediates_fwd) > 0, "Should find at least one intermediate gene"
+        assert intermediates_fwd == intermediates_rev, (
+            f"Intermediate genes should be the same regardless of query direction: "
+            f"{intermediates_fwd} vs {intermediates_rev}"
+        )

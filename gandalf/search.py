@@ -1118,9 +1118,17 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
         discovered_subjects = set()
         discovered_objects = set()
 
-        for subj_idx, pred, obj_idx, _via_inverse, _fwd_edge_idx in edge_matches:
-            discovered_subjects.add(graph.get_node_id(subj_idx))
-            discovered_objects.add(graph.get_node_id(obj_idx))
+        for subj_idx, pred, obj_idx, via_inverse, _fwd_edge_idx in edge_matches:
+            if via_inverse:
+                # Edge was found through inverse lookup: the stored edge is
+                # subj_idx -> obj_idx, but the query direction is reversed.
+                # So subj_idx corresponds to the query's object node and
+                # obj_idx corresponds to the query's subject node.
+                discovered_subjects.add(graph.get_node_id(obj_idx))
+                discovered_objects.add(graph.get_node_id(subj_idx))
+            else:
+                discovered_subjects.add(graph.get_node_id(subj_idx))
+                discovered_objects.add(graph.get_node_id(obj_idx))
 
         # Update node IDs in subgraph
         if len(discovered_subjects) > 0:
