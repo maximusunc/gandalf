@@ -1205,19 +1205,31 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
             )
 
     # Group paths by unique node binding combinations
-    # Key: tuple of (qnode_id, node_id) pairs sorted by qnode_id
+    # Key: tuple of (qnode_id, bound_id) pairs sorted by qnode_id
     # Value: list of edge dictionaries from paths with this node combination
+    #
+    # IMPORTANT: the key must use the *bound* ID (after superclass
+    # substitution) rather than the raw node ID.  When subclass expansion
+    # is active, different subclass descendants map to the same superclass
+    # bound ID.  Using raw IDs would split them into separate groups,
+    # producing duplicate results with identical node_bindings.
     node_binding_groups = defaultdict(list)
 
     for path in paths:
-        # Create a hashable key from node bindings — exclude superclass nodes
-        node_key = tuple(
-            sorted(
-                (qnode_id, node["id"])
-                for qnode_id, node in path["nodes"].items()
-                if qnode_id not in superclass_qnodes
-            )
-        )
+        # Create a hashable key from bound node IDs — exclude superclass nodes
+        key_pairs = []
+        for qnode_id, node in path["nodes"].items():
+            if qnode_id in superclass_qnodes:
+                continue
+            # Apply superclass substitution (same logic as result building)
+            bound_id = node["id"]
+            if qnode_id in qnode_to_superclass:
+                superclass_qnode = qnode_to_superclass[qnode_id]
+                superclass_node = path["nodes"].get(superclass_qnode)
+                if superclass_node and superclass_node["id"] != node["id"]:
+                    bound_id = superclass_node["id"]
+            key_pairs.append((qnode_id, bound_id))
+        node_key = tuple(sorted(key_pairs))
         node_binding_groups[node_key].append(path)
 
     t_grouped = time.perf_counter()
