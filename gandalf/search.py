@@ -2,6 +2,7 @@
 
 import copy
 import gc
+import os
 import time
 import uuid
 from collections import defaultdict
@@ -16,7 +17,53 @@ from gandalf.query_planner import get_next_qedge, remove_orphaned
 # When path count exceeds this threshold, skip edge attribute enrichment
 # (sources, qualifiers, publications, attributes from LMDB) and only include
 # predicates. This avoids expensive per-edge property lookups on large result sets.
-LARGE_RESULT_PATH_THRESHOLD = 50_000
+LARGE_RESULT_PATH_THRESHOLD = int(
+    os.environ.get("GANDALF_LARGE_RESULT_THRESHOLD", "50000")
+)
+
+# Maximum number of intermediate paths allowed during join operations.
+# When exceeded, paths are truncated to this limit and a warning is printed.
+# Set to 0 to disable the limit.
+MAX_PATH_LIMIT = int(
+    os.environ.get("GANDALF_MAX_PATH_LIMIT", "0")
+)
+
+
+class PathArrays:
+    """Compact path representation using numpy arrays instead of Python dicts.
+
+    Keeps all path data in four dense numpy arrays (~50 bytes/path) rather
+    than enriched Python dicts (~3 KB/path).  For 5M paths this reduces
+    memory from ~15 GB of dicts to ~250 MB of arrays.
+    """
+
+    __slots__ = (
+        'paths_nodes', 'paths_preds', 'paths_via_inverse',
+        'paths_fwd_edge_idx', 'node_cache', 'idx_to_predicate',
+        'qnode_to_col', 'qedge_to_col', 'col_to_qnode', 'col_to_qedge',
+        'num_node_cols', 'num_edges', 'lightweight',
+    )
+
+    def __init__(self, *, paths_nodes, paths_preds, paths_via_inverse,
+                 paths_fwd_edge_idx, node_cache, idx_to_predicate,
+                 qnode_to_col, qedge_to_col, col_to_qnode, col_to_qedge,
+                 num_node_cols, num_edges, lightweight):
+        self.paths_nodes = paths_nodes
+        self.paths_preds = paths_preds
+        self.paths_via_inverse = paths_via_inverse
+        self.paths_fwd_edge_idx = paths_fwd_edge_idx
+        self.node_cache = node_cache
+        self.idx_to_predicate = idx_to_predicate
+        self.qnode_to_col = qnode_to_col
+        self.qedge_to_col = qedge_to_col
+        self.col_to_qnode = col_to_qnode
+        self.col_to_qedge = col_to_qedge
+        self.num_node_cols = num_node_cols
+        self.num_edges = num_edges
+        self.lightweight = lightweight
+
+    def __len__(self):
+        return len(self.paths_nodes)
 
 
 class QualifierExpander:
@@ -1149,13 +1196,15 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
     if verbose:
         print(f"\nReconstructing complete paths...")
 
-    paths = _reconstruct_paths(
+    path_data = _reconstruct_paths(
         graph, query_graph, edge_results, original_edges, verbose,
         edge_inverse_preds=edge_inverse_preds
     )
 
+    num_paths = len(path_data) if path_data is not None else 0
+
     if verbose:
-        print(f"Found {len(paths):,} complete paths")
+        print(f"Found {num_paths:,} complete paths")
 
     t_post_start = time.perf_counter()
 
@@ -1171,255 +1220,301 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
         }
     }
 
-    # Pre-compute subclass metadata for result building
-    superclass_qnodes = {
-        qnode_id for qnode_id, qnode in query_graph["nodes"].items()
-        if qnode.get("_superclass")
-    }
-    subclass_qedges = {
-        qedge_id for qedge_id, qedge in query_graph["edges"].items()
-        if qedge.get("_subclass")
-    }
-    # Map: original qnode_id -> superclass qnode_id
-    qnode_to_superclass = {}
-    # Map: original qedge_id -> subclass qedge_id (for finding subclass edges attached to real edges)
-    qedge_attached_subclass = defaultdict(list)
-    for qedge_id, qedge in query_graph["edges"].items():
-        if qedge.get("_subclass"):
-            child_qnode = qedge["subject"]   # e.g. "n0"
-            parent_qnode = qedge["object"]   # e.g. "n0_superclass"
-            qnode_to_superclass[child_qnode] = parent_qnode
-    # For each real (non-subclass) edge, find attached subclass edges
-    for qedge_id, qedge in query_graph["edges"].items():
-        if qedge.get("_subclass"):
-            continue
-        subj = qedge["subject"]
-        obj = qedge["object"]
-        if subj in qnode_to_superclass:
-            qedge_attached_subclass[qedge_id].append(
-                ("subject", f"{subj}_subclass_edge", qnode_to_superclass[subj])
-            )
-        if obj in qnode_to_superclass:
-            qedge_attached_subclass[qedge_id].append(
-                ("object", f"{obj}_subclass_edge", qnode_to_superclass[obj])
-            )
+    if num_paths == 0:
+        t_built = time.perf_counter()
+        if verbose:
+            print(f"  Post-processing total: {t_built - t_post_start:.2f}s")
+    else:
+        # Extract arrays and metadata from PathArrays for efficient access
+        pa_nodes = path_data.paths_nodes
+        pa_preds = path_data.paths_preds
+        pa_via_inv = path_data.paths_via_inverse
+        pa_fwd_eidx = path_data.paths_fwd_edge_idx
+        node_cache = path_data.node_cache
+        idx_to_predicate = path_data.idx_to_predicate
+        qnode_to_col = path_data.qnode_to_col
+        qedge_to_col = path_data.qedge_to_col
+        col_to_qnode = path_data.col_to_qnode
+        col_to_qedge = path_data.col_to_qedge
+        pa_num_node_cols = path_data.num_node_cols
+        pa_num_edges = path_data.num_edges
+        lightweight = path_data.lightweight
 
-    # Group paths by unique node binding combinations
-    # Key: tuple of (qnode_id, bound_id) pairs sorted by qnode_id
-    # Value: list of edge dictionaries from paths with this node combination
-    #
-    # IMPORTANT: the key must use the *bound* ID (after superclass
-    # substitution) rather than the raw node ID.  When subclass expansion
-    # is active, different subclass descendants map to the same superclass
-    # bound ID.  Using raw IDs would split them into separate groups,
-    # producing duplicate results with identical node_bindings.
-    node_binding_groups = defaultdict(list)
-
-    for path in paths:
-        # Create a hashable key from bound node IDs — exclude superclass nodes
-        key_pairs = []
-        for qnode_id, node in path["nodes"].items():
-            if qnode_id in superclass_qnodes:
+        # Pre-compute subclass metadata for result building
+        superclass_qnodes = {
+            qnode_id for qnode_id, qnode in query_graph["nodes"].items()
+            if qnode.get("_superclass")
+        }
+        subclass_qedges = {
+            qedge_id for qedge_id, qedge in query_graph["edges"].items()
+            if qedge.get("_subclass")
+        }
+        qnode_to_superclass = {}
+        qedge_attached_subclass = defaultdict(list)
+        for qedge_id, qedge in query_graph["edges"].items():
+            if qedge.get("_subclass"):
+                child_qnode = qedge["subject"]
+                parent_qnode = qedge["object"]
+                qnode_to_superclass[child_qnode] = parent_qnode
+        for qedge_id, qedge in query_graph["edges"].items():
+            if qedge.get("_subclass"):
                 continue
-            # Apply superclass substitution (same logic as result building)
-            bound_id = node["id"]
-            if qnode_id in qnode_to_superclass:
-                superclass_qnode = qnode_to_superclass[qnode_id]
-                superclass_node = path["nodes"].get(superclass_qnode)
-                if superclass_node and superclass_node["id"] != node["id"]:
-                    bound_id = superclass_node["id"]
-            key_pairs.append((qnode_id, bound_id))
-        node_key = tuple(sorted(key_pairs))
-        node_binding_groups[node_key].append(path)
+            subj = qedge["subject"]
+            obj = qedge["object"]
+            if subj in qnode_to_superclass:
+                qedge_attached_subclass[qedge_id].append(
+                    ("subject", f"{subj}_subclass_edge", qnode_to_superclass[subj])
+                )
+            if obj in qnode_to_superclass:
+                qedge_attached_subclass[qedge_id].append(
+                    ("object", f"{obj}_subclass_edge", qnode_to_superclass[obj])
+                )
 
-    t_grouped = time.perf_counter()
-    if verbose:
-        print(f"  Grouped into {len(node_binding_groups):,} unique node paths ({t_grouped - t_post_start:.2f}s)")
+        # Group paths by unique node binding combinations using numpy arrays.
+        # Stores path *indices* (ints) instead of enriched dicts (~15 GB savings
+        # for 5M paths).
+        node_binding_groups = defaultdict(list)
 
-    # Disable GC during result building to prevent stochastic pauses
-    # GC can cause 30+ second delays when triggered during this loop
-    gc_was_enabled = gc.isenabled()
-    gc.disable()
-
-    try:
-        # Build results - one per unique node binding combination
-        for node_key, grouped_paths in node_binding_groups.items():
-            # Use first path for node info (all paths in group have same nodes)
-            first_path = grouped_paths[0]
-
-            result = {
-                "node_bindings": {},
-                "analyses": [{
-                    "resource_id": "infores:gandalf",
-                    "edge_bindings": {},
-                }],
-            }
-
-            # Add node bindings — skip superclass nodes, substitute IDs
-            for qnode_id, node in first_path["nodes"].items():
+        for path_idx in range(num_paths):
+            key_pairs = []
+            for col in range(pa_num_node_cols):
+                qnode_id = col_to_qnode[col]
                 if qnode_id in superclass_qnodes:
-                    # Don't expose synthetic superclass nodes in bindings
                     continue
-
-                # Add node to knowledge graph
-                response["message"]["knowledge_graph"]["nodes"][node["id"]] = node
-
-                # If this qnode has a superclass counterpart with a different result ID,
-                # use the superclass ID in the binding (it's the originally queried entity)
-                bound_id = node["id"]
+                node_idx = int(pa_nodes[path_idx, col])
+                bound_id = node_cache[node_idx]["id"]
                 if qnode_id in qnode_to_superclass:
-                    superclass_qnode = qnode_to_superclass[qnode_id]
-                    superclass_node = first_path["nodes"].get(superclass_qnode)
-                    if superclass_node and superclass_node["id"] != node["id"]:
-                        bound_id = superclass_node["id"]
-                        # Also add the superclass node to the knowledge graph
-                        response["message"]["knowledge_graph"]["nodes"][superclass_node["id"]] = superclass_node
+                    sc_qnode = qnode_to_superclass[qnode_id]
+                    if sc_qnode in qnode_to_col:
+                        sc_col = qnode_to_col[sc_qnode]
+                        sc_node_idx = int(pa_nodes[path_idx, sc_col])
+                        sc_id = node_cache[sc_node_idx]["id"]
+                        if sc_id != bound_id:
+                            bound_id = sc_id
+                key_pairs.append((qnode_id, bound_id))
+            node_key = tuple(sorted(key_pairs))
+            node_binding_groups[node_key].append(path_idx)
 
-                result["node_bindings"][qnode_id] = [
-                    {"id": bound_id, "attributes": []},
-                ]
+        t_grouped = time.perf_counter()
+        if verbose:
+            print(f"  Grouped into {len(node_binding_groups):,} unique node paths ({t_grouped - t_post_start:.2f}s)")
 
-            # Aggregate edge bindings from all paths in group.
-            # Edges sharing (subject, predicate, object) but with different
-            # qualifiers or sources are distinct and must be kept.
-            edge_bindings_by_qedge = defaultdict(list)
-            edge_seen_keys = defaultdict(set)  # qedge_id -> set of hashable keys
+        # Disable GC during result building to prevent stochastic pauses
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
 
-            for path in grouped_paths:
-                for edge_id, edge in path["edges"].items():
-                    # Build a key that distinguishes edges with different
-                    # qualifiers / sources even when (subj, pred, obj) match.
-                    quals = edge.get("qualifiers") or []
-                    quals_key = tuple(
-                        sorted(
-                            (q.get("qualifier_type_id", ""), q.get("qualifier_value", ""))
-                            for q in quals
-                        )
-                    )
-                    sources = edge.get("sources") or []
-                    sources_key = tuple(
-                        sorted(
-                            (s.get("resource_id", ""), s.get("resource_role", ""))
-                            for s in sources
-                        )
-                    )
-                    edge_key = (
-                        edge["subject"], edge["predicate"], edge["object"],
-                        quals_key, sources_key,
-                    )
-                    if edge_key not in edge_seen_keys[edge_id]:
-                        edge_seen_keys[edge_id].add(edge_key)
-                        edge_bindings_by_qedge[edge_id].append(edge)
+        try:
+            # Build results — one per unique node binding combination.
+            # Edge dicts are created only for unique edges (not per-path).
+            for node_key, path_indices in node_binding_groups.items():
+                first_idx = path_indices[0]
 
-            # Add edges to knowledge graph and result bindings.
-            # Use the original edge ID from the data when available so that
-            # the same physical edge is stored once in the KG and referenced
-            # by every result that uses it.
-            for edge_id, edges in edge_bindings_by_qedge.items():
-                # Skip subclass edges from direct bindings
-                if edge_id in subclass_qedges:
-                    continue
+                result = {
+                    "node_bindings": {},
+                    "analyses": [{
+                        "resource_id": "infores:gandalf",
+                        "edge_bindings": {},
+                    }],
+                }
 
-                result["analyses"][0]["edge_bindings"][edge_id] = []
+                # Add node bindings — skip superclass nodes, substitute IDs
+                for col in range(pa_num_node_cols):
+                    qnode_id = col_to_qnode[col]
+                    if qnode_id in superclass_qnodes:
+                        continue
 
-                for edge in edges:
-                    edge_kg_id = edge.pop("_edge_id", None) or str(uuid.uuid4())[:8]
-                    response["message"]["knowledge_graph"]["edges"][edge_kg_id] = edge
+                    node_idx = int(pa_nodes[first_idx, col])
+                    node = node_cache[node_idx]
+                    response["message"]["knowledge_graph"]["nodes"][node["id"]] = node
 
-                    # Check if this edge has attached subclass edges
-                    attached = qedge_attached_subclass.get(edge_id, [])
-                    if attached:
-                        # Collect subclass edge IDs from the current path
-                        subclass_edge_kg_ids = []
-                        superclass_node_overrides = {}
+                    bound_id = node["id"]
+                    if qnode_id in qnode_to_superclass:
+                        sc_qnode = qnode_to_superclass[qnode_id]
+                        if sc_qnode in qnode_to_col:
+                            sc_col = qnode_to_col[sc_qnode]
+                            sc_node_idx = int(pa_nodes[first_idx, sc_col])
+                            sc_node = node_cache[sc_node_idx]
+                            if sc_node["id"] != node["id"]:
+                                bound_id = sc_node["id"]
+                                response["message"]["knowledge_graph"]["nodes"][sc_node["id"]] = sc_node
 
-                        for (which_end, sc_edge_id, sc_qnode_id) in attached:
-                            sc_edges = edge_bindings_by_qedge.get(sc_edge_id, [])
-                            for sc_edge in sc_edges:
-                                # Skip self-loops (depth-0, no actual subclass hop)
-                                if sc_edge["subject"] == sc_edge["object"]:
-                                    continue
-                                # Use .get() (not .pop()) because the same sc_edge
-                                # dict may be referenced by multiple regular edges.
-                                sc_kg_id = sc_edge.get("_edge_id") or str(uuid.uuid4())[:8]
-                                response["message"]["knowledge_graph"]["edges"][sc_kg_id] = sc_edge
-                                subclass_edge_kg_ids.append(sc_kg_id)
+                    result["node_bindings"][qnode_id] = [
+                        {"id": bound_id, "attributes": []},
+                    ]
 
-                            # Get the superclass node ID for endpoint override
-                            for path in grouped_paths:
-                                sc_node = path["nodes"].get(sc_qnode_id)
-                                if sc_node:
-                                    superclass_node_overrides[which_end] = sc_node["id"]
-                                    break
+                # Aggregate edge bindings from all paths in group.
+                # Edge dicts are created only for unique (subj, pred, obj,
+                # qualifiers, sources) combinations — not for every path.
+                edge_bindings_by_qedge = defaultdict(list)
+                edge_seen_keys = defaultdict(set)
 
-                        if subclass_edge_kg_ids:
-                            # Create composite inferred edge
-                            composite_edge_ids = [edge_kg_id] + subclass_edge_kg_ids
-                            composite_edge_id = "_".join(composite_edge_ids)
-                            aux_graph_id = f"aux_{composite_edge_id}"
+                for path_idx in path_indices:
+                    for col in range(pa_num_edges):
+                        qedge_id = col_to_qedge[col]
+                        pred_idx = int(pa_preds[path_idx, col])
+                        predicate = idx_to_predicate[pred_idx]
+                        is_inverse = bool(pa_via_inv[path_idx, col])
+                        fwd_eidx = int(pa_fwd_eidx[path_idx, col])
 
-                            if aux_graph_id not in response["message"]["auxiliary_graphs"]:
-                                response["message"]["auxiliary_graphs"][aux_graph_id] = {
-                                    "edges": composite_edge_ids,
-                                    "attributes": [],
-                                }
+                        # Determine actual (stored) edge direction
+                        edge_def = query_graph["edges"][qedge_id]
+                        subj_col_e = qnode_to_col[edge_def["subject"]]
+                        obj_col_e = qnode_to_col[edge_def["object"]]
+                        query_subj_idx = int(pa_nodes[path_idx, subj_col_e])
+                        query_obj_idx = int(pa_nodes[path_idx, obj_col_e])
 
-                            if composite_edge_id not in response["message"]["knowledge_graph"]["edges"]:
-                                inferred_edge = {
-                                    "subject": superclass_node_overrides.get("subject", edge["subject"]),
-                                    "predicate": edge["predicate"],
-                                    "object": superclass_node_overrides.get("object", edge["object"]),
-                                    "attributes": [
-                                        {
-                                            "attribute_type_id": "biolink:knowledge_level",
-                                            "value": "logical_entailment",
-                                        },
-                                        {
-                                            "attribute_type_id": "biolink:agent_type",
-                                            "value": "automated_agent",
-                                        },
-                                        {
-                                            "attribute_type_id": "biolink:support_graphs",
-                                            "value": [aux_graph_id],
-                                        },
-                                    ],
-                                    "sources": [
-                                        {
-                                            "resource_id": "infores:gandalf",
-                                            "resource_role": "primary_knowledge_source",
-                                        }
-                                    ],
-                                }
-                                response["message"]["knowledge_graph"]["edges"][composite_edge_id] = inferred_edge
-
-                            result["analyses"][0]["edge_bindings"][edge_id].append(
-                                {"id": composite_edge_id, "attributes": []}
-                            )
+                        if is_inverse:
+                            actual_subj_idx, actual_obj_idx = query_obj_idx, query_subj_idx
                         else:
-                            # Subclass edges were all self-loops (depth-0), use normal binding
+                            actual_subj_idx, actual_obj_idx = query_subj_idx, query_obj_idx
+
+                        subj_id = node_cache[actual_subj_idx]["id"]
+                        obj_id = node_cache[actual_obj_idx]["id"]
+
+                        # Compute dedup key
+                        if lightweight or fwd_eidx < 0:
+                            edge_key = (subj_id, predicate, obj_id, (), ())
+                        else:
+                            quals = graph.edge_properties.get_qualifiers(fwd_eidx)
+                            quals_key = tuple(
+                                sorted(
+                                    (q.get("qualifier_type_id", ""), q.get("qualifier_value", ""))
+                                    for q in (quals or [])
+                                )
+                            )
+                            sources = graph.edge_properties.get_sources(fwd_eidx)
+                            sources_key = tuple(
+                                sorted(
+                                    (s.get("resource_id", ""), s.get("resource_role", ""))
+                                    for s in (sources or [])
+                                )
+                            )
+                            edge_key = (subj_id, predicate, obj_id, quals_key, sources_key)
+
+                        if edge_key not in edge_seen_keys[qedge_id]:
+                            edge_seen_keys[qedge_id].add(edge_key)
+                            # Build edge dict only for unique edges
+                            if lightweight:
+                                edge_props = {
+                                    "predicate": predicate,
+                                    "subject": subj_id,
+                                    "object": obj_id,
+                                }
+                            else:
+                                if fwd_eidx < 0:
+                                    edge_props = {}
+                                else:
+                                    edge_props = graph.get_edge_properties_by_index(fwd_eidx).copy()
+                                edge_props["predicate"] = predicate
+                                edge_props["subject"] = subj_id
+                                edge_props["object"] = obj_id
+
+                            if fwd_eidx >= 0:
+                                orig_id = graph.get_edge_id(fwd_eidx)
+                                if orig_id is not None:
+                                    edge_props["_edge_id"] = orig_id
+
+                            edge_bindings_by_qedge[qedge_id].append(edge_props)
+
+                # Add edges to knowledge graph and result bindings
+                for edge_id, edges in edge_bindings_by_qedge.items():
+                    if edge_id in subclass_qedges:
+                        continue
+
+                    result["analyses"][0]["edge_bindings"][edge_id] = []
+
+                    for edge in edges:
+                        edge_kg_id = edge.pop("_edge_id", None) or str(uuid.uuid4())[:8]
+                        response["message"]["knowledge_graph"]["edges"][edge_kg_id] = edge
+
+                        attached = qedge_attached_subclass.get(edge_id, [])
+                        if attached:
+                            subclass_edge_kg_ids = []
+                            superclass_node_overrides = {}
+
+                            for (which_end, sc_edge_id, sc_qnode_id) in attached:
+                                sc_edges = edge_bindings_by_qedge.get(sc_edge_id, [])
+                                for sc_edge in sc_edges:
+                                    if sc_edge["subject"] == sc_edge["object"]:
+                                        continue
+                                    sc_kg_id = sc_edge.get("_edge_id") or str(uuid.uuid4())[:8]
+                                    response["message"]["knowledge_graph"]["edges"][sc_kg_id] = sc_edge
+                                    subclass_edge_kg_ids.append(sc_kg_id)
+
+                                # Get superclass node ID for endpoint override
+                                if sc_qnode_id in qnode_to_col:
+                                    sc_col = qnode_to_col[sc_qnode_id]
+                                    sc_node_idx = int(pa_nodes[first_idx, sc_col])
+                                    superclass_node_overrides[which_end] = node_cache[sc_node_idx]["id"]
+
+                            if subclass_edge_kg_ids:
+                                composite_edge_ids = [edge_kg_id] + subclass_edge_kg_ids
+                                composite_edge_id = "_".join(composite_edge_ids)
+                                aux_graph_id = f"aux_{composite_edge_id}"
+
+                                if aux_graph_id not in response["message"]["auxiliary_graphs"]:
+                                    response["message"]["auxiliary_graphs"][aux_graph_id] = {
+                                        "edges": composite_edge_ids,
+                                        "attributes": [],
+                                    }
+
+                                if composite_edge_id not in response["message"]["knowledge_graph"]["edges"]:
+                                    inferred_edge = {
+                                        "subject": superclass_node_overrides.get("subject", edge["subject"]),
+                                        "predicate": edge["predicate"],
+                                        "object": superclass_node_overrides.get("object", edge["object"]),
+                                        "attributes": [
+                                            {
+                                                "attribute_type_id": "biolink:knowledge_level",
+                                                "value": "logical_entailment",
+                                            },
+                                            {
+                                                "attribute_type_id": "biolink:agent_type",
+                                                "value": "automated_agent",
+                                            },
+                                            {
+                                                "attribute_type_id": "biolink:support_graphs",
+                                                "value": [aux_graph_id],
+                                            },
+                                        ],
+                                        "sources": [
+                                            {
+                                                "resource_id": "infores:gandalf",
+                                                "resource_role": "primary_knowledge_source",
+                                            }
+                                        ],
+                                    }
+                                    response["message"]["knowledge_graph"]["edges"][composite_edge_id] = inferred_edge
+
+                                result["analyses"][0]["edge_bindings"][edge_id].append(
+                                    {"id": composite_edge_id, "attributes": []}
+                                )
+                            else:
+                                result["analyses"][0]["edge_bindings"][edge_id].append(
+                                    {"id": edge_kg_id, "attributes": []}
+                                )
+                        else:
                             result["analyses"][0]["edge_bindings"][edge_id].append(
                                 {"id": edge_kg_id, "attributes": []}
                             )
-                    else:
-                        result["analyses"][0]["edge_bindings"][edge_id].append(
-                            {"id": edge_kg_id, "attributes": []}
-                        )
 
-            response["message"]["results"].append(result)
-    finally:
-        # Re-enable GC if it was enabled before
-        if gc_was_enabled:
-            gc.enable()
+                response["message"]["results"].append(result)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
-    # Strip internal _edge_id markers from KG edges so they don't leak
-    # into the TRAPI response.
-    for edge in response["message"]["knowledge_graph"]["edges"].values():
-        edge.pop("_edge_id", None)
+        # Free path arrays now that results are built
+        del path_data
 
-    t_built = time.perf_counter()
-    if verbose:
-        print(f"  Built {len(response['message']['results']):,} results ({t_built - t_grouped:.2f}s)")
-        print(f"  Post-processing total: {t_built - t_post_start:.2f}s")
+        # Strip internal _edge_id markers from KG edges so they don't leak
+        # into the TRAPI response.
+        for edge in response["message"]["knowledge_graph"]["edges"].values():
+            edge.pop("_edge_id", None)
+
+        t_built = time.perf_counter()
+        if verbose:
+            print(f"  Built {len(response['message']['results']):,} results ({t_built - t_grouped:.2f}s)")
+            print(f"  Post-processing total: {t_built - t_post_start:.2f}s")
 
     # Stop GC monitoring and show summary
     gc_monitor.stop()
@@ -1800,8 +1895,8 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
     """
     Reconstruct complete paths by iteratively joining edge results.
 
-    Uses NumPy arrays for efficient memory usage and to avoid GC pressure.
-    For 15M+ paths, this eliminates Python object creation overhead.
+    Uses two-pass joins (count then fill) to avoid temporary Python lists
+    and returns a compact PathArrays object instead of per-path dicts.
 
     Args:
         graph: CSRGraph instance
@@ -1812,10 +1907,10 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
         edge_inverse_preds: (Deprecated, kept for compatibility) Dict of edge_id -> set of inverse predicates
 
     Returns:
-        List of enriched path dictionaries
+        PathArrays object, or None if no paths found
     """
     if len(edge_order) == 0:
-        return []
+        return None
 
     t0 = time.perf_counter()
 
@@ -1857,12 +1952,9 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
     num_paths = len(first_results)
 
     if num_paths == 0:
-        return []
+        return None
 
     # Pre-allocate arrays for nodes, predicates, and via_inverse flags
-    # nodes: shape (num_paths, max_nodes) - will grow columns as needed
-    # preds: shape (num_paths, num_edges)
-    # via_inverse: shape (num_paths, num_edges) - tracks if edge was found via inverse lookup
     max_nodes = len(query_graph["nodes"])
     num_edges = len(join_order)
 
@@ -1872,16 +1964,11 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
     paths_fwd_edge_idx = np.zeros((num_paths, num_edges), dtype=np.int32)
 
     # Fill in first edge data
-    # For inverse matches, the actual edge has subject/object swapped relative to query
     for i, (subj_idx, predicate, obj_idx, via_inverse, fwd_edge_idx) in enumerate(first_results):
         if via_inverse:
-            # Inverse match: actual edge is (subj, pred, obj) but query expects reversed
-            # subj in actual edge corresponds to query's object
-            # obj in actual edge corresponds to query's subject
-            paths_nodes[i, 0] = obj_idx   # Query subject column gets actual object
-            paths_nodes[i, 1] = subj_idx  # Query object column gets actual subject
+            paths_nodes[i, 0] = obj_idx
+            paths_nodes[i, 1] = subj_idx
         else:
-            # Direct match: actual edge matches query direction
             paths_nodes[i, 0] = subj_idx
             paths_nodes[i, 1] = obj_idx
         paths_preds[i, 0] = get_pred_idx(predicate)
@@ -1891,7 +1978,9 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
     if verbose:
         print(f"  Starting with {num_paths:,} paths from edge '{first_edge_id}'")
 
-    # Iteratively join with remaining edges
+    # Iteratively join with remaining edges using two-pass approach:
+    # Pass 1: count output rows, Pass 2: fill pre-allocated arrays.
+    # This avoids creating millions of tiny numpy row copies in Python lists.
     for join_idx, edge_id in enumerate(join_order[1:], 1):
         edge = query_graph["edges"][edge_id]
         subj_qnode = edge["subject"]
@@ -1911,13 +2000,9 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
         edge_data = edge_results[edge_id]
 
         # Normalize edge data to query-aligned direction
-        # For inverse matches (via_inverse=True), the actual edge (subj, pred, obj)
-        # represents the query direction (obj, pred, subj), so we swap
-        # We keep the via_inverse flag and fwd_edge_idx to use during enrichment
         normalized_edge_data = []
         for subj_idx, predicate, obj_idx, via_inverse, fwd_edge_idx in edge_data:
             if via_inverse:
-                # Inverse: swap to query-aligned direction
                 normalized_edge_data.append((obj_idx, predicate, subj_idx, via_inverse, fwd_edge_idx))
             else:
                 normalized_edge_data.append((subj_idx, predicate, obj_idx, via_inverse, fwd_edge_idx))
@@ -1928,147 +2013,158 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
             subj_col = qnode_to_col[subj_qnode]
             obj_col = qnode_to_col[obj_qnode]
 
-            # Build index: (subj_idx, obj_idx) -> [(pred_idx, via_inverse, fwd_edge_idx), ...]
             edge_index = defaultdict(list)
             for subj_idx, predicate, obj_idx, via_inverse, fwd_edge_idx in edge_data:
                 edge_index[(subj_idx, obj_idx)].append((get_pred_idx(predicate), via_inverse, fwd_edge_idx))
 
-            # Find matching paths
-            new_nodes_list = []
-            new_preds_list = []
-            new_via_inverse_list = []
-            new_fwd_edge_idx_list = []
-
+            # Pass 1: Count output rows
+            output_count = 0
             for path_idx in range(len(paths_nodes)):
-                key = (paths_nodes[path_idx, subj_col], paths_nodes[path_idx, obj_col])
+                key = (int(paths_nodes[path_idx, subj_col]), int(paths_nodes[path_idx, obj_col]))
+                if key in edge_index:
+                    output_count += len(edge_index[key])
+            if MAX_PATH_LIMIT > 0 and output_count > MAX_PATH_LIMIT:
+                print(f"\n    Warning: Truncating {output_count:,} intermediate paths to {MAX_PATH_LIMIT:,}")
+                output_count = MAX_PATH_LIMIT
+
+            # Pass 2: Fill pre-allocated arrays
+            new_nodes = np.empty((output_count, max_nodes), dtype=np.int32)
+            new_preds = np.empty((output_count, num_edges), dtype=np.int32)
+            new_via_inv = np.empty((output_count, num_edges), dtype=np.bool_)
+            new_fwd_eidx = np.empty((output_count, num_edges), dtype=np.int32)
+            w = 0
+            for path_idx in range(len(paths_nodes)):
+                if w >= output_count:
+                    break
+                key = (int(paths_nodes[path_idx, subj_col]), int(paths_nodes[path_idx, obj_col]))
                 if key in edge_index:
                     for pred_idx, via_inverse, fwd_edge_idx in edge_index[key]:
-                        new_nodes_list.append(paths_nodes[path_idx].copy())
-                        new_preds = paths_preds[path_idx].copy()
-                        new_preds[join_idx] = pred_idx
-                        new_preds_list.append(new_preds)
-                        new_via_inv = paths_via_inverse[path_idx].copy()
-                        new_via_inv[join_idx] = via_inverse
-                        new_via_inverse_list.append(new_via_inv)
-                        new_fwd_eidx = paths_fwd_edge_idx[path_idx].copy()
-                        new_fwd_eidx[join_idx] = fwd_edge_idx
-                        new_fwd_edge_idx_list.append(new_fwd_eidx)
+                        if w >= output_count:
+                            break
+                        new_nodes[w] = paths_nodes[path_idx]
+                        new_preds[w] = paths_preds[path_idx]
+                        new_preds[w, join_idx] = pred_idx
+                        new_via_inv[w] = paths_via_inverse[path_idx]
+                        new_via_inv[w, join_idx] = via_inverse
+                        new_fwd_eidx[w] = paths_fwd_edge_idx[path_idx]
+                        new_fwd_eidx[w, join_idx] = fwd_edge_idx
+                        w += 1
 
-            if new_nodes_list:
-                paths_nodes = np.array(new_nodes_list, dtype=np.int32)
-                paths_preds = np.array(new_preds_list, dtype=np.int32)
-                paths_via_inverse = np.array(new_via_inverse_list, dtype=np.bool_)
-                paths_fwd_edge_idx = np.array(new_fwd_edge_idx_list, dtype=np.int32)
-            else:
-                paths_nodes = np.zeros((0, max_nodes), dtype=np.int32)
-                paths_preds = np.zeros((0, num_edges), dtype=np.int32)
-                paths_via_inverse = np.zeros((0, num_edges), dtype=np.bool_)
-                paths_fwd_edge_idx = np.zeros((0, num_edges), dtype=np.int32)
+            del paths_nodes, paths_preds, paths_via_inverse, paths_fwd_edge_idx
+            paths_nodes = new_nodes
+            paths_preds = new_preds
+            paths_via_inverse = new_via_inv
+            paths_fwd_edge_idx = new_fwd_eidx
 
         elif subj_in_paths:
             # Join on subject node, add object node
             subj_col = qnode_to_col[subj_qnode]
-
-            # Assign column for new object node
             if obj_qnode not in qnode_to_col:
                 qnode_to_col[obj_qnode] = num_node_cols
                 num_node_cols += 1
             obj_col = qnode_to_col[obj_qnode]
 
-            # Build index: subj_idx -> [(pred_idx, obj_idx, via_inverse, fwd_edge_idx), ...]
             edge_index = defaultdict(list)
             for subj_idx, predicate, obj_idx, via_inverse, fwd_edge_idx in edge_data:
                 edge_index[subj_idx].append((get_pred_idx(predicate), obj_idx, via_inverse, fwd_edge_idx))
 
-            # Find matching paths
-            new_nodes_list = []
-            new_preds_list = []
-            new_via_inverse_list = []
-            new_fwd_edge_idx_list = []
-
+            # Pass 1: Count
+            output_count = 0
             for path_idx in range(len(paths_nodes)):
-                subj_idx = paths_nodes[path_idx, subj_col]
-                if subj_idx in edge_index:
-                    for pred_idx, obj_idx, via_inverse, fwd_edge_idx in edge_index[subj_idx]:
-                        new_nodes = paths_nodes[path_idx].copy()
-                        new_nodes[obj_col] = obj_idx
-                        new_nodes_list.append(new_nodes)
-                        new_preds = paths_preds[path_idx].copy()
-                        new_preds[join_idx] = pred_idx
-                        new_preds_list.append(new_preds)
-                        new_via_inv = paths_via_inverse[path_idx].copy()
-                        new_via_inv[join_idx] = via_inverse
-                        new_via_inverse_list.append(new_via_inv)
-                        new_fwd_eidx = paths_fwd_edge_idx[path_idx].copy()
-                        new_fwd_eidx[join_idx] = fwd_edge_idx
-                        new_fwd_edge_idx_list.append(new_fwd_eidx)
+                sidx = int(paths_nodes[path_idx, subj_col])
+                if sidx in edge_index:
+                    output_count += len(edge_index[sidx])
+            if MAX_PATH_LIMIT > 0 and output_count > MAX_PATH_LIMIT:
+                print(f"\n    Warning: Truncating {output_count:,} intermediate paths to {MAX_PATH_LIMIT:,}")
+                output_count = MAX_PATH_LIMIT
 
-            if new_nodes_list:
-                paths_nodes = np.array(new_nodes_list, dtype=np.int32)
-                paths_preds = np.array(new_preds_list, dtype=np.int32)
-                paths_via_inverse = np.array(new_via_inverse_list, dtype=np.bool_)
-                paths_fwd_edge_idx = np.array(new_fwd_edge_idx_list, dtype=np.int32)
-            else:
-                paths_nodes = np.zeros((0, max_nodes), dtype=np.int32)
-                paths_preds = np.zeros((0, num_edges), dtype=np.int32)
-                paths_via_inverse = np.zeros((0, num_edges), dtype=np.bool_)
-                paths_fwd_edge_idx = np.zeros((0, num_edges), dtype=np.int32)
+            # Pass 2: Fill
+            new_nodes = np.empty((output_count, max_nodes), dtype=np.int32)
+            new_preds = np.empty((output_count, num_edges), dtype=np.int32)
+            new_via_inv = np.empty((output_count, num_edges), dtype=np.bool_)
+            new_fwd_eidx = np.empty((output_count, num_edges), dtype=np.int32)
+            w = 0
+            for path_idx in range(len(paths_nodes)):
+                if w >= output_count:
+                    break
+                sidx = int(paths_nodes[path_idx, subj_col])
+                if sidx in edge_index:
+                    for pred_idx, obj_idx, via_inverse, fwd_edge_idx in edge_index[sidx]:
+                        if w >= output_count:
+                            break
+                        new_nodes[w] = paths_nodes[path_idx]
+                        new_nodes[w, obj_col] = obj_idx
+                        new_preds[w] = paths_preds[path_idx]
+                        new_preds[w, join_idx] = pred_idx
+                        new_via_inv[w] = paths_via_inverse[path_idx]
+                        new_via_inv[w, join_idx] = via_inverse
+                        new_fwd_eidx[w] = paths_fwd_edge_idx[path_idx]
+                        new_fwd_eidx[w, join_idx] = fwd_edge_idx
+                        w += 1
+
+            del paths_nodes, paths_preds, paths_via_inverse, paths_fwd_edge_idx
+            paths_nodes = new_nodes
+            paths_preds = new_preds
+            paths_via_inverse = new_via_inv
+            paths_fwd_edge_idx = new_fwd_eidx
 
         elif obj_in_paths:
             # Join on object node, add subject node
             obj_col = qnode_to_col[obj_qnode]
-
-            # Assign column for new subject node
             if subj_qnode not in qnode_to_col:
                 qnode_to_col[subj_qnode] = num_node_cols
                 num_node_cols += 1
             subj_col = qnode_to_col[subj_qnode]
 
-            # Build index: obj_idx -> [(subj_idx, pred_idx, via_inverse, fwd_edge_idx), ...]
             edge_index = defaultdict(list)
             for subj_idx, predicate, obj_idx, via_inverse, fwd_edge_idx in edge_data:
                 edge_index[obj_idx].append((subj_idx, get_pred_idx(predicate), via_inverse, fwd_edge_idx))
 
-            # Find matching paths
-            new_nodes_list = []
-            new_preds_list = []
-            new_via_inverse_list = []
-            new_fwd_edge_idx_list = []
-
+            # Pass 1: Count
+            output_count = 0
             for path_idx in range(len(paths_nodes)):
-                obj_idx = paths_nodes[path_idx, obj_col]
-                if obj_idx in edge_index:
-                    for subj_idx, pred_idx, via_inverse, fwd_edge_idx in edge_index[obj_idx]:
-                        new_nodes = paths_nodes[path_idx].copy()
-                        new_nodes[subj_col] = subj_idx
-                        new_nodes_list.append(new_nodes)
-                        new_preds = paths_preds[path_idx].copy()
-                        new_preds[join_idx] = pred_idx
-                        new_preds_list.append(new_preds)
-                        new_via_inv = paths_via_inverse[path_idx].copy()
-                        new_via_inv[join_idx] = via_inverse
-                        new_via_inverse_list.append(new_via_inv)
-                        new_fwd_eidx = paths_fwd_edge_idx[path_idx].copy()
-                        new_fwd_eidx[join_idx] = fwd_edge_idx
-                        new_fwd_edge_idx_list.append(new_fwd_eidx)
+                oidx = int(paths_nodes[path_idx, obj_col])
+                if oidx in edge_index:
+                    output_count += len(edge_index[oidx])
+            if MAX_PATH_LIMIT > 0 and output_count > MAX_PATH_LIMIT:
+                print(f"\n    Warning: Truncating {output_count:,} intermediate paths to {MAX_PATH_LIMIT:,}")
+                output_count = MAX_PATH_LIMIT
 
-            if new_nodes_list:
-                paths_nodes = np.array(new_nodes_list, dtype=np.int32)
-                paths_preds = np.array(new_preds_list, dtype=np.int32)
-                paths_via_inverse = np.array(new_via_inverse_list, dtype=np.bool_)
-                paths_fwd_edge_idx = np.array(new_fwd_edge_idx_list, dtype=np.int32)
-            else:
-                paths_nodes = np.zeros((0, max_nodes), dtype=np.int32)
-                paths_preds = np.zeros((0, num_edges), dtype=np.int32)
-                paths_via_inverse = np.zeros((0, num_edges), dtype=np.bool_)
-                paths_fwd_edge_idx = np.zeros((0, num_edges), dtype=np.int32)
+            # Pass 2: Fill
+            new_nodes = np.empty((output_count, max_nodes), dtype=np.int32)
+            new_preds = np.empty((output_count, num_edges), dtype=np.int32)
+            new_via_inv = np.empty((output_count, num_edges), dtype=np.bool_)
+            new_fwd_eidx = np.empty((output_count, num_edges), dtype=np.int32)
+            w = 0
+            for path_idx in range(len(paths_nodes)):
+                if w >= output_count:
+                    break
+                oidx = int(paths_nodes[path_idx, obj_col])
+                if oidx in edge_index:
+                    for sidx, pred_idx, via_inverse, fwd_edge_idx in edge_index[oidx]:
+                        if w >= output_count:
+                            break
+                        new_nodes[w] = paths_nodes[path_idx]
+                        new_nodes[w, subj_col] = sidx
+                        new_preds[w] = paths_preds[path_idx]
+                        new_preds[w, join_idx] = pred_idx
+                        new_via_inv[w] = paths_via_inverse[path_idx]
+                        new_via_inv[w, join_idx] = via_inverse
+                        new_fwd_eidx[w] = paths_fwd_edge_idx[path_idx]
+                        new_fwd_eidx[w, join_idx] = fwd_edge_idx
+                        w += 1
+
+            del paths_nodes, paths_preds, paths_via_inverse, paths_fwd_edge_idx
+            paths_nodes = new_nodes
+            paths_preds = new_preds
+            paths_via_inverse = new_via_inv
+            paths_fwd_edge_idx = new_fwd_eidx
 
         else:
             # Neither node in paths - cartesian product
             if verbose:
                 print(f"\n    Warning: Cartesian product needed for edge '{edge_id}'")
 
-            # Assign columns for both nodes
             if subj_qnode not in qnode_to_col:
                 qnode_to_col[subj_qnode] = num_node_cols
                 num_node_cols += 1
@@ -2078,37 +2174,38 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
             subj_col = qnode_to_col[subj_qnode]
             obj_col = qnode_to_col[obj_qnode]
 
-            new_nodes_list = []
-            new_preds_list = []
-            new_via_inverse_list = []
-            new_fwd_edge_idx_list = []
+            output_count = len(paths_nodes) * len(edge_data)
+            if MAX_PATH_LIMIT > 0 and output_count > MAX_PATH_LIMIT:
+                print(f"\n    Warning: Truncating {output_count:,} intermediate paths to {MAX_PATH_LIMIT:,}")
+                output_count = MAX_PATH_LIMIT
 
+            new_nodes = np.empty((output_count, max_nodes), dtype=np.int32)
+            new_preds = np.empty((output_count, num_edges), dtype=np.int32)
+            new_via_inv = np.empty((output_count, num_edges), dtype=np.bool_)
+            new_fwd_eidx = np.empty((output_count, num_edges), dtype=np.int32)
+            w = 0
             for path_idx in range(len(paths_nodes)):
+                if w >= output_count:
+                    break
                 for subj_idx, predicate, obj_idx, via_inverse, fwd_edge_idx in edge_data:
-                    new_nodes = paths_nodes[path_idx].copy()
-                    new_nodes[subj_col] = subj_idx
-                    new_nodes[obj_col] = obj_idx
-                    new_nodes_list.append(new_nodes)
-                    new_preds = paths_preds[path_idx].copy()
-                    new_preds[join_idx] = get_pred_idx(predicate)
-                    new_preds_list.append(new_preds)
-                    new_via_inv = paths_via_inverse[path_idx].copy()
-                    new_via_inv[join_idx] = via_inverse
-                    new_via_inverse_list.append(new_via_inv)
-                    new_fwd_eidx = paths_fwd_edge_idx[path_idx].copy()
-                    new_fwd_eidx[join_idx] = fwd_edge_idx
-                    new_fwd_edge_idx_list.append(new_fwd_eidx)
+                    if w >= output_count:
+                        break
+                    new_nodes[w] = paths_nodes[path_idx]
+                    new_nodes[w, subj_col] = subj_idx
+                    new_nodes[w, obj_col] = obj_idx
+                    new_preds[w] = paths_preds[path_idx]
+                    new_preds[w, join_idx] = get_pred_idx(predicate)
+                    new_via_inv[w] = paths_via_inverse[path_idx]
+                    new_via_inv[w, join_idx] = via_inverse
+                    new_fwd_eidx[w] = paths_fwd_edge_idx[path_idx]
+                    new_fwd_eidx[w, join_idx] = fwd_edge_idx
+                    w += 1
 
-            if new_nodes_list:
-                paths_nodes = np.array(new_nodes_list, dtype=np.int32)
-                paths_preds = np.array(new_preds_list, dtype=np.int32)
-                paths_via_inverse = np.array(new_via_inverse_list, dtype=np.bool_)
-                paths_fwd_edge_idx = np.array(new_fwd_edge_idx_list, dtype=np.int32)
-            else:
-                paths_nodes = np.zeros((0, max_nodes), dtype=np.int32)
-                paths_preds = np.zeros((0, num_edges), dtype=np.int32)
-                paths_via_inverse = np.zeros((0, num_edges), dtype=np.bool_)
-                paths_fwd_edge_idx = np.zeros((0, num_edges), dtype=np.int32)
+            del paths_nodes, paths_preds, paths_via_inverse, paths_fwd_edge_idx
+            paths_nodes = new_nodes
+            paths_preds = new_preds
+            paths_via_inverse = new_via_inv
+            paths_fwd_edge_idx = new_fwd_eidx
 
         t_join_end = time.perf_counter()
         if verbose:
@@ -2125,33 +2222,27 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
 
     num_paths = len(paths_nodes)
     if num_paths == 0:
-        return []
+        return None
 
-    # Check if we exceed the large result threshold — if so, skip expensive
-    # per-edge property lookups (edge attributes, sources, qualifiers, LMDB
-    # publications/attributes) and only include predicates.
+    # Check if we exceed the large result threshold
     lightweight = num_paths > LARGE_RESULT_PATH_THRESHOLD
 
-    # Build node property cache
     if verbose:
         if lightweight:
             print(
-                f"  Enriching {num_paths:,} paths (lightweight mode: "
+                f"  {num_paths:,} paths (lightweight mode: "
                 f">{LARGE_RESULT_PATH_THRESHOLD:,} paths, skipping edge attributes)..."
             )
         else:
-            print(f"  Enriching {num_paths:,} paths...")
+            print(f"  {num_paths:,} paths")
 
+    # Build node property cache
     t_cache_start = time.perf_counter()
-
-    # Get unique node indices from numpy array (much faster than Python loops)
     unique_node_indices = np.unique(paths_nodes[:, :num_node_cols])
 
     node_cache = {}
     for node_idx in unique_node_indices:
-        # Start with all stored node properties
         node_props = graph.get_all_node_properties(node_idx).copy()
-        # Ensure required fields are present
         node_props["id"] = graph.get_node_id(node_idx)
         if "categories" not in node_props:
             node_props["categories"] = []
@@ -2166,99 +2257,25 @@ def _reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
             f"({t_cache_end - t_cache_start:.2f}s)"
         )
 
-    # Convert numpy arrays to enriched path format
-    t_enrich_start = time.perf_counter()
-
-    # Reverse mappings for output
+    # Build reverse mappings
     col_to_qnode = {v: k for k, v in qnode_to_col.items()}
     col_to_qedge = {v: k for k, v in qedge_to_col.items()}
 
-    # Disable GC during enrichment to prevent stochastic pauses
-    gc_was_enabled = gc.isenabled()
-    gc.disable()
-
-    try:
-        enriched_paths = []
-        for path_idx in range(num_paths):
-            nodes = {}
-            for col in range(num_node_cols):
-                qnode_id = col_to_qnode[col]
-                node_idx = paths_nodes[path_idx, col]
-                nodes[qnode_id] = node_cache[node_idx]
-
-            edges = {}
-            for col in range(num_edges):
-                qedge_id = col_to_qedge[col]
-                pred_idx = paths_preds[path_idx, col]
-                predicate = idx_to_predicate[pred_idx]
-
-                # Get subject and object from query graph structure
-                edge_def = query_graph["edges"][qedge_id]
-                subj_qnode = edge_def["subject"]
-                obj_qnode = edge_def["object"]
-                subj_col = qnode_to_col[subj_qnode]
-                obj_col = qnode_to_col[obj_qnode]
-
-                # Get query-aligned node indices
-                query_subj_idx = paths_nodes[path_idx, subj_col]
-                query_obj_idx = paths_nodes[path_idx, obj_col]
-
-                # Check if this edge was found via inverse lookup
-                # If so, the actual edge in the graph has swapped direction
-                is_inverse = paths_via_inverse[path_idx, col]
-
-                if is_inverse:
-                    # Actual edge: query_obj -> query_subj
-                    actual_subj_idx = query_obj_idx
-                    actual_obj_idx = query_subj_idx
-                else:
-                    # Actual edge: query_subj -> query_obj
-                    actual_subj_idx = query_subj_idx
-                    actual_obj_idx = query_obj_idx
-
-                fwd_eidx = int(paths_fwd_edge_idx[path_idx, col])
-
-                if lightweight:
-                    # Only include predicate and structural info — skip
-                    # edge attribute lookups (sources, qualifiers, LMDB data)
-                    edge_props = {
-                        "predicate": predicate,
-                        "subject": node_cache[actual_subj_idx]["id"],
-                        "object": node_cache[actual_obj_idx]["id"],
-                    }
-                else:
-                    # O(1) property lookup using forward edge index
-                    if fwd_eidx < 0:
-                        # Synthetic edge (e.g. subclass self-match) with no
-                        # real CSR position — build minimal props.
-                        edge_props = {}
-                    else:
-                        edge_props = graph.get_edge_properties_by_index(fwd_eidx).copy()
-
-                    # Ensure required fields are present with actual edge direction
-                    edge_props["predicate"] = predicate
-                    edge_props["subject"] = node_cache[actual_subj_idx]["id"]
-                    edge_props["object"] = node_cache[actual_obj_idx]["id"]
-
-                # Attach the original edge ID (if available) for use
-                # during knowledge graph construction.
-                if fwd_eidx >= 0:
-                    orig_id = graph.get_edge_id(fwd_eidx)
-                    if orig_id is not None:
-                        edge_props["_edge_id"] = orig_id
-
-                edges[qedge_id] = edge_props
-
-            enriched_paths.append({"nodes": nodes, "edges": edges})
-    finally:
-        if gc_was_enabled:
-            gc.enable()
-
-    t_enrich_end = time.perf_counter()
-    if verbose:
-        print(f"  Enrichment took {t_enrich_end - t_enrich_start:.2f}s")
-
-    return enriched_paths
+    return PathArrays(
+        paths_nodes=paths_nodes,
+        paths_preds=paths_preds,
+        paths_via_inverse=paths_via_inverse,
+        paths_fwd_edge_idx=paths_fwd_edge_idx,
+        node_cache=node_cache,
+        idx_to_predicate=idx_to_predicate,
+        qnode_to_col=qnode_to_col,
+        qedge_to_col=qedge_to_col,
+        col_to_qnode=col_to_qnode,
+        col_to_qedge=col_to_qedge,
+        num_node_cols=num_node_cols,
+        num_edges=num_edges,
+        lightweight=lightweight,
+    )
 
 
 def _compute_join_order(query_graph, edge_results, edge_order, verbose):
