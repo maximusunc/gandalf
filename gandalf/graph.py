@@ -528,6 +528,45 @@ class CSRGraph:
 
         return result
 
+    def neighbors_filtered_by_targets(
+        self, node_idx: int, target_set: set, predicate_filter: Optional[set] = None
+    ):
+        """Get outgoing neighbors that are in *target_set*, with properties.
+
+        Unlike ``neighbors_with_properties``, this skips property lookups
+        entirely for edges whose target is not in ``target_set``.  When only
+        a small fraction of neighbors match, this avoids millions of
+        unnecessary dict allocations and dramatically reduces memory pressure.
+
+        Args:
+            node_idx: Source node index.
+            target_set: Set of target node indices to keep.
+            predicate_filter: Optional set of allowed predicate strings.
+
+        Returns:
+            List of (target_idx, predicate_str, edge_props, fwd_edge_idx) tuples
+            for edges whose target is in *target_set*.
+        """
+        start = int(self.fwd_offsets[node_idx])
+        end = int(self.fwd_offsets[node_idx + 1])
+
+        result = []
+        for pos in range(start, end):
+            target = int(self.fwd_targets[pos])
+            if target not in target_set:
+                continue
+
+            pred_id = int(self.fwd_predicates[pos])
+            pred_str = self.id_to_predicate[pred_id]
+
+            if predicate_filter is not None and pred_str not in predicate_filter:
+                continue
+
+            props = self.edge_properties._get_props(pos)
+            result.append((target, pred_str, props, pos))
+
+        return result
+
     def incoming_neighbors_with_properties(
         self, node_idx, predicate_filter: Optional[list] = None
     ):

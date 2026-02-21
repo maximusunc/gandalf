@@ -1,5 +1,6 @@
 """GANDALF."""
 
+import gc
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -62,6 +63,15 @@ async def lifespan(app: FastAPI):
     GRAPH = load_graph(GRAPH_PATH, GRAPH_FORMAT)
     print("Initializing Biolink Model Toolkit...")
     BMT = Toolkit()
+
+    # Freeze all objects allocated so far (graph + BMT) into a permanent
+    # generation that the cyclic GC will never scan.  This makes Gen 2
+    # collections cheap because they skip the large CSR arrays.
+    gc.collect()
+    gc.freeze()
+    # Raise thresholds so Gen 2 collections are less frequent even for
+    # the (now-small) unfrozen query-time object set.
+    gc.set_threshold(50_000, 50, 50)
     print("Server ready!")
     yield
     GRAPH = None
