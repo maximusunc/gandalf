@@ -1043,7 +1043,6 @@ def lookup(graph, query: dict, bmt=None, verbose=True, subclass=True, subclass_d
         gc_monitor.stop()
         if gc_was_enabled_at_start:
             gc.enable()
-            gc.collect()
 
 
 def _lookup_inner(graph, query, bmt, verbose, subclass, subclass_depth,
