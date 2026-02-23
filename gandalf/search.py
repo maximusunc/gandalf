@@ -1431,6 +1431,7 @@ def _lookup_inner(graph, query, bmt, verbose, subclass, subclass_depth,
                         edge_bindings_by_qedge[qedge_id].append(edge_props)
 
             # Add edges to knowledge graph and result bindings
+            kg_edges = response["message"]["knowledge_graph"]["edges"]
             for edge_id, edges in edge_bindings_by_qedge.items():
                 if edge_id in subclass_qedges:
                     continue
@@ -1439,7 +1440,20 @@ def _lookup_inner(graph, query, bmt, verbose, subclass, subclass_depth,
 
                 for edge in edges:
                     edge_kg_id = edge.pop("_edge_id", None) or str(uuid.uuid4())
-                    response["message"]["knowledge_graph"]["edges"][edge_kg_id] = edge
+                    # Disambiguate duplicate source IDs that map to
+                    # different physical edges (different endpoints or
+                    # predicate).  Without this, the second edge
+                    # silently overwrites the first in the shared KG
+                    # dict, leaving the earlier result's edge_binding
+                    # pointing at the wrong edge — and disconnected.
+                    existing = kg_edges.get(edge_kg_id)
+                    if existing is not None and (
+                        existing.get("subject") != edge.get("subject")
+                        or existing.get("object") != edge.get("object")
+                        or existing.get("predicate") != edge.get("predicate")
+                    ):
+                        edge_kg_id = f"{edge_kg_id}_{uuid.uuid4().hex[:8]}"
+                    kg_edges[edge_kg_id] = edge
 
                     attached = qedge_attached_subclass.get(edge_id, [])
                     if attached:
@@ -1452,7 +1466,14 @@ def _lookup_inner(graph, query, bmt, verbose, subclass, subclass_depth,
                                 if sc_edge["subject"] == sc_edge["object"]:
                                     continue
                                 sc_kg_id = sc_edge.get("_edge_id") or str(uuid.uuid4())
-                                response["message"]["knowledge_graph"]["edges"][sc_kg_id] = sc_edge
+                                existing_sc = kg_edges.get(sc_kg_id)
+                                if existing_sc is not None and (
+                                    existing_sc.get("subject") != sc_edge.get("subject")
+                                    or existing_sc.get("object") != sc_edge.get("object")
+                                    or existing_sc.get("predicate") != sc_edge.get("predicate")
+                                ):
+                                    sc_kg_id = f"{sc_kg_id}_{uuid.uuid4().hex[:8]}"
+                                kg_edges[sc_kg_id] = sc_edge
                                 subclass_edge_kg_ids.append(sc_kg_id)
 
                             # Get superclass node ID for endpoint override
