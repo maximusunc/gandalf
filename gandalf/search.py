@@ -1438,7 +1438,7 @@ def _lookup_inner(graph, query, bmt, verbose, subclass, subclass_depth,
                 result["analyses"][0]["edge_bindings"][edge_id] = []
 
                 for edge in edges:
-                    edge_kg_id = edge.pop("_edge_id", None) or str(uuid.uuid4())[:8]
+                    edge_kg_id = edge.pop("_edge_id", None) or str(uuid.uuid4())
                     response["message"]["knowledge_graph"]["edges"][edge_kg_id] = edge
 
                     attached = qedge_attached_subclass.get(edge_id, [])
@@ -1451,7 +1451,7 @@ def _lookup_inner(graph, query, bmt, verbose, subclass, subclass_depth,
                             for sc_edge in sc_edges:
                                 if sc_edge["subject"] == sc_edge["object"]:
                                     continue
-                                sc_kg_id = sc_edge.get("_edge_id") or str(uuid.uuid4())[:8]
+                                sc_kg_id = sc_edge.get("_edge_id") or str(uuid.uuid4())
                                 response["message"]["knowledge_graph"]["edges"][sc_kg_id] = sc_edge
                                 subclass_edge_kg_ids.append(sc_kg_id)
 
