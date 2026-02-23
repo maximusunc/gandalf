@@ -1448,8 +1448,16 @@ def _lookup_inner(graph, query, bmt, verbose, subclass, subclass_depth,
 
                         for (which_end, sc_edge_id, sc_qnode_id) in attached:
                             sc_edges = edge_bindings_by_qedge.get(sc_edge_id, [])
+                            # Only attach subclass edges whose child node
+                            # matches this main edge's endpoint.  Without this
+                            # filter, *all* subclass edges in the result group
+                            # are attached to every main edge, producing
+                            # disconnected nodes in auxiliary graphs.
+                            expected_child = edge[which_end]
                             for sc_edge in sc_edges:
                                 if sc_edge["subject"] == sc_edge["object"]:
+                                    continue
+                                if sc_edge["subject"] != expected_child:
                                     continue
                                 sc_kg_id = sc_edge.get("_edge_id") or str(uuid.uuid4())[:8]
                                 response["message"]["knowledge_graph"]["edges"][sc_kg_id] = sc_edge
