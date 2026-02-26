@@ -22,6 +22,39 @@ import msgpack
 _DEFAULT_MAP_SIZE = 50 * 1024 * 1024 * 1024
 
 
+def _estimate_map_size(num_edges):
+    """Estimate LMDB map size based on edge count.
+
+    Uses ~1 KB per edge as a conservative estimate, with a 50 GB minimum.
+    This reserves virtual address space only — physical memory is used on
+    demand via mmap, so over-estimating is cheap on 64-bit systems.
+    """
+    estimated = num_edges * 1024
+    return max(_DEFAULT_MAP_SIZE, estimated)
+
+
+def _put_with_resize(env, txn, key, val):
+    """Put key/value into LMDB, auto-resizing the map if full.
+
+    On MapFullError the current transaction is committed (preserving all
+    prior writes), the map is doubled, and the failed put is retried in a
+    fresh transaction.
+
+    Returns the (possibly new) write transaction.
+    """
+    try:
+        txn.put(key, val)
+        return txn
+    except lmdb.MapFullError:
+        txn.commit()
+        new_size = env.info()["map_size"] * 2
+        env.set_mapsize(new_size)
+        print(f"    LMDB: map full, resized to {new_size / (1024**3):.0f} GB")
+        txn = env.begin(write=True)
+        txn.put(key, val)
+        return txn
+
+
 def _encode_key(edge_idx: int) -> bytes:
     """Encode edge index as 4-byte big-endian for correct LMDB sort order."""
     return struct.pack(">I", edge_idx)
@@ -115,7 +148,7 @@ class LMDBPropertyStore:
 
         env = lmdb.open(
             str(db_path),
-            map_size=_DEFAULT_MAP_SIZE,
+            map_size=_estimate_map_size(num_edges),
             readonly=False,
             max_dbs=0,
             readahead=False,
@@ -127,7 +160,7 @@ class LMDBPropertyStore:
             for edge_idx, props in edge_iterator:
                 key = _encode_key(edge_idx)
                 val = msgpack.packb(props, use_bin_type=True)
-                txn.put(key, val)
+                txn = _put_with_resize(env, txn, key, val)
                 count += 1
 
                 if count % commit_every == 0:
@@ -172,16 +205,17 @@ class LMDBPropertyStore:
             shutil.rmtree(db_path)
         db_path.mkdir(parents=True, exist_ok=True)
 
+        map_size = _estimate_map_size(num_edges)
         temp_env = lmdb.open(
             str(temp_db_path),
             readonly=True,
             lock=False,
-            map_size=_DEFAULT_MAP_SIZE,
+            map_size=map_size,
             readahead=False,
         )
         final_env = lmdb.open(
             str(db_path),
-            map_size=_DEFAULT_MAP_SIZE,
+            map_size=map_size,
             readonly=False,
             max_dbs=0,
             readahead=False,
@@ -199,7 +233,9 @@ class LMDBPropertyStore:
                 val = temp_txn.get(temp_key)
 
                 final_key = _encode_key(csr_pos)
-                final_txn.put(final_key, bytes(val))
+                final_txn = _put_with_resize(
+                    final_env, final_txn, final_key, bytes(val)
+                )
 
                 if (csr_pos + 1) % commit_every == 0:
                     final_txn.commit()
