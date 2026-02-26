@@ -232,6 +232,10 @@ class LMDBPropertyStore:
                 temp_key = _encode_key(original_idx)
                 val = temp_txn.get(temp_key)
 
+                # Skip edges with no cold-path data (empty pubs + attrs).
+                if val is None:
+                    continue
+
                 final_key = _encode_key(csr_pos)
                 final_txn = _put_with_resize(
                     final_env, final_txn, final_key, bytes(val)

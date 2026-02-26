@@ -241,13 +241,15 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path, temp_dir=None):
                 prop_builder.add(i, {"sources": sources, "qualifiers": qualifiers})
 
                 # Cold path: write publications + attributes to temp LMDB
-                detail = {
-                    "publications": publications,
-                    "attributes": attributes,
-                }
-                key = _encode_key(i)
-                val = msgpack.packb(detail, use_bin_type=True)
-                txn = _put_with_resize(temp_env, txn, key, val)
+                # Skip edges with no cold-path data to save disk space.
+                if publications or attributes:
+                    detail = {
+                        "publications": publications,
+                        "attributes": attributes,
+                    }
+                    key = _encode_key(i)
+                    val = msgpack.packb(detail, use_bin_type=True)
+                    txn = _put_with_resize(temp_env, txn, key, val)
 
                 if (i + 1) % 50_000 == 0:
                     txn.commit()
