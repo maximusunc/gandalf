@@ -22,7 +22,7 @@ import msgpack
 import numpy as np
 
 from gandalf.graph import CSRGraph, EdgePropertyStoreBuilder
-from gandalf.lmdb_store import LMDBPropertyStore, _encode_key, _estimate_map_size, _put_with_resize
+from gandalf.lmdb_store import LMDBPropertyStore, _INITIAL_WRITE_MAP_SIZE, _encode_key, _put_with_resize
 
 import lmdb
 
@@ -211,7 +211,7 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path, temp_dir=None):
 
     temp_env = lmdb.open(
         str(temp_lmdb_path),
-        map_size=_estimate_map_size(edge_count),
+        map_size=_INITIAL_WRITE_MAP_SIZE,
         readonly=False,
         max_dbs=0,
         readahead=False,

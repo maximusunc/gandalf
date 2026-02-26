@@ -11,26 +11,20 @@ duplication.
 
 import shutil
 import struct
-import tempfile
 from pathlib import Path
 
 import lmdb
 import msgpack
 
 
-# 50 GB virtual address space (not allocated until used)
-_DEFAULT_MAP_SIZE = 50 * 1024 * 1024 * 1024
+# Read-only map size — large enough to cover any pre-built database.
+# Only virtual address space; no physical allocation until pages are touched.
+_DEFAULT_READ_MAP_SIZE = 256 * 1024 * 1024 * 1024   # 256 GB
 
-
-def _estimate_map_size(num_edges):
-    """Estimate LMDB map size based on edge count.
-
-    Uses ~1 KB per edge as a conservative estimate, with a 50 GB minimum.
-    This reserves virtual address space only — physical memory is used on
-    demand via mmap, so over-estimating is cheap on 64-bit systems.
-    """
-    estimated = num_edges * 1024
-    return max(_DEFAULT_MAP_SIZE, estimated)
+# Initial write map size — intentionally small so the data.mdb file
+# starts small on disk.  _put_with_resize() doubles it on MapFullError,
+# so the file grows only as real data demands.
+_INITIAL_WRITE_MAP_SIZE = 4 * 1024 * 1024 * 1024    # 4 GB
 
 
 def _put_with_resize(env, txn, key, val):
@@ -82,7 +76,7 @@ class LMDBPropertyStore:
             str(self._path),
             readonly=readonly,
             max_dbs=0,
-            map_size=_DEFAULT_MAP_SIZE,
+            map_size=_DEFAULT_READ_MAP_SIZE,
             readahead=False,  # We do point + small range reads
             lock=not readonly,  # No lock file needed for read-only
         )
@@ -148,7 +142,7 @@ class LMDBPropertyStore:
 
         env = lmdb.open(
             str(db_path),
-            map_size=_estimate_map_size(num_edges),
+            map_size=_INITIAL_WRITE_MAP_SIZE,
             readonly=False,
             max_dbs=0,
             readahead=False,
@@ -205,17 +199,16 @@ class LMDBPropertyStore:
             shutil.rmtree(db_path)
         db_path.mkdir(parents=True, exist_ok=True)
 
-        map_size = _estimate_map_size(num_edges)
         temp_env = lmdb.open(
             str(temp_db_path),
             readonly=True,
             lock=False,
-            map_size=map_size,
+            map_size=_DEFAULT_READ_MAP_SIZE,
             readahead=False,
         )
         final_env = lmdb.open(
             str(db_path),
-            map_size=map_size,
+            map_size=_INITIAL_WRITE_MAP_SIZE,
             readonly=False,
             max_dbs=0,
             readahead=False,
