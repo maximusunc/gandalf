@@ -470,11 +470,37 @@ def _build_response(graph, response, path_data, query_graph, num_paths,
 
             result["analyses"][0]["edge_bindings"][edge_id] = []
 
+            attached = qedge_attached_subclass.get(edge_id, [])
+
+            # When a direct edge already connects the originally-queried
+            # (superclass) nodes, drop subclass-expanded edges so that
+            # superfluous subclass_of edges and child nodes do not
+            # appear in the result.
+            if attached:
+                sc_ids = {}
+                for (which_end, _, sc_qnid) in attached:
+                    if sc_qnid in qnode_to_col:
+                        sc_col_idx = qnode_to_col[sc_qnid]
+                        sc_nidx = int(pa_nodes[first_idx, sc_col_idx])
+                        sc_ids[which_end] = node_cache[sc_nidx]["id"]
+
+                direct_edges = []
+                for e in edges:
+                    is_direct = all(
+                        e.get("_query_subject" if end == "subject" else "_query_object") == sc_id
+                        for end, sc_id in sc_ids.items()
+                    )
+                    if is_direct:
+                        direct_edges.append(e)
+
+                if direct_edges:
+                    edges = direct_edges
+                    attached = []
+
             for edge in edges:
                 edge_kg_id = edge.pop("_edge_id", None) or str(uuid.uuid4())[:8]
                 response["message"]["knowledge_graph"]["edges"][edge_kg_id] = edge
 
-                attached = qedge_attached_subclass.get(edge_id, [])
                 if attached:
                     subclass_edge_kg_ids = []
                     superclass_node_overrides = {}
