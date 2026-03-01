@@ -11,15 +11,48 @@ duplication.
 
 import shutil
 import struct
-import tempfile
 from pathlib import Path
 
 import lmdb
 import msgpack
 
 
-# 50 GB virtual address space (not allocated until used)
-_DEFAULT_MAP_SIZE = 50 * 1024 * 1024 * 1024
+# Read-only map size — large enough to cover any pre-built database.
+# Only virtual address space; no physical allocation until pages are touched.
+_DEFAULT_READ_MAP_SIZE = 256 * 1024 * 1024 * 1024   # 256 GB
+
+# Initial write map size — intentionally small so the data.mdb file
+# starts small on disk.  _put_with_resize() doubles it on MapFullError,
+# so the file grows only as real data demands.
+_INITIAL_WRITE_MAP_SIZE = 4 * 1024 * 1024 * 1024    # 4 GB
+
+
+def _put_with_resize(env, txn, key, val, pending):
+    """Put key/value into LMDB, auto-resizing the map if full.
+
+    After a failed put(), LMDB marks the transaction as invalid — it must
+    be aborted, not committed.  So we abort, double the map, and replay
+    all writes since the last commit (tracked in *pending*).
+
+    Callers must clear *pending* after every successful commit.
+
+    Returns the (possibly new) write transaction.
+    """
+    try:
+        txn.put(key, val)
+        pending.append((key, val))
+        return txn
+    except lmdb.MapFullError:
+        txn.abort()
+        new_size = env.info()["map_size"] * 2
+        env.set_mapsize(new_size)
+        print(f"    LMDB: map full, resized to {new_size / (1024**3):.0f} GB")
+        txn = env.begin(write=True)
+        for k, v in pending:
+            txn.put(k, v)
+        txn.put(key, val)
+        pending.append((key, val))
+        return txn
 
 
 def _encode_key(edge_idx: int) -> bytes:
@@ -49,7 +82,7 @@ class LMDBPropertyStore:
             str(self._path),
             readonly=readonly,
             max_dbs=0,
-            map_size=_DEFAULT_MAP_SIZE,
+            map_size=_DEFAULT_READ_MAP_SIZE,
             readahead=False,  # We do point + small range reads
             lock=not readonly,  # No lock file needed for read-only
         )
@@ -115,23 +148,25 @@ class LMDBPropertyStore:
 
         env = lmdb.open(
             str(db_path),
-            map_size=_DEFAULT_MAP_SIZE,
+            map_size=_INITIAL_WRITE_MAP_SIZE,
             readonly=False,
             max_dbs=0,
             readahead=False,
         )
 
         txn = env.begin(write=True)
+        pending = []
         count = 0
         try:
             for edge_idx, props in edge_iterator:
                 key = _encode_key(edge_idx)
                 val = msgpack.packb(props, use_bin_type=True)
-                txn.put(key, val)
+                txn = _put_with_resize(env, txn, key, val, pending)
                 count += 1
 
                 if count % commit_every == 0:
                     txn.commit()
+                    pending.clear()
                     if count % 1_000_000 == 0:
                         print(f"    LMDB: wrote {count:,}/{num_edges:,} edges...")
                     txn = env.begin(write=True)
@@ -154,8 +189,8 @@ class LMDBPropertyStore:
         Reads from temp_db_path using sort_permutation to reorder, writes
         to db_path with sequential keys 0..num_edges-1.
 
-        This is the expensive build-time operation that ensures query-time
-        keys match CSR edge indices with zero indirection.
+        Uses an inverse permutation + sequential cursor scan so reads are
+        sequential (fast) instead of random B-tree lookups (slow).
 
         Args:
             db_path: Path for the final LMDB directory.
@@ -167,44 +202,58 @@ class LMDBPropertyStore:
         Returns:
             LMDBPropertyStore opened in read-only mode.
         """
+        import numpy as np
+
         db_path = Path(db_path)
         if db_path.exists():
             shutil.rmtree(db_path)
         db_path.mkdir(parents=True, exist_ok=True)
 
+        # Inverse mapping: original_line_idx → csr_pos.
+        # This lets us scan the temp LMDB sequentially (by original index)
+        # and compute the correct CSR key for each entry in O(1).
+        inv_perm = np.empty(num_edges, dtype=np.int64)
+        inv_perm[sort_permutation] = np.arange(num_edges, dtype=np.int64)
+
         temp_env = lmdb.open(
             str(temp_db_path),
             readonly=True,
             lock=False,
-            map_size=_DEFAULT_MAP_SIZE,
-            readahead=False,
+            map_size=_DEFAULT_READ_MAP_SIZE,
+            readahead=True,  # Sequential scan benefits from readahead
         )
         final_env = lmdb.open(
             str(db_path),
-            map_size=_DEFAULT_MAP_SIZE,
+            map_size=_INITIAL_WRITE_MAP_SIZE,
             readonly=False,
             max_dbs=0,
             readahead=False,
         )
 
-        print(f"    LMDB: rewriting {num_edges:,} edges in CSR-sorted order...")
+        print(f"    LMDB: rewriting edges in CSR-sorted order (sequential scan)...")
 
         temp_txn = temp_env.begin(buffers=True)
         final_txn = final_env.begin(write=True)
+        pending = []
 
+        count = 0
         try:
-            for csr_pos in range(num_edges):
-                original_idx = int(sort_permutation[csr_pos])
-                temp_key = _encode_key(original_idx)
-                val = temp_txn.get(temp_key)
+            cursor = temp_txn.cursor()
+            for temp_key, val in cursor:
+                original_idx = struct.unpack(">I", bytes(temp_key))[0]
+                csr_pos = int(inv_perm[original_idx])
 
                 final_key = _encode_key(csr_pos)
-                final_txn.put(final_key, bytes(val))
+                final_txn = _put_with_resize(
+                    final_env, final_txn, final_key, bytes(val), pending
+                )
+                count += 1
 
-                if (csr_pos + 1) % commit_every == 0:
+                if count % commit_every == 0:
                     final_txn.commit()
-                    if (csr_pos + 1) % 1_000_000 == 0:
-                        print(f"      {csr_pos + 1:,}/{num_edges:,} edges rewritten...")
+                    pending.clear()
+                    if count % 500_000 == 0:
+                        print(f"      {count:>12,} edges rewritten")
                     final_txn = final_env.begin(write=True)
 
             final_txn.commit()
@@ -216,5 +265,5 @@ class LMDBPropertyStore:
             temp_env.close()
             final_env.close()
 
-        print(f"    LMDB: final store written to {db_path}")
+        print(f"    LMDB: final store written — {count:,} edges to {db_path}")
         return LMDBPropertyStore(db_path, readonly=True)
