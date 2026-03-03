@@ -275,6 +275,7 @@ def _build_response(graph, response, path_data, query_graph, num_paths,
     pa_via_inv = path_data.paths_via_inverse
     pa_fwd_eidx = path_data.paths_fwd_edge_idx
     node_cache = path_data.node_cache
+    node_id_cache = path_data.node_id_cache
     idx_to_predicate = path_data.idx_to_predicate
     qnode_to_col = path_data.qnode_to_col
     qedge_to_col = path_data.qedge_to_col
@@ -326,13 +327,13 @@ def _build_response(graph, response, path_data, query_graph, num_paths,
             if qnode_id in superclass_qnodes:
                 continue
             node_idx = int(pa_nodes[path_idx, col])
-            bound_id = node_cache[node_idx]["id"]
+            bound_id = node_id_cache[node_idx]
             if qnode_id in qnode_to_superclass:
                 sc_qnode = qnode_to_superclass[qnode_id]
                 if sc_qnode in qnode_to_col:
                     sc_col = qnode_to_col[sc_qnode]
                     sc_node_idx = int(pa_nodes[path_idx, sc_col])
-                    sc_id = node_cache[sc_node_idx]["id"]
+                    sc_id = node_id_cache[sc_node_idx]
                     if sc_id != bound_id:
                         bound_id = sc_id
             key_pairs.append((qnode_id, bound_id))
@@ -365,18 +366,20 @@ def _build_response(graph, response, path_data, query_graph, num_paths,
 
             node_idx = int(pa_nodes[first_idx, col])
             node = node_cache[node_idx]
-            response["message"]["knowledge_graph"]["nodes"][node["id"]] = node
+            node_id = node_id_cache[node_idx]
+            response["message"]["knowledge_graph"]["nodes"][node_id] = node
 
-            bound_id = node["id"]
+            bound_id = node_id
             if qnode_id in qnode_to_superclass:
                 sc_qnode = qnode_to_superclass[qnode_id]
                 if sc_qnode in qnode_to_col:
                     sc_col = qnode_to_col[sc_qnode]
                     sc_node_idx = int(pa_nodes[first_idx, sc_col])
                     sc_node = node_cache[sc_node_idx]
-                    if sc_node["id"] != node["id"]:
-                        bound_id = sc_node["id"]
-                        response["message"]["knowledge_graph"]["nodes"][sc_node["id"]] = sc_node
+                    sc_node_id = node_id_cache[sc_node_idx]
+                    if sc_node_id != node_id:
+                        bound_id = sc_node_id
+                        response["message"]["knowledge_graph"]["nodes"][sc_node_id] = sc_node
 
             result["node_bindings"][qnode_id] = [
                 {"id": bound_id, "attributes": []},
@@ -408,8 +411,8 @@ def _build_response(graph, response, path_data, query_graph, num_paths,
                 else:
                     actual_subj_idx, actual_obj_idx = query_subj_idx, query_obj_idx
 
-                subj_id = node_cache[actual_subj_idx]["id"]
-                obj_id = node_cache[actual_obj_idx]["id"]
+                subj_id = node_id_cache[actual_subj_idx]
+                obj_id = node_id_cache[actual_obj_idx]
 
                 # Compute dedup key
                 if lightweight or fwd_eidx < 0:
@@ -458,8 +461,8 @@ def _build_response(graph, response, path_data, query_graph, num_paths,
                     # inferred composite edges.  edge["subject"]/["object"]
                     # follow stored direction (swapped for inverse edges),
                     # but superclass_node_overrides uses query direction.
-                    edge_props["_query_subject"] = node_cache[query_subj_idx]["id"]
-                    edge_props["_query_object"] = node_cache[query_obj_idx]["id"]
+                    edge_props["_query_subject"] = node_id_cache[query_subj_idx]
+                    edge_props["_query_object"] = node_id_cache[query_obj_idx]
 
                     edge_bindings_by_qedge[qedge_id].append(edge_props)
 
@@ -482,7 +485,7 @@ def _build_response(graph, response, path_data, query_graph, num_paths,
                     if sc_qnid in qnode_to_col:
                         sc_col_idx = qnode_to_col[sc_qnid]
                         sc_nidx = int(pa_nodes[first_idx, sc_col_idx])
-                        sc_ids[which_end] = node_cache[sc_nidx]["id"]
+                        sc_ids[which_end] = node_id_cache[sc_nidx]
 
                 direct_edges = []
                 for e in edges:
@@ -527,7 +530,7 @@ def _build_response(graph, response, path_data, query_graph, num_paths,
                         if sc_qnode_id in qnode_to_col:
                             sc_col = qnode_to_col[sc_qnode_id]
                             sc_node_idx = int(pa_nodes[first_idx, sc_col])
-                            superclass_node_overrides[which_end] = node_cache[sc_node_idx]["id"]
+                            superclass_node_overrides[which_end] = node_id_cache[sc_node_idx]
 
                     if subclass_edge_kg_ids:
                         composite_edge_ids = [edge_kg_id] + subclass_edge_kg_ids

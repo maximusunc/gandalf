@@ -219,14 +219,15 @@ def reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
     unique_node_indices = np.unique(paths_nodes[:, :num_node_cols])
 
     node_cache = {}
+    node_id_cache = {}
     for node_idx in unique_node_indices:
         node_props = graph.get_all_node_properties(node_idx).copy()
-        node_props["id"] = graph.get_node_id(node_idx)
         if "categories" not in node_props:
             node_props["categories"] = []
         if "attributes" not in node_props:
             node_props["attributes"] = []
         node_cache[node_idx] = node_props
+        node_id_cache[node_idx] = graph.get_node_id(node_idx)
 
     t_cache_end = time.perf_counter()
     if verbose:
@@ -245,6 +246,7 @@ def reconstruct_paths(graph, query_graph, edge_results, edge_order, verbose,
         paths_via_inverse=paths_via_inverse,
         paths_fwd_edge_idx=paths_fwd_edge_idx,
         node_cache=node_cache,
+        node_id_cache=node_id_cache,
         idx_to_predicate=idx_to_predicate,
         qnode_to_col=qnode_to_col,
         qedge_to_col=qedge_to_col,
