@@ -66,22 +66,14 @@ class TestSubclassInverseEdgeDirection:
     edge is found via inverse lookup combined with subclass expansion."""
 
     def test_inverse_edge_with_subclass_on_subject(self, graph, bmt):
-        """Inverse edge + subclass on subject should produce correct composite.
+        """Inverse edge + subclass on subject: direct edge takes priority.
 
         Query: n0 (disease, pinned MONDO:0005015) -> n1 (chemical, pinned CHEBI:6801)
         predicate: related_to (wildcard, matches all predicates in both directions)
 
-        Stored edge: CHEBI:6801 --treats--> MONDO:0005148 (chemical -> disease)
-        Query direction: disease -> chemical (opposite of stored)
-        This edge is found via inverse lookup.
-
-        With subclass on n0, MONDO:0005015 expands to include MONDO:0005148.
-        The composite/inferred edge should connect:
-          subject = MONDO:0005015 (superclass, queried ID)
-          object  = CHEBI:6801 (chemical)
-
-        Before the fix, the inverse caused subject/object to be swapped in the
-        override logic, producing a disease-to-disease composite edge.
+        A direct edge exists (CHEBI:6801 --treats--> MONDO:0005015, found via
+        inverse), so subclass-expanded edges through MONDO:0005148 are dropped
+        and no inferred composite edges should be present.
         """
         query = {
             "message": {
@@ -106,22 +98,11 @@ class TestSubclassInverseEdgeDirection:
         results = response["message"]["results"]
         assert len(results) >= 1
 
+        # Direct edge exists, so no inferred composite edges should be present
         inferred = _get_inferred_edges(response)
-        # There should be at least one inferred edge from subclass expansion
-        assert len(inferred) > 0, "Expected inferred composite edges from subclass expansion"
-
-        for eid, edge in inferred.items():
-            # The inferred edge should connect the superclass disease to the
-            # chemical, NOT disease-to-disease.
-            endpoints = {edge["subject"], edge["object"]}
-            assert "CHEBI:6801" in endpoints, (
-                f"Inferred edge {eid} missing CHEBI:6801: "
-                f"{edge['subject']} -> {edge['object']}"
-            )
-            assert "MONDO:0005015" in endpoints, (
-                f"Inferred edge {eid} missing MONDO:0005015: "
-                f"{edge['subject']} -> {edge['object']}"
-            )
+        assert len(inferred) == 0, (
+            "Expected no inferred edges when a direct edge exists between queried nodes"
+        )
 
         _assert_all_results_connected(response)
 
