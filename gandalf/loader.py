@@ -1,25 +1,26 @@
 """Load nodes and edges into Gandalf.
 
-Three-pass streaming loader that keeps peak memory at ~3-4GB for 38M edges:
+Single-pass streaming loader that keeps peak memory at ~3-4GB for 38M edges:
 
-Pass 1: Stream JSONL to collect vocabularies (node IDs, predicates, edge count).
-Pass 2: Stream JSONL again, converting each edge to integer indices stored in
-        pre-allocated numpy arrays. Simultaneously interns qualifier/source data
-        into the EdgePropertyStoreBuilder and writes attributes to
-        a temporary LMDB keyed by original line index.
-Pass 3: Sort numpy arrays by (src, dst, pred) via np.lexsort. Rewrite the temp
-        LMDB in CSR-sorted order to produce the final LMDB where key == CSR
-        edge index (zero indirection at query time). Reorder qualifier/source
-        dedup indices to match. Build CSR offset arrays.
+Pass 1: Stream JSONL once, building vocabularies incrementally while
+        simultaneously converting each edge to integer indices in growing
+        Python lists. Interns qualifier/source data into the
+        EdgePropertyStoreBuilder and writes attributes to a temporary LMDB
+        keyed by original line index.
+Pass 2: Convert lists to numpy arrays, sort by (src, dst, pred) via
+        np.lexsort. Rewrite the temp LMDB in CSR-sorted order to produce
+        the final LMDB where key == CSR edge index (zero indirection at
+        query time). Reorder qualifier/source dedup indices to match.
+        Build CSR offset arrays.
 """
 
-import json
 import shutil
 import tempfile
 from pathlib import Path
 
 import msgpack
 import numpy as np
+import orjson
 
 from gandalf.graph import CSRGraph, EdgePropertyStoreBuilder
 from gandalf.lmdb_store import LMDBPropertyStore, _INITIAL_WRITE_MAP_SIZE, _encode_key, _put_with_resize
@@ -45,6 +46,9 @@ _QUALIFIER_FIELDS = {
     "causal_mechanism_qualifier",
     "species_context_qualifier",
 }
+
+# Union for fast membership testing during attribute extraction
+_SKIP_FIELDS = _CORE_FIELDS | _QUALIFIER_FIELDS | {"qualifiers"}
 
 
 def _extract_sources(data):
@@ -115,7 +119,7 @@ def _extract_attributes(data):
     """
     attributes = []
     for field, value in data.items():
-        if field in _CORE_FIELDS or field in _QUALIFIER_FIELDS or field == "qualifiers":
+        if field in _SKIP_FIELDS:
             continue
         attributes.append({
             "attribute_type_id": f"biolink:{field}",
@@ -145,11 +149,11 @@ def _extract_node_attributes(node_data):
 
 
 def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path, temp_dir=None):
-    """Build a CSR graph from JSONL files using three-pass streaming.
+    """Build a CSR graph from JSONL files using optimized streaming.
 
-    Pass 1: Collect vocabularies (node IDs, predicates, edge count).
-    Pass 2: Build numpy arrays + dedup store + temp LMDB.
-    Pass 3: Sort, rewrite LMDB in CSR order, build offsets.
+    Pass 1 (single pass): Build vocabularies incrementally while collecting
+        edge data into growing lists + dedup store + temp LMDB.
+    Pass 2: Sort, rewrite LMDB in CSR order, build offsets.
 
     Args:
         edge_jsonl_path: Path to the edges JSONL file.
@@ -165,73 +169,29 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path, temp_dir=None):
     node_jsonl_path = str(node_jsonl_path) if node_jsonl_path else None
 
     # =================================================================
-    # Pass 1: Vocabulary collection
+    # Pass 1: Single-pass vocabulary + array building
     # =================================================================
-    print(f"Pass 1: Collecting vocabularies from {edge_jsonl_path}...")
+    print(f"Pass 1: Streaming edges from {edge_jsonl_path}...")
 
-    node_ids = set()
-    predicates = set()
-    edge_count = 0
+    # Vocabularies built incrementally (assign index on first encounter)
+    node_id_to_idx = {}
+    predicate_to_idx = {}
 
-    with open(edge_jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            data = json.loads(line)
-            node_ids.add(data["subject"])
-            node_ids.add(data["object"])
-            predicates.add(data["predicate"])
-            edge_count += 1
+    # Growing lists for edge data (converted to numpy after the pass)
+    src_list = []
+    dst_list = []
+    pred_list = []
+    edge_ids = []
 
-            if edge_count % 1_000_000 == 0:
-                print(f"  {edge_count:,} edges scanned...")
-
-    print(f"  Found {len(node_ids):,} unique nodes, {len(predicates):,} predicates, "
-          f"{edge_count:,} edges")
-
-    # Build vocabulary mappings
-    node_id_to_idx = {nid: idx for idx, nid in enumerate(sorted(node_ids))}
-    predicate_to_idx = {pred: idx for idx, pred in enumerate(sorted(predicates))}
-    num_nodes = len(node_ids)
-    del node_ids  # Free ~2GB immediately
-
-    # Load node properties
-    node_properties = {}
-    if node_jsonl_path:
-        print(f"Reading node properties from {node_jsonl_path}...")
-        with open(node_jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                node_data = json.loads(line)
-                node_id = node_data.get("id")
-                if node_id:
-                    idx = node_id_to_idx.get(node_id)
-                    if idx is not None:
-                        node_properties[idx] = {
-                            "name": node_data.get("name", None),
-                            "categories": node_data.get("category", []),
-                            "attributes": _extract_node_attributes(node_data),
-                        }
-        print(f"  Loaded properties for {len(node_properties):,} nodes")
-
-    # =================================================================
-    # Pass 2: Build arrays + dedup store + temp LMDB
-    # =================================================================
-    print(f"Pass 2: Building arrays and property stores ({edge_count:,} edges)...")
-
-    # Pre-allocate numpy arrays
-    src_indices = np.empty(edge_count, dtype=np.int32)
-    dst_indices = np.empty(edge_count, dtype=np.int32)
-    pred_indices = np.empty(edge_count, dtype=np.int32)
-
-    # Edge IDs from the JSONL "id" field (indexed by original line order)
-    edge_ids = [None] * edge_count
-
-    # Incremental dedup builder for qualifiers + sources (hot path)
-    prop_builder = EdgePropertyStoreBuilder(edge_count)
+    # We don't know edge_count up front, so we collect hot-path props
+    # in a list and build the EdgePropertyStoreBuilder after the pass.
+    hot_props_list = []
 
     # Temp LMDB for cold-path properties (publications, attributes)
     # Default to same partition as the input data to avoid filling /tmp.
     build_temp_root = temp_dir or str(Path(edge_jsonl_path).resolve().parent)
-    temp_dir = tempfile.mkdtemp(prefix="gandalf_build_")
-    temp_lmdb_path = Path(temp_dir) / "temp_props.lmdb"
+    temp_dir_path = tempfile.mkdtemp(prefix="gandalf_build_", dir=build_temp_root)
+    temp_lmdb_path = Path(temp_dir_path) / "temp_props.lmdb"
     temp_lmdb_path.mkdir(parents=True, exist_ok=True)
 
     temp_env = lmdb.open(
@@ -244,45 +204,57 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path, temp_dir=None):
 
     txn = temp_env.begin(write=True)
     pending = []
-    try:
-        with open(edge_jsonl_path, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                data = json.loads(line)
+    edge_count = 0
+    commit_every = 200_000
 
-                # Fill numpy arrays
-                src_indices[i] = node_id_to_idx[data["subject"]]
-                dst_indices[i] = node_id_to_idx[data["object"]]
-                pred_indices[i] = predicate_to_idx[data["predicate"]]
+    try:
+        with open(edge_jsonl_path, "rb") as f:
+            for line in f:
+                data = orjson.loads(line)
+
+                # Assign node indices incrementally
+                subj = data["subject"]
+                obj = data["object"]
+                pred = data["predicate"]
+
+                if subj not in node_id_to_idx:
+                    node_id_to_idx[subj] = len(node_id_to_idx)
+                if obj not in node_id_to_idx:
+                    node_id_to_idx[obj] = len(node_id_to_idx)
+                if pred not in predicate_to_idx:
+                    predicate_to_idx[pred] = len(predicate_to_idx)
+
+                src_list.append(node_id_to_idx[subj])
+                dst_list.append(node_id_to_idx[obj])
+                pred_list.append(predicate_to_idx[pred])
 
                 # Capture edge ID from JSONL (if present)
-                edge_ids[i] = data.get("id")
+                edge_ids.append(data.get("id"))
 
                 # Extract properties
                 sources = _extract_sources(data)
                 qualifiers = _extract_qualifiers(data)
                 attributes = _extract_attributes(data)
 
-                # Hot path: intern qualifiers + sources
-                prop_builder.add(i, {"sources": sources, "qualifiers": qualifiers})
+                # Hot path: collect for batch interning after pass
+                hot_props_list.append({"sources": sources, "qualifiers": qualifiers})
 
                 # Cold path: write attributes to temp LMDB
-                # (publications are now included in the attributes list)
-                # Skip edges with no cold-path data to save disk space.
                 if attributes:
-                    detail = {
-                        "attributes": attributes,
-                    }
-                    key = _encode_key(i)
+                    detail = {"attributes": attributes}
+                    key = _encode_key(edge_count)
                     val = msgpack.packb(detail, use_bin_type=True)
                     txn = _put_with_resize(temp_env, txn, key, val, pending)
 
-                if (i + 1) % 50_000 == 0:
+                edge_count += 1
+
+                if edge_count % commit_every == 0:
                     txn.commit()
                     pending.clear()
                     txn = temp_env.begin(write=True)
 
-                if (i + 1) % 1_000_000 == 0:
-                    print(f"  {i + 1:,}/{edge_count:,} edges processed...")
+                if edge_count % 1_000_000 == 0:
+                    print(f"  {edge_count:,} edges processed...")
 
         txn.commit()
     except BaseException:
@@ -291,12 +263,48 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path, temp_dir=None):
     finally:
         temp_env.close()
 
+    num_nodes = len(node_id_to_idx)
+    print(f"  Found {num_nodes:,} unique nodes, {len(predicate_to_idx):,} predicates, "
+          f"{edge_count:,} edges")
+
+    # Convert lists to numpy arrays
+    print("  Converting to numpy arrays...")
+    src_indices = np.array(src_list, dtype=np.int32)
+    dst_indices = np.array(dst_list, dtype=np.int32)
+    pred_indices = np.array(pred_list, dtype=np.int32)
+    del src_list, dst_list, pred_list
+
+    # Build EdgePropertyStoreBuilder and intern all hot-path props
+    print("  Interning edge properties...")
+    prop_builder = EdgePropertyStoreBuilder(edge_count)
+    for i, props in enumerate(hot_props_list):
+        prop_builder.add(i, props)
+    del hot_props_list
+
+    # Load node properties
+    node_properties = {}
+    if node_jsonl_path:
+        print(f"Reading node properties from {node_jsonl_path}...")
+        with open(node_jsonl_path, "rb") as f:
+            for line in f:
+                node_data = orjson.loads(line)
+                node_id = node_data.get("id")
+                if node_id:
+                    idx = node_id_to_idx.get(node_id)
+                    if idx is not None:
+                        node_properties[idx] = {
+                            "name": node_data.get("name", None),
+                            "categories": node_data.get("category", []),
+                            "attributes": _extract_node_attributes(node_data),
+                        }
+        print(f"  Loaded properties for {len(node_properties):,} nodes")
+
     print(f"  Arrays and temp LMDB built")
 
     # =================================================================
-    # Pass 3: Sort, rewrite LMDB, build CSR
+    # Pass 2: Sort, rewrite LMDB, build CSR
     # =================================================================
-    print("Pass 3: Sorting and building CSR structure...")
+    print("Pass 2: Sorting and building CSR structure...")
 
     # Sort by (src, dst, pred) using lexsort (last key is primary)
     sort_order = np.lexsort((pred_indices, dst_indices, src_indices))
@@ -309,9 +317,10 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path, temp_dir=None):
     # Free unsorted arrays
     del src_indices, dst_indices, pred_indices
 
-    # Reorder edge IDs to match CSR sort order
-    edge_ids_sorted = [edge_ids[sort_order[j]] for j in range(edge_count)]
-    del edge_ids
+    # Reorder edge IDs to match CSR sort order (vectorized via numpy)
+    edge_ids_arr = np.array(edge_ids, dtype=object)
+    edge_ids_sorted = edge_ids_arr[sort_order].tolist()
+    del edge_ids, edge_ids_arr
 
     # Reorder dedup store indices to match CSR order
     prop_builder.reorder(sort_order)
@@ -326,7 +335,7 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path, temp_dir=None):
     # Rewrite temp LMDB in CSR-sorted order → final LMDB
     # This is the expensive build-time step, but ensures query-time
     # LMDB key == CSR edge index with zero indirection.
-    final_lmdb_path = Path(temp_dir) / "edge_properties.lmdb"
+    final_lmdb_path = Path(temp_dir_path) / "edge_properties.lmdb"
     lmdb_store = LMDBPropertyStore.build_sorted(
         db_path=final_lmdb_path,
         temp_db_path=temp_lmdb_path,
@@ -348,12 +357,11 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path, temp_dir=None):
 
     # Build reverse CSR: sort edges by (dst, src, pred)
     print("  Building reverse CSR...")
-    # Reconstruct per-edge source node IDs from forward CSR offsets
-    edge_src = np.empty(edge_count, dtype=np.int32)
-    for node_idx in range(num_nodes):
-        start = int(fwd_offsets[node_idx])
-        end = int(fwd_offsets[node_idx + 1])
-        edge_src[start:end] = node_idx
+    # Reconstruct per-edge source node IDs from forward CSR offsets (vectorized)
+    edge_src = np.repeat(
+        np.arange(num_nodes, dtype=np.int32),
+        np.diff(fwd_offsets).astype(np.int32),
+    )
 
     rev_order = np.lexsort((pred_sorted, edge_src, dst_sorted))
 

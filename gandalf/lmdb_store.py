@@ -183,7 +183,7 @@ class LMDBPropertyStore:
 
     @staticmethod
     def build_sorted(db_path, temp_db_path, sort_permutation, num_edges,
-                     commit_every=50_000):
+                     commit_every=200_000):
         """Rewrite a temp LMDB in CSR-sorted order to produce the final store.
 
         Reads from temp_db_path using sort_permutation to reorder, writes
