@@ -205,8 +205,9 @@ class TestMinInformationContent:
         """min_information_content should filter intermediate nodes in multi-hop queries.
 
         Two-hop: Metformin --affects--> Gene --gene_associated--> T2D
-        Genes: PPARG(IC=92.3), INSR(IC=88.7), GCK(IC=81.2)
-        With min_information_content=85, only PPARG and INSR pass.
+        Without filtering, 3 genes bridge the path: PPARG(92.3), INSR(88.7), GCK(81.2).
+        T2D has IC=78.2, which is also below 85, so it gets filtered in the second
+        hop as well, yielding 0 total results.
         """
         query = {
             "message": {
@@ -232,13 +233,51 @@ class TestMinInformationContent:
             },
         }
 
-        response = lookup(graph, query, bmt=bmt, verbose=False, min_information_content=85)
-        results = response["message"]["results"]
+        # Without filtering: 3 results (PPARG, INSR, GCK as intermediates)
+        response_unfiltered = lookup(graph, query, bmt=bmt, verbose=False)
+        assert len(response_unfiltered["message"]["results"]) == 3
 
-        # PPARG (92.3) and INSR (88.7) pass; GCK (81.2) filtered out
-        assert len(results) == 2
-        gene_ids = {r["node_bindings"]["n1"][0]["id"] for r in results}
-        assert gene_ids == {"NCBIGene:5468", "NCBIGene:3643"}
+        # With min_information_content=85: GCK (81.2) filtered in first hop,
+        # AND T2D (78.2) filtered in second hop → 0 results
+        response_filtered = lookup(graph, query, bmt=bmt, verbose=False, min_information_content=85)
+        assert len(response_filtered["message"]["results"]) == 0
+
+
+    def test_min_ic_filters_backward_discovered_nodes(self, graph, bmt):
+        """min_information_content should filter discovered nodes in backward search.
+
+        Query: Gene --gene_associated_with_condition--> T2D
+        Discovered genes: PPARG(IC=92.3), INSR(IC=88.7), GCK(IC=81.2)
+        With min_information_content=90, only PPARG passes.
+        """
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"categories": ["biolink:Gene"]},
+                        "n1": {"ids": ["MONDO:0005148"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:gene_associated_with_condition"],
+                        },
+                    },
+                },
+            },
+        }
+
+        # Without filtering: 3 genes
+        response_unfiltered = lookup(graph, query, bmt=bmt, verbose=False)
+        assert len(response_unfiltered["message"]["results"]) == 3
+
+        # With min_information_content=90: only PPARG (92.3) passes
+        response_filtered = lookup(graph, query, bmt=bmt, verbose=False, min_information_content=90)
+        results = response_filtered["message"]["results"]
+
+        assert len(results) == 1
+        assert results[0]["node_bindings"]["n0"][0]["id"] == "NCBIGene:5468"
 
 
 class TestCombinedFilters:
