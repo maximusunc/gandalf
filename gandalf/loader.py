@@ -144,20 +144,12 @@ def _extract_node_attributes(node_data):
     return attributes
 
 
-def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path, temp_dir=None):
+def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path):
     """Build a CSR graph from JSONL files using three-pass streaming.
 
     Pass 1: Collect vocabularies (node IDs, predicates, edge count).
     Pass 2: Build numpy arrays + dedup store + temp LMDB.
     Pass 3: Sort, rewrite LMDB in CSR order, build offsets.
-
-    Args:
-        edge_jsonl_path: Path to the edges JSONL file.
-        node_jsonl_path: Path to the nodes JSONL file.
-        temp_dir: Directory for temporary build files (LMDB scratch space).
-            Defaults to the parent directory of edge_jsonl_path.  Set this
-            to a partition with sufficient free space (roughly 2x the
-            edges.jsonl size).
 
     Peak memory: ~3-4GB for 38M edges (down from 100GB+).
     """
@@ -228,8 +220,6 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path, temp_dir=None):
     prop_builder = EdgePropertyStoreBuilder(edge_count)
 
     # Temp LMDB for cold-path properties (publications, attributes)
-    # Default to same partition as the input data to avoid filling /tmp.
-    build_temp_root = temp_dir or str(Path(edge_jsonl_path).resolve().parent)
     temp_dir = tempfile.mkdtemp(prefix="gandalf_build_")
     temp_lmdb_path = Path(temp_dir) / "temp_props.lmdb"
     temp_lmdb_path.mkdir(parents=True, exist_ok=True)
@@ -267,14 +257,12 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path, temp_dir=None):
 
                 # Cold path: write attributes to temp LMDB
                 # (publications are now included in the attributes list)
-                # Skip edges with no cold-path data to save disk space.
-                if attributes:
-                    detail = {
-                        "attributes": attributes,
-                    }
-                    key = _encode_key(i)
-                    val = msgpack.packb(detail, use_bin_type=True)
-                    txn = _put_with_resize(temp_env, txn, key, val, pending)
+                detail = {
+                    "attributes": attributes,
+                }
+                key = _encode_key(i)
+                val = msgpack.packb(detail, use_bin_type=True)
+                txn = _put_with_resize(temp_env, txn, key, val, pending)
 
                 if (i + 1) % 50_000 == 0:
                     txn.commit()
