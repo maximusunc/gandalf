@@ -189,8 +189,8 @@ class LMDBPropertyStore:
         Reads from temp_db_path using sort_permutation to reorder, writes
         to db_path with sequential keys 0..num_edges-1.
 
-        Uses an inverse permutation + sequential cursor scan so reads are
-        sequential (fast) instead of random B-tree lookups (slow).
+        This is the expensive build-time operation that ensures query-time
+        keys match CSR edge indices with zero indirection.
 
         Args:
             db_path: Path for the final LMDB directory.
@@ -202,25 +202,17 @@ class LMDBPropertyStore:
         Returns:
             LMDBPropertyStore opened in read-only mode.
         """
-        import numpy as np
-
         db_path = Path(db_path)
         if db_path.exists():
             shutil.rmtree(db_path)
         db_path.mkdir(parents=True, exist_ok=True)
-
-        # Inverse mapping: original_line_idx → csr_pos.
-        # This lets us scan the temp LMDB sequentially (by original index)
-        # and compute the correct CSR key for each entry in O(1).
-        inv_perm = np.empty(num_edges, dtype=np.int64)
-        inv_perm[sort_permutation] = np.arange(num_edges, dtype=np.int64)
 
         temp_env = lmdb.open(
             str(temp_db_path),
             readonly=True,
             lock=False,
             map_size=_DEFAULT_READ_MAP_SIZE,
-            readahead=True,  # Sequential scan benefits from readahead
+            readahead=False,
         )
         final_env = lmdb.open(
             str(db_path),
@@ -230,30 +222,28 @@ class LMDBPropertyStore:
             readahead=False,
         )
 
-        print(f"    LMDB: rewriting edges in CSR-sorted order (sequential scan)...")
+        print(f"    LMDB: rewriting {num_edges:,} edges in CSR-sorted order...")
 
         temp_txn = temp_env.begin(buffers=True)
         final_txn = final_env.begin(write=True)
         pending = []
 
-        count = 0
         try:
-            cursor = temp_txn.cursor()
-            for temp_key, val in cursor:
-                original_idx = struct.unpack(">I", bytes(temp_key))[0]
-                csr_pos = int(inv_perm[original_idx])
+            for csr_pos in range(num_edges):
+                original_idx = int(sort_permutation[csr_pos])
+                temp_key = _encode_key(original_idx)
+                val = temp_txn.get(temp_key)
 
                 final_key = _encode_key(csr_pos)
                 final_txn = _put_with_resize(
                     final_env, final_txn, final_key, bytes(val), pending
                 )
-                count += 1
 
-                if count % commit_every == 0:
+                if (csr_pos + 1) % commit_every == 0:
                     final_txn.commit()
                     pending.clear()
-                    if count % 500_000 == 0:
-                        print(f"      {count:>12,} edges rewritten")
+                    if (csr_pos + 1) % 1_000_000 == 0:
+                        print(f"      {csr_pos + 1:,}/{num_edges:,} edges rewritten...")
                     final_txn = final_env.begin(write=True)
 
             final_txn.commit()
@@ -265,5 +255,5 @@ class LMDBPropertyStore:
             temp_env.close()
             final_env.close()
 
-        print(f"    LMDB: final store written — {count:,} edges to {db_path}")
+        print(f"    LMDB: final store written to {db_path}")
         return LMDBPropertyStore(db_path, readonly=True)
