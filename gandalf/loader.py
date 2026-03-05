@@ -14,6 +14,7 @@ Pass 2: Convert lists to numpy arrays, sort by (src, dst, pred) via
         Build CSR offset arrays.
 """
 
+import array as _array
 import shutil
 import tempfile
 from pathlib import Path
@@ -22,7 +23,7 @@ import msgpack
 import numpy as np
 import orjson
 
-from gandalf.graph import CSRGraph, EdgePropertyStoreBuilder
+from gandalf.graph import CSRGraph, GrowablePropertyStoreBuilder
 from gandalf.lmdb_store import LMDBPropertyStore, _INITIAL_WRITE_MAP_SIZE, _encode_key, _put_with_resize
 
 import lmdb
@@ -177,15 +178,17 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path, temp_dir=None):
     node_id_to_idx = {}
     predicate_to_idx = {}
 
-    # Growing lists for edge data (converted to numpy after the pass)
-    src_list = []
-    dst_list = []
-    pred_list = []
+    # Growing arrays for edge data — array.array('i') uses 4 bytes per int
+    # (same as numpy int32), vs 28 bytes per int in a Python list.
+    src_arr = _array.array('i')
+    dst_arr = _array.array('i')
+    pred_arr = _array.array('i')
     edge_ids = []
 
-    # We don't know edge_count up front, so we collect hot-path props
-    # in a list and build the EdgePropertyStoreBuilder after the pass.
-    hot_props_list = []
+    # Inline interning of hot-path properties (qualifiers + sources).
+    # Only the intern dicts and small pools are kept in memory — each edge
+    # contributes just 4+4 = 8 bytes of index storage, not a full dict.
+    prop_builder = GrowablePropertyStoreBuilder()
 
     # Temp LMDB for cold-path properties (publications, attributes)
     # Default to same partition as the input data to avoid filling /tmp.
@@ -224,9 +227,9 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path, temp_dir=None):
                 if pred not in predicate_to_idx:
                     predicate_to_idx[pred] = len(predicate_to_idx)
 
-                src_list.append(node_id_to_idx[subj])
-                dst_list.append(node_id_to_idx[obj])
-                pred_list.append(predicate_to_idx[pred])
+                src_arr.append(node_id_to_idx[subj])
+                dst_arr.append(node_id_to_idx[obj])
+                pred_arr.append(predicate_to_idx[pred])
 
                 # Capture edge ID from JSONL (if present)
                 edge_ids.append(data.get("id"))
@@ -236,8 +239,8 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path, temp_dir=None):
                 qualifiers = _extract_qualifiers(data)
                 attributes = _extract_attributes(data)
 
-                # Hot path: collect for batch interning after pass
-                hot_props_list.append({"sources": sources, "qualifiers": qualifiers})
+                # Hot path: intern inline (only 8 bytes of index storage per edge)
+                prop_builder.append(sources, qualifiers)
 
                 # Cold path: write attributes to temp LMDB
                 if attributes:
@@ -267,19 +270,12 @@ def build_graph_from_jsonl(edge_jsonl_path, node_jsonl_path, temp_dir=None):
     print(f"  Found {num_nodes:,} unique nodes, {len(predicate_to_idx):,} predicates, "
           f"{edge_count:,} edges")
 
-    # Convert lists to numpy arrays
+    # Convert array.array to numpy (zero-copy view + copy for ownership)
     print("  Converting to numpy arrays...")
-    src_indices = np.array(src_list, dtype=np.int32)
-    dst_indices = np.array(dst_list, dtype=np.int32)
-    pred_indices = np.array(pred_list, dtype=np.int32)
-    del src_list, dst_list, pred_list
-
-    # Build EdgePropertyStoreBuilder and intern all hot-path props
-    print("  Interning edge properties...")
-    prop_builder = EdgePropertyStoreBuilder(edge_count)
-    for i, props in enumerate(hot_props_list):
-        prop_builder.add(i, props)
-    del hot_props_list
+    src_indices = np.frombuffer(src_arr, dtype=np.int32).copy()
+    dst_indices = np.frombuffer(dst_arr, dtype=np.int32).copy()
+    pred_indices = np.frombuffer(pred_arr, dtype=np.int32).copy()
+    del src_arr, dst_arr, pred_arr
 
     # Load node properties
     node_properties = {}

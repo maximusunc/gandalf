@@ -221,6 +221,58 @@ class EdgePropertyStoreBuilder:
         return store
 
 
+class GrowablePropertyStoreBuilder:
+    """Incrementally builds an EdgePropertyStore without knowing edge count.
+
+    Uses ``array.array('i')`` (4 bytes per int, like numpy int32) for
+    compact storage during streaming, then converts to numpy for reorder/build.
+    """
+
+    def __init__(self):
+        import array as _array
+        self._sources_pool = []
+        self._quals_pool = []
+        self._sources_intern = {}
+        self._quals_intern = {}
+        self._sources_idx = _array.array('i')
+        self._quals_idx = _array.array('i')
+
+    def append(self, sources, qualifiers):
+        """Intern and append one edge's qualifier and source properties."""
+        sources_key = EdgePropertyStore._make_hashable(sources)
+        if sources_key not in self._sources_intern:
+            self._sources_intern[sources_key] = len(self._sources_pool)
+            self._sources_pool.append(sources)
+        self._sources_idx.append(self._sources_intern[sources_key])
+
+        quals_key = EdgePropertyStore._make_hashable(qualifiers)
+        if quals_key not in self._quals_intern:
+            self._quals_intern[quals_key] = len(self._quals_pool)
+            self._quals_pool.append(qualifiers)
+        self._quals_idx.append(self._quals_intern[quals_key])
+
+    def reorder(self, permutation):
+        """Reorder index arrays to match CSR sort order."""
+        # Convert to numpy for efficient fancy indexing
+        self._sources_idx = np.frombuffer(self._sources_idx, dtype=np.int32).copy()[permutation]
+        self._quals_idx = np.frombuffer(self._quals_idx, dtype=np.int32).copy()[permutation]
+
+    def build(self):
+        """Finalize to an EdgePropertyStore."""
+        store = EdgePropertyStore()
+        store._sources_pool = self._sources_pool
+        store._quals_pool = self._quals_pool
+        if isinstance(self._sources_idx, np.ndarray):
+            store._sources_idx = self._sources_idx
+            store._quals_idx = self._quals_idx
+        else:
+            store._sources_idx = np.frombuffer(self._sources_idx, dtype=np.int32).copy()
+            store._quals_idx = np.frombuffer(self._quals_idx, dtype=np.int32).copy()
+        self._sources_intern = None
+        self._quals_intern = None
+        return store
+
+
 class CSRGraph:
     """
     Compressed Sparse Row graph representation for fast neighbor lookups.
