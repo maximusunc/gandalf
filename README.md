@@ -99,3 +99,7 @@ The package uses a three-stage pipeline:
 3. **Enrichment** (batch) - Load all properties for final paths only
 
 This separation allows filtering millions of paths before expensive property lookups.
+
+## Releases
+Run this on the mmap folder:
+- `tar -czvf gandalf_mmap_<date>.tar.gz gandalf_mmap`
