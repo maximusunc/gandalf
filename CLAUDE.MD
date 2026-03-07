@@ -14,12 +14,15 @@ GANDALF (Graph Analysis Navigator for Discovery And Link Finding) is a Python li
 - **black** - Code formatting
 
 ## Installation
+
+**Important:** An up-to-date `setuptools` (>=69) is required before installing
+dependencies.  BMT transitively depends on legacy packages (`stringcase`,
+`pytest-logging`) whose `setup.py` installs fail with older setuptools due to a
+`distutils` `install_layout` bug.  Always upgrade setuptools first.
+
 ```bash
 pip install -U pip setuptools wheel
-pip install -r requirements.txt
-pip install -r requirements-dev.txt
-# Install (development mode)
-pip install -e .
+pip install -e ".[dev]"
 ```
 
 ## Quick Commands
@@ -112,6 +115,11 @@ Tests use pytest. Run with coverage:
 ```bash
 pytest --cov=gandalf --cov-report=html
 ```
+
+BMT is mocked in tests via `MockBMT` in `tests/conftest.py` to avoid the
+external API call that `bmt.Toolkit()` makes on initialisation.  If you add new
+predicates or qualifier values to the test fixtures, update the corresponding
+lookup tables in `MockBMT`.
 
 ## Known Considerations
 
