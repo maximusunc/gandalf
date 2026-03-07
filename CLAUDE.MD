@@ -111,9 +111,11 @@ Uses Translator Knowledge Graph Exchange (KGX) format:
 
 ## Testing
 
-Tests use pytest. Run with coverage:
+Tests use pytest.  Use `python -m pytest` (not bare `pytest`) so the
+system-installed packages (numpy, etc.) are on the path:
 ```bash
-pytest --cov=gandalf --cov-report=html
+python -m pytest
+python -m pytest --cov=gandalf --cov-report=html
 ```
 
 BMT is mocked in tests via `MockBMT` in `tests/conftest.py` to avoid the
