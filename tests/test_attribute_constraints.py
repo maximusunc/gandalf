@@ -729,3 +729,324 @@ class TestEdgeAttributeConstraintsIntegration:
                 if a.get("original_attribute_name") == "publications"]
         assert len(pubs) == 1
         assert "PMID:55555555" in pubs[0]["value"]
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: numeric edge attribute constraints (p_value, evidence_count)
+# ---------------------------------------------------------------------------
+
+class TestNumericEdgeConstraints:
+    """Test numeric edge attribute constraints using p_value and evidence_count.
+
+    The affects edges have these values:
+        PPARG (unqualified):         p_value=0.001,  evidence_count=12
+        INSR (activity/increased):   p_value=0.03,   evidence_count=5
+        GCK (activity/decreased):    p_value=0.08,   evidence_count=2
+        TNF (abundance/increased):   p_value=0.0005, evidence_count=20
+        INSR (abundance/decreased):  p_value=0.04,   evidence_count=3
+    """
+
+    def test_p_value_less_than_filters_edges(self, graph, bmt):
+        """p_value < 0.01 should keep only PPARG(0.001) and TNF(0.0005)."""
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:affects"],
+                            "attribute_constraints": [{
+                                "id": "biolink:p_value",
+                                "name": "p-value",
+                                "operator": "<",
+                                "value": 0.01,
+                            }],
+                        },
+                    },
+                },
+            },
+        }
+
+        response = lookup(graph, query, bmt=bmt, verbose=False)
+        results = response["message"]["results"]
+
+        assert len(results) == 2
+        gene_ids = {r["node_bindings"]["n1"][0]["id"] for r in results}
+        assert gene_ids == {"NCBIGene:5468", "NCBIGene:7124"}
+
+    def test_evidence_count_greater_than(self, graph, bmt):
+        """evidence_count > 10 should keep PPARG(12) and TNF(20)."""
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:affects"],
+                            "attribute_constraints": [{
+                                "id": "biolink:evidence_count",
+                                "name": "evidence count",
+                                "operator": ">",
+                                "value": 10,
+                            }],
+                        },
+                    },
+                },
+            },
+        }
+
+        response = lookup(graph, query, bmt=bmt, verbose=False)
+        results = response["message"]["results"]
+
+        assert len(results) == 2
+        gene_ids = {r["node_bindings"]["n1"][0]["id"] for r in results}
+        assert gene_ids == {"NCBIGene:5468", "NCBIGene:7124"}
+
+    def test_p_value_and_evidence_count_combined(self, graph, bmt):
+        """p_value < 0.05 AND evidence_count > 4 should keep PPARG and TNF.
+
+        Edges passing p_value < 0.05:
+            PPARG(0.001), INSR-activity(0.03), TNF(0.0005), INSR-abundance(0.04)
+        Of those, evidence_count > 4:
+            PPARG(12), INSR-activity(5), TNF(20)
+        Both: PPARG, INSR (via activity edge), TNF → 3 gene results.
+        """
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:affects"],
+                            "attribute_constraints": [
+                                {
+                                    "id": "biolink:p_value",
+                                    "name": "p-value",
+                                    "operator": "<",
+                                    "value": 0.05,
+                                },
+                                {
+                                    "id": "biolink:evidence_count",
+                                    "name": "evidence count",
+                                    "operator": ">",
+                                    "value": 4,
+                                },
+                            ],
+                        },
+                    },
+                },
+            },
+        }
+
+        response = lookup(graph, query, bmt=bmt, verbose=False)
+        results = response["message"]["results"]
+
+        assert len(results) == 3
+        gene_ids = {r["node_bindings"]["n1"][0]["id"] for r in results}
+        assert gene_ids == {"NCBIGene:5468", "NCBIGene:3643", "NCBIGene:7124"}
+
+    def test_very_strict_p_value_filters_all(self, graph, bmt):
+        """p_value < 0.0001 should filter all edges (lowest is 0.0005)."""
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:affects"],
+                            "attribute_constraints": [{
+                                "id": "biolink:p_value",
+                                "name": "p-value",
+                                "operator": "<",
+                                "value": 0.0001,
+                            }],
+                        },
+                    },
+                },
+            },
+        }
+
+        response = lookup(graph, query, bmt=bmt, verbose=False)
+        results = response["message"]["results"]
+        assert len(results) == 0
+
+    def test_evidence_count_equals(self, graph, bmt):
+        """evidence_count == 20 should match only the TNF edge."""
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:affects"],
+                            "attribute_constraints": [{
+                                "id": "biolink:evidence_count",
+                                "name": "evidence count",
+                                "operator": "==",
+                                "value": 20,
+                            }],
+                        },
+                    },
+                },
+            },
+        }
+
+        response = lookup(graph, query, bmt=bmt, verbose=False)
+        results = response["message"]["results"]
+
+        assert len(results) == 1
+        assert results[0]["node_bindings"]["n1"][0]["id"] == "NCBIGene:7124"
+
+    def test_p_value_backward_search(self, graph, bmt):
+        """Numeric edge constraints work in backward search.
+
+        Gene --gene_associated_with_condition--> T2D edges:
+            PPARG: p_value=0.002, evidence_count=15
+            INSR:  p_value=0.07,  evidence_count=4
+            GCK:   p_value=0.15,  evidence_count=1
+
+        p_value < 0.05 should keep only PPARG.
+        """
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"categories": ["biolink:Gene"]},
+                        "n1": {"ids": ["MONDO:0005148"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:gene_associated_with_condition"],
+                            "attribute_constraints": [{
+                                "id": "biolink:p_value",
+                                "name": "p-value",
+                                "operator": "<",
+                                "value": 0.05,
+                            }],
+                        },
+                    },
+                },
+            },
+        }
+
+        response = lookup(graph, query, bmt=bmt, verbose=False)
+        results = response["message"]["results"]
+
+        assert len(results) == 1
+        assert results[0]["node_bindings"]["n0"][0]["id"] == "NCBIGene:5468"
+
+    def test_evidence_count_two_hop_with_edge_constraint(self, graph, bmt):
+        """Edge constraints on a two-hop query filter the constrained hop only.
+
+        Metformin --affects--> Gene --gene_associated_with_condition--> T2D
+        Constrain the second hop: evidence_count > 10 → only PPARG(15) passes.
+        So only paths through PPARG survive.
+        """
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                        "n2": {"ids": ["MONDO:0005148"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:affects"],
+                        },
+                        "e1": {
+                            "subject": "n1",
+                            "object": "n2",
+                            "predicates": ["biolink:gene_associated_with_condition"],
+                            "attribute_constraints": [{
+                                "id": "biolink:evidence_count",
+                                "name": "evidence count",
+                                "operator": ">",
+                                "value": 10,
+                            }],
+                        },
+                    },
+                },
+            },
+        }
+
+        response = lookup(graph, query, bmt=bmt, verbose=False)
+        results = response["message"]["results"]
+
+        assert len(results) == 1
+        assert results[0]["node_bindings"]["n1"][0]["id"] == "NCBIGene:5468"
+
+    def test_node_and_numeric_edge_constraints_combined(self, graph, bmt):
+        """Combine node IC constraint with numeric edge constraint.
+
+        Metformin --affects--> Gene:
+            Node IC > 90 keeps: PPARG(92.3), TNF(94.5)
+            Edge p_value < 0.001 keeps: TNF(0.0005)
+            Combined: only TNF survives.
+        """
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {
+                            "categories": ["biolink:Gene"],
+                            "constraints": [{
+                                "id": "information_content",
+                                "name": "IC",
+                                "operator": ">",
+                                "value": 90,
+                            }],
+                        },
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:affects"],
+                            "attribute_constraints": [{
+                                "id": "biolink:p_value",
+                                "name": "p-value",
+                                "operator": "<",
+                                "value": 0.001,
+                            }],
+                        },
+                    },
+                },
+            },
+        }
+
+        response = lookup(graph, query, bmt=bmt, verbose=False)
+        results = response["message"]["results"]
+
+        assert len(results) == 1
+        assert results[0]["node_bindings"]["n1"][0]["id"] == "NCBIGene:7124"
