@@ -3,6 +3,7 @@
 import gc
 import logging
 import os
+import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,6 +22,16 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from gandalf import CSRGraph, lookup
 from gandalf.logging_config import configure_logging
+from gandalf.models import (
+    AsyncTRAPIQuery,
+    EdgeSummaryResponse,
+    EdgesResponse,
+    MetadataResponse,
+    NodeResponse,
+    TRAPIQuery,
+    TRAPIResponse,
+    WorkflowStep,
+)
 
 configure_logging(logging.INFO)
 logger = logging.getLogger(__name__)
@@ -47,7 +58,12 @@ class CustomORJSONResponse(JSONResponse):
     media_type = "application/json"
 
     def render(self, content) -> bytes:
-        return orjson.dumps(content, default=_orjson_default)
+        t0 = time.perf_counter()
+        data = orjson.dumps(content, default=_orjson_default)
+        dt_ms = (time.perf_counter() - t0) * 1000
+        size_kb = len(data) / 1024
+        logger.debug("orjson serialization: %.2f ms, %.1f KB", dt_ms, size_kb)
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +200,7 @@ def sri_testing_data():
 # Metadata (Plater-compatible)
 # ---------------------------------------------------------------------------
 
-@APP.get("/metadata")
+@APP.get("/metadata", responses={200: {"model": MetadataResponse}})
 def metadata():
     """Return knowledge graph metadata and statistics."""
     if GRAPH is None:
@@ -196,7 +212,7 @@ def metadata():
 # Node lookup (Plater-compatible)
 # ---------------------------------------------------------------------------
 
-@APP.get("/node/{curie:path}")
+@APP.get("/node/{curie:path}", responses={200: {"model": NodeResponse}})
 def get_node(curie: str):
     """Retrieve node information by CURIE identifier."""
     if GRAPH is None:
@@ -214,7 +230,7 @@ def get_node(curie: str):
 # Edge lookup (Plater-compatible)
 # ---------------------------------------------------------------------------
 
-@APP.get("/edges/{curie:path}")
+@APP.get("/edges/{curie:path}", responses={200: {"model": EdgesResponse}})
 def get_edges(
     curie: str,
     category: Optional[str] = Query(None, description="Filter by target node category"),
@@ -293,7 +309,7 @@ def get_edges(
 # Edge summary (Plater-compatible)
 # ---------------------------------------------------------------------------
 
-@APP.get("/edge_summary/{curie:path}")
+@APP.get("/edge_summary/{curie:path}", responses={200: {"model": EdgeSummaryResponse}})
 def edge_summary(curie: str):
     """Summarize edge types connected to a node.
 
@@ -380,9 +396,9 @@ def simple_spec(
 # TRAPI query (Plater-compatible with query params)
 # ---------------------------------------------------------------------------
 
-@APP.post("/query")
+@APP.post("/query", responses={200: {"model": TRAPIResponse}})
 def sync_lookup(
-    request: dict,
+    request: TRAPIQuery,
     subclass: Optional[bool] = Query(None, description="Enable biolink subclass inference"),
 ):
     """Execute a TRAPI query against the knowledge graph.
@@ -392,13 +408,25 @@ def sync_lookup(
     if GRAPH is None:
         raise HTTPException(503, "Graph not loaded")
 
-    # Query params take precedence, fall back to request body
-    sc = subclass if subclass is not None else request.get("subclass", True)
-    subclass_depth = request.get("subclass_depth", 1)
+    # Temporarily adjust log level for this request if requested
+    gandalf_logger = logging.getLogger("gandalf")
+    prev_level = gandalf_logger.level
+    if request.log_level is not None:
+        gandalf_logger.setLevel(request.log_level)
 
-    response = lookup(GRAPH, request, bmt=BMT, subclass=sc, subclass_depth=subclass_depth)
+    try:
+        raw = request.model_dump(exclude_none=True)
+        raw.pop("log_level", None)
 
-    return response
+        # Query params take precedence, fall back to request body
+        sc = subclass if subclass is not None else raw.get("subclass", True)
+        subclass_depth = raw.get("subclass_depth", 1)
+
+        response = lookup(GRAPH, raw, bmt=BMT, subclass=sc, subclass_depth=subclass_depth)
+
+        return response
+    finally:
+        gandalf_logger.setLevel(prev_level)
 
 
 # ---------------------------------------------------------------------------
@@ -425,32 +453,29 @@ def async_lookup(callback_url: str, query: dict):
 @APP.post("/asyncquery")
 def async_query(
     background_tasks: BackgroundTasks,
-    query: dict,
+    query: AsyncTRAPIQuery,
 ):
     """Handle asynchronous query."""
+    raw = query.model_dump(exclude_none=True)
+
     # parse requested workflow
-    callback = query["callback"]
-    workflow = query.get("workflow", None) or [{"id": "lookup"}]
-    if not isinstance(workflow, list):
-        raise HTTPException(400, "workflow must be a list")
-    if not len(workflow) == 1:
+    workflow = query.workflow or [WorkflowStep(id="lookup")]
+    workflow_dicts = [w.model_dump(exclude_none=True) for w in workflow]
+
+    if len(workflow_dicts) != 1:
         raise HTTPException(400, "workflow must contain exactly 1 operation")
-    if "id" not in workflow[0]:
-        raise HTTPException(400, "workflow must have property 'id'")
-    if workflow[0]["id"] == "filter_results_top_n":
-        max_results = workflow[0]["parameters"]["max_results"]
-        if max_results < len(query["message"]["results"]):
-            query["message"]["results"] = query["message"]["results"][
-                :max_results
-            ]
-        return query
-    if not workflow[0]["id"] == "lookup":
+    if workflow_dicts[0]["id"] == "filter_results_top_n":
+        max_results = workflow_dicts[0]["parameters"]["max_results"]
+        if max_results < len(raw["message"].get("results", [])):
+            raw["message"]["results"] = raw["message"]["results"][:max_results]
+        return raw
+    if workflow_dicts[0]["id"] != "lookup":
         raise HTTPException(400, "operations must have id 'lookup'")
 
-    if (query.get("set_interpretation", None) or "BATCH") == "MANY":
+    if (query.set_interpretation or "BATCH") == "MANY":
         raise HTTPException(422, "set_interpretation MANY not supported.")
 
-    logger.info("Doing async lookup for %s", callback)
-    background_tasks.add_task(async_lookup, callback, query)
+    logger.info("Doing async lookup for %s", query.callback)
+    background_tasks.add_task(async_lookup, query.callback, raw)
 
     return
