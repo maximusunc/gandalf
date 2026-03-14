@@ -408,15 +408,25 @@ def sync_lookup(
     if GRAPH is None:
         raise HTTPException(503, "Graph not loaded")
 
-    raw = request.model_dump(exclude_none=True)
+    # Temporarily adjust log level for this request if requested
+    gandalf_logger = logging.getLogger("gandalf")
+    prev_level = gandalf_logger.level
+    if request.log_level is not None:
+        gandalf_logger.setLevel(request.log_level)
 
-    # Query params take precedence, fall back to request body
-    sc = subclass if subclass is not None else raw.get("subclass", True)
-    subclass_depth = raw.get("subclass_depth", 1)
+    try:
+        raw = request.model_dump(exclude_none=True)
+        raw.pop("log_level", None)
 
-    response = lookup(GRAPH, raw, bmt=BMT, subclass=sc, subclass_depth=subclass_depth)
+        # Query params take precedence, fall back to request body
+        sc = subclass if subclass is not None else raw.get("subclass", True)
+        subclass_depth = raw.get("subclass_depth", 1)
 
-    return response
+        response = lookup(GRAPH, raw, bmt=BMT, subclass=sc, subclass_depth=subclass_depth)
+
+        return response
+    finally:
+        gandalf_logger.setLevel(prev_level)
 
 
 # ---------------------------------------------------------------------------

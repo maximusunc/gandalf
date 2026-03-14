@@ -4,7 +4,7 @@ Provides TRAPI-compatible request/response models with OpenAPI examples
 for the Swagger UI documentation.
 """
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -204,6 +204,11 @@ class TRAPIQuery(BaseModel):
     )
     subclass_depth: Optional[int] = Field(
         None, description="Maximum subclass_of hops to traverse (default 1)"
+    )
+    log_level: Optional[Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]] = Field(
+        None,
+        description="Set logging level for this request "
+        "(e.g. 'DEBUG' to see serialization timings)",
     )
 
     model_config = ConfigDict(
