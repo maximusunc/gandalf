@@ -194,7 +194,7 @@ def sri_testing_data():
 # Metadata (Plater-compatible)
 # ---------------------------------------------------------------------------
 
-@APP.get("/metadata", response_model=MetadataResponse)
+@APP.get("/metadata", responses={200: {"model": MetadataResponse}})
 def metadata():
     """Return knowledge graph metadata and statistics."""
     if GRAPH is None:
@@ -206,7 +206,7 @@ def metadata():
 # Node lookup (Plater-compatible)
 # ---------------------------------------------------------------------------
 
-@APP.get("/node/{curie:path}", response_model=NodeResponse)
+@APP.get("/node/{curie:path}", responses={200: {"model": NodeResponse}})
 def get_node(curie: str):
     """Retrieve node information by CURIE identifier."""
     if GRAPH is None:
@@ -224,7 +224,7 @@ def get_node(curie: str):
 # Edge lookup (Plater-compatible)
 # ---------------------------------------------------------------------------
 
-@APP.get("/edges/{curie:path}", response_model=EdgesResponse)
+@APP.get("/edges/{curie:path}", responses={200: {"model": EdgesResponse}})
 def get_edges(
     curie: str,
     category: Optional[str] = Query(None, description="Filter by target node category"),
@@ -303,7 +303,7 @@ def get_edges(
 # Edge summary (Plater-compatible)
 # ---------------------------------------------------------------------------
 
-@APP.get("/edge_summary/{curie:path}", response_model=EdgeSummaryResponse)
+@APP.get("/edge_summary/{curie:path}", responses={200: {"model": EdgeSummaryResponse}})
 def edge_summary(curie: str):
     """Summarize edge types connected to a node.
 
@@ -390,7 +390,7 @@ def simple_spec(
 # TRAPI query (Plater-compatible with query params)
 # ---------------------------------------------------------------------------
 
-@APP.post("/query", response_model=TRAPIResponse)
+@APP.post("/query", responses={200: {"model": TRAPIResponse}})
 def sync_lookup(
     request: TRAPIQuery,
     subclass: Optional[bool] = Query(None, description="Enable biolink subclass inference"),
