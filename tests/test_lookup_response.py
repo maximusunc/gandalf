@@ -1,5 +1,8 @@
 """Tests for TRAPI response structure and specific edge queries."""
 
+import logging
+from datetime import datetime
+
 from tests.search_fixtures import graph  # noqa: F401
 
 from gandalf.search import lookup
@@ -293,3 +296,93 @@ class TestMetforminType2DiabetesEdges:
         # Verify edge bindings contain all 4 edges
         edge_bindings = results[0]["analyses"][0]["edge_bindings"]["e0"]
         assert len(edge_bindings) == 4
+
+
+class TestTRAPILogs:
+    """Tests for TRAPI-spec logs in the response root."""
+
+    def _make_query(self):
+        return {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["CHEBI:6801"]},
+                        "n1": {"ids": ["MONDO:0005148"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:treats"],
+                        },
+                    },
+                },
+            },
+        }
+
+    def test_response_has_logs_field(self, graph, bmt):
+        """Response should have a 'logs' key at the root level."""
+        response = lookup(graph, self._make_query(), bmt=bmt)
+        assert "logs" in response
+        assert isinstance(response["logs"], list)
+
+    def test_log_entries_have_required_fields(self, graph, bmt):
+        """Each log entry should have 'timestamp' and 'message' fields."""
+        gandalf_logger = logging.getLogger("gandalf")
+        gandalf_logger.setLevel(logging.DEBUG)
+        try:
+            response = lookup(graph, self._make_query(), bmt=bmt)
+        finally:
+            gandalf_logger.setLevel(logging.WARNING)
+        assert len(response["logs"]) > 0
+        for entry in response["logs"]:
+            assert "timestamp" in entry
+            assert "message" in entry
+
+    def test_log_timestamps_are_iso8601(self, graph, bmt):
+        """Log timestamps should be valid ISO 8601 UTC strings."""
+        gandalf_logger = logging.getLogger("gandalf")
+        gandalf_logger.setLevel(logging.DEBUG)
+        try:
+            response = lookup(graph, self._make_query(), bmt=bmt)
+        finally:
+            gandalf_logger.setLevel(logging.WARNING)
+        for entry in response["logs"]:
+            ts = entry["timestamp"]
+            assert ts.endswith("Z")
+            datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+
+    def test_log_levels_are_valid(self, graph, bmt):
+        """Log levels should be one of the TRAPI-spec values or None."""
+        valid_levels = {"ERROR", "WARNING", "INFO", "DEBUG", None}
+        gandalf_logger = logging.getLogger("gandalf")
+        gandalf_logger.setLevel(logging.DEBUG)
+        try:
+            response = lookup(graph, self._make_query(), bmt=bmt)
+        finally:
+            gandalf_logger.setLevel(logging.WARNING)
+        for entry in response["logs"]:
+            assert entry.get("level") in valid_levels
+
+    def test_empty_results_still_have_logs(self, graph, bmt):
+        """Queries that return no results should still include logs."""
+        query = {
+            "message": {
+                "query_graph": {
+                    "nodes": {
+                        "n0": {"ids": ["NONEXISTENT:0000"]},
+                        "n1": {"categories": ["biolink:Gene"]},
+                    },
+                    "edges": {
+                        "e0": {
+                            "subject": "n0",
+                            "object": "n1",
+                            "predicates": ["biolink:treats"],
+                        },
+                    },
+                },
+            },
+        }
+        response = lookup(graph, query, bmt=bmt)
+        assert "logs" in response
+        assert isinstance(response["logs"], list)

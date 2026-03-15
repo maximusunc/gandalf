@@ -11,6 +11,7 @@ from bmt.toolkit import Toolkit
 
 logger = logging.getLogger(__name__)
 
+from gandalf.logging_config import TRAPILogCollector
 from gandalf.query_planner import get_next_qedge, remove_orphaned
 from gandalf.search.expanders import PredicateExpander, QualifierExpander
 from gandalf.search.gc_utils import GCMonitor
@@ -45,6 +46,11 @@ def lookup(
     """
     t_start = time.perf_counter()
 
+    # Collect TRAPI-spec log entries during query execution
+    log_collector = TRAPILogCollector()
+    gandalf_logger = logging.getLogger("gandalf")
+    gandalf_logger.addHandler(log_collector)
+
     # Start GC monitoring to track collection events
     gc_monitor = GCMonitor()
     gc_monitor.start()
@@ -57,7 +63,7 @@ def lookup(
     gc.disable()
 
     try:
-        return _lookup_inner(
+        response = _lookup_inner(
             graph,
             query,
             bmt,
@@ -68,7 +74,10 @@ def lookup(
             max_node_degree=max_node_degree,
             min_information_content=min_information_content,
         )
+        response["logs"] = log_collector.get_logs()
+        return response
     finally:
+        gandalf_logger.removeHandler(log_collector)
         gc_monitor.stop()
         if gc_was_enabled_at_start:
             gc.enable()
