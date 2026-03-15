@@ -628,7 +628,7 @@ def async_query(
         raise HTTPException(400, "callback must be an http:// or https:// URL")
 
     # parse requested workflow
-    workflow = query.workflow or [WorkflowStep(id="lookup")]
+    workflow = query.workflow or [WorkflowStep(id="lookup", parameters=None)]
     workflow_dicts = [w.model_dump(exclude_none=True) for w in workflow]
 
     if len(workflow_dicts) != 1:

@@ -5,7 +5,7 @@ import pickle
 import shutil
 import time
 from pathlib import Path
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 import logging
 
@@ -155,7 +155,7 @@ class EdgePropertyStore:
             pickle.dump(pools, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     @classmethod
-    def load_mmap(cls, directory: Path, mmap_mode: str = "r"):
+    def load_mmap(cls, directory: Path, mmap_mode: Literal["r+", "r", "w+", "c"] = "r"):
         """Load from directory, memory-mapping the index arrays."""
         store = cls()
 
@@ -992,7 +992,9 @@ class CSRGraph:
         logger.debug("  Total: %.1f MB", total_size / 1024 / 1024)
 
     @staticmethod
-    def load_mmap(directory: Union[str, Path], mmap_mode: str = "r"):
+    def load_mmap(
+        directory: Union[str, Path], mmap_mode: Literal["r+", "r", "w+", "c"] = "r"
+    ):
         """Load graph from memory-mapped format.
 
         Supports both the new hybrid format (dedup store + LMDB) and

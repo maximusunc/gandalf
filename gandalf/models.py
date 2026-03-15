@@ -93,7 +93,7 @@ class Message(BaseModel):
 # POST /query — request model
 # ---------------------------------------------------------------------------
 
-_QUERY_EXAMPLE_ONEHOP = {
+_QUERY_EXAMPLE_ONEHOP: dict = {
     "message": {
         "query_graph": {
             "nodes": {
@@ -111,7 +111,7 @@ _QUERY_EXAMPLE_ONEHOP = {
     }
 }
 
-_QUERY_EXAMPLE_TWOHOP = {
+_QUERY_EXAMPLE_TWOHOP: dict = {
     "message": {
         "query_graph": {
             "nodes": {
@@ -135,7 +135,7 @@ _QUERY_EXAMPLE_TWOHOP = {
     }
 }
 
-_QUERY_EXAMPLE_QUALIFIERS = {
+_QUERY_EXAMPLE_QUALIFIERS: dict = {
     "message": {
         "query_graph": {
             "nodes": {
