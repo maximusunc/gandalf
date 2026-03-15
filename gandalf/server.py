@@ -25,8 +25,8 @@ from gandalf import CSRGraph, lookup
 from gandalf.logging_config import configure_logging, request_id_var
 from gandalf.models import (
     AsyncTRAPIQuery,
-    EdgeSummaryResponse,
     EdgesResponse,
+    EdgeSummaryResponse,
     MetadataResponse,
     NodeResponse,
     TRAPIQuery,
@@ -38,7 +38,7 @@ from gandalf.models import (
 # Configuration via environment variables
 # ---------------------------------------------------------------------------
 
-GRAPH_PATH = os.environ.get("GANDALF_GRAPH_PATH", "../12_17_2025/gandalf_mmap")
+GRAPH_PATH = os.environ.get("GANDALF_GRAPH_PATH", "../02_26_2026/gandalf_mmap")
 GRAPH_FORMAT = os.environ.get("GANDALF_GRAPH_FORMAT", "auto")  # "auto" or "mmap"
 LOG_LEVEL = os.environ.get("GANDALF_LOG_LEVEL", "INFO").upper()
 LOG_FORMAT = os.environ.get("GANDALF_LOG_FORMAT", "text")  # "text" or "json"
