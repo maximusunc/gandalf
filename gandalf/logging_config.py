@@ -46,9 +46,7 @@ class TRAPILogCollector(logging.Handler):
         level_name = record.levelname
         self._entries.append(
             {
-                "timestamp": datetime.now(timezone.utc).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                ),
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "level": level_name if level_name in _TRAPI_LEVELS else None,
                 "message": record.getMessage(),
             }

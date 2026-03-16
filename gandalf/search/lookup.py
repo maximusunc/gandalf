@@ -340,7 +340,9 @@ def _lookup_inner(
         )
 
     t_stop = time.perf_counter()
-    logger.info(f"Returning {len(response['message']['results'])} results in {t_stop - t_start} seconds.")
+    logger.info(
+        f"Returning {len(response['message']['results'])} results in {t_stop - t_start} seconds."
+    )
     return response
 
 

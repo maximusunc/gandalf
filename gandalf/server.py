@@ -577,7 +577,11 @@ def sync_lookup(
     subclass_depth = raw.get("subclass_depth", 1)
 
     return lookup(
-        GRAPH, raw, bmt=BMT, subclass=sc, subclass_depth=subclass_depth,
+        GRAPH,
+        raw,
+        bmt=BMT,
+        subclass=sc,
+        subclass_depth=subclass_depth,
         log_level=log_level,
     )
 
@@ -593,7 +597,11 @@ def _async_lookup(callback_url: str, query: dict):
     subclass_depth = query.get("subclass_depth", 1)
     log_level = query.pop("log_level", None)
     response = lookup(
-        GRAPH, query, bmt=BMT, subclass=subclass, subclass_depth=subclass_depth,
+        GRAPH,
+        query,
+        bmt=BMT,
+        subclass=subclass,
+        subclass_depth=subclass_depth,
         log_level=log_level,
     )
 

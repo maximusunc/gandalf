@@ -350,12 +350,8 @@ class TestTRAPILogs:
 
     def test_log_level_parameter_controls_verbosity(self, graph, bmt):
         """The log_level parameter should control which logs are captured."""
-        debug_response = lookup(
-            graph, self._make_query(), bmt=bmt, log_level="DEBUG"
-        )
-        error_response = lookup(
-            graph, self._make_query(), bmt=bmt, log_level="ERROR"
-        )
+        debug_response = lookup(graph, self._make_query(), bmt=bmt, log_level="DEBUG")
+        error_response = lookup(graph, self._make_query(), bmt=bmt, log_level="ERROR")
         # DEBUG level captures more logs than ERROR level
         assert len(debug_response["logs"]) > len(error_response["logs"])
 
