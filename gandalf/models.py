@@ -4,9 +4,35 @@ Provides TRAPI-compatible request/response models with OpenAPI examples
 for the Swagger UI documentation.
 """
 
+from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
+
+# ---------------------------------------------------------------------------
+# TRAPI log components
+# ---------------------------------------------------------------------------
+
+
+class LogLevel(str, Enum):
+    """TRAPI log severity levels."""
+
+    ERROR = "ERROR"
+    WARNING = "WARNING"
+    INFO = "INFO"
+    DEBUG = "DEBUG"
+
+
+class LogEntry(BaseModel):
+    """A single TRAPI log entry conforming to the Translator Reasoner API spec."""
+
+    timestamp: str = Field(..., description="ISO 8601 timestamp (UTC with 'Z' tag)")
+    level: Optional[str] = Field(None, description="Log severity level")
+    code: Optional[str] = Field(None, description="Standardized short code")
+    message: str = Field(..., description="Human-readable log message")
+
+    model_config = ConfigDict(extra="allow")
+
 
 # ---------------------------------------------------------------------------
 # Query graph components (request validation)
@@ -256,6 +282,13 @@ class AsyncTRAPIQuery(BaseModel):
     )
     set_interpretation: Optional[str] = Field(
         None, description="Set interpretation mode (only 'BATCH' is supported)"
+    )
+    log_level: Optional[Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]] = (
+        Field(
+            None,
+            description="Set logging level for this request "
+            "(e.g. 'DEBUG' to see detailed query processing)",
+        )
     )
 
     model_config = ConfigDict(

@@ -11,6 +11,7 @@ from bmt.toolkit import Toolkit
 
 logger = logging.getLogger(__name__)
 
+from gandalf.logging_config import TRAPILogCollector
 from gandalf.query_planner import get_next_qedge, remove_orphaned
 from gandalf.search.expanders import PredicateExpander, QualifierExpander
 from gandalf.search.gc_utils import GCMonitor
@@ -26,6 +27,7 @@ def lookup(
     subclass_depth=1,
     max_node_degree=None,
     min_information_content=None,
+    log_level=None,
 ):
     """Take an arbitrary Translator query graph and return all matching paths.
 
@@ -39,11 +41,24 @@ def lookup(
             exceeding this value during path traversal.
         min_information_content: If set, filter out nodes whose
             information_content attribute is below this value.
+        log_level: If set, temporarily adjust the gandalf logger to this level
+            (e.g. ``"DEBUG"``) for the duration of the query.
 
     Returns:
-        TRAPI response dict with message containing results, knowledge_graph, etc.
+        TRAPI response dict with message containing results, knowledge_graph,
+        and a ``logs`` list of TRAPI LogEntry dicts.
     """
     t_start = time.perf_counter()
+
+    # Collect TRAPI-spec log entries during query execution.
+    # Temporarily adjust the logger level if requested so that the collector
+    # captures entries at the desired verbosity.
+    log_collector = TRAPILogCollector()
+    gandalf_logger = logging.getLogger("gandalf")
+    prev_level = gandalf_logger.level
+    if log_level is not None:
+        gandalf_logger.setLevel(log_level)
+    gandalf_logger.addHandler(log_collector)
 
     # Start GC monitoring to track collection events
     gc_monitor = GCMonitor()
@@ -57,7 +72,7 @@ def lookup(
     gc.disable()
 
     try:
-        return _lookup_inner(
+        response = _lookup_inner(
             graph,
             query,
             bmt,
@@ -68,7 +83,11 @@ def lookup(
             max_node_degree=max_node_degree,
             min_information_content=min_information_content,
         )
+        response["logs"] = log_collector.get_logs()
+        return response
     finally:
+        gandalf_logger.removeHandler(log_collector)
+        gandalf_logger.setLevel(prev_level)
         gc_monitor.stop()
         if gc_was_enabled_at_start:
             gc.enable()
@@ -86,10 +105,11 @@ def _lookup_inner(
     min_information_content=None,
 ):
     """Inner implementation of lookup with all the core logic."""
+    logger.info("Starting lookup.")
     if bmt is None:
         bmt = Toolkit()
         t_bmt = time.perf_counter()
-        logger.debug("BMT initialization: %.2fs", t_bmt - t_start)
+        logger.warning("BMT initialization: %.2fs", t_bmt - t_start)
     else:
         logger.debug("Using provided BMT instance")
 
@@ -319,7 +339,10 @@ def _lookup_inner(
             gc_summary["total_collected"],
         )
 
-    logger.info(f"Returning {len(response['message']['results'])} results.")
+    t_stop = time.perf_counter()
+    logger.info(
+        f"Returning {len(response['message']['results'])} results in {t_stop - t_start} seconds."
+    )
     return response
 
 

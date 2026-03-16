@@ -4,6 +4,7 @@ import json
 import logging
 import sys
 from contextvars import ContextVar
+from datetime import datetime, timezone
 
 # Context variable for per-request ID propagation.
 request_id_var: ContextVar[str] = ContextVar("request_id", default="")
@@ -25,6 +26,35 @@ class _JSONFormatter(logging.Formatter):
         if record.exc_info and record.exc_info[0] is not None:
             entry["exception"] = self.formatException(record.exc_info)
         return json.dumps(entry)
+
+
+_TRAPI_LEVELS = {"ERROR", "WARNING", "INFO", "DEBUG"}
+
+
+class TRAPILogCollector(logging.Handler):
+    """A logging handler that collects log entries as TRAPI-spec LogEntry dicts.
+
+    Attach to the ``gandalf`` logger for the duration of a query, then call
+    :meth:`get_logs` to retrieve the accumulated entries.
+    """
+
+    def __init__(self, level: int = logging.DEBUG):
+        super().__init__(level)
+        self._entries: list[dict] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        level_name = record.levelname
+        self._entries.append(
+            {
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "level": level_name if level_name in _TRAPI_LEVELS else None,
+                "message": record.getMessage(),
+            }
+        )
+
+    def get_logs(self) -> list[dict]:
+        """Return collected log entries in chronological order."""
+        return list(self._entries)
 
 
 def configure_logging(level=logging.INFO, fmt: str = "text"):
