@@ -1,6 +1,5 @@
 """Tests for TRAPI response structure and specific edge queries."""
 
-import logging
 from datetime import datetime
 
 from tests.search_fixtures import graph  # noqa: F401
@@ -328,12 +327,7 @@ class TestTRAPILogs:
 
     def test_log_entries_have_required_fields(self, graph, bmt):
         """Each log entry should have 'timestamp' and 'message' fields."""
-        gandalf_logger = logging.getLogger("gandalf")
-        gandalf_logger.setLevel(logging.DEBUG)
-        try:
-            response = lookup(graph, self._make_query(), bmt=bmt)
-        finally:
-            gandalf_logger.setLevel(logging.WARNING)
+        response = lookup(graph, self._make_query(), bmt=bmt, log_level="DEBUG")
         assert len(response["logs"]) > 0
         for entry in response["logs"]:
             assert "timestamp" in entry
@@ -341,12 +335,7 @@ class TestTRAPILogs:
 
     def test_log_timestamps_are_iso8601(self, graph, bmt):
         """Log timestamps should be valid ISO 8601 UTC strings."""
-        gandalf_logger = logging.getLogger("gandalf")
-        gandalf_logger.setLevel(logging.DEBUG)
-        try:
-            response = lookup(graph, self._make_query(), bmt=bmt)
-        finally:
-            gandalf_logger.setLevel(logging.WARNING)
+        response = lookup(graph, self._make_query(), bmt=bmt, log_level="DEBUG")
         for entry in response["logs"]:
             ts = entry["timestamp"]
             assert ts.endswith("Z")
@@ -355,14 +344,20 @@ class TestTRAPILogs:
     def test_log_levels_are_valid(self, graph, bmt):
         """Log levels should be one of the TRAPI-spec values or None."""
         valid_levels = {"ERROR", "WARNING", "INFO", "DEBUG", None}
-        gandalf_logger = logging.getLogger("gandalf")
-        gandalf_logger.setLevel(logging.DEBUG)
-        try:
-            response = lookup(graph, self._make_query(), bmt=bmt)
-        finally:
-            gandalf_logger.setLevel(logging.WARNING)
+        response = lookup(graph, self._make_query(), bmt=bmt, log_level="DEBUG")
         for entry in response["logs"]:
             assert entry.get("level") in valid_levels
+
+    def test_log_level_parameter_controls_verbosity(self, graph, bmt):
+        """The log_level parameter should control which logs are captured."""
+        debug_response = lookup(
+            graph, self._make_query(), bmt=bmt, log_level="DEBUG"
+        )
+        error_response = lookup(
+            graph, self._make_query(), bmt=bmt, log_level="ERROR"
+        )
+        # DEBUG level captures more logs than ERROR level
+        assert len(debug_response["logs"]) > len(error_response["logs"])
 
     def test_empty_results_still_have_logs(self, graph, bmt):
         """Queries that return no results should still include logs."""

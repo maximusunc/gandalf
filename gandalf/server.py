@@ -569,27 +569,17 @@ def sync_lookup(
     if GRAPH is None:
         raise HTTPException(503, "Graph not loaded")
 
-    # Temporarily adjust log level for this request if requested
-    gandalf_logger = logging.getLogger("gandalf")
-    prev_level = gandalf_logger.level
-    if request.log_level is not None:
-        gandalf_logger.setLevel(request.log_level)
+    raw = request.model_dump(exclude_none=True)
+    log_level = raw.pop("log_level", None)
 
-    try:
-        raw = request.model_dump(exclude_none=True)
-        raw.pop("log_level", None)
+    # Query params take precedence, fall back to request body
+    sc = subclass if subclass is not None else raw.get("subclass", True)
+    subclass_depth = raw.get("subclass_depth", 1)
 
-        # Query params take precedence, fall back to request body
-        sc = subclass if subclass is not None else raw.get("subclass", True)
-        subclass_depth = raw.get("subclass_depth", 1)
-
-        response = lookup(
-            GRAPH, raw, bmt=BMT, subclass=sc, subclass_depth=subclass_depth
-        )
-
-        return response
-    finally:
-        gandalf_logger.setLevel(prev_level)
+    return lookup(
+        GRAPH, raw, bmt=BMT, subclass=sc, subclass_depth=subclass_depth,
+        log_level=log_level,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -601,8 +591,10 @@ def _async_lookup(callback_url: str, query: dict):
     """Execute lookup and POST results to callback URL."""
     subclass = query.get("subclass", True)
     subclass_depth = query.get("subclass_depth", 1)
+    log_level = query.pop("log_level", None)
     response = lookup(
-        GRAPH, query, bmt=BMT, subclass=subclass, subclass_depth=subclass_depth
+        GRAPH, query, bmt=BMT, subclass=subclass, subclass_depth=subclass_depth,
+        log_level=log_level,
     )
 
     try:

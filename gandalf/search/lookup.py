@@ -27,6 +27,7 @@ def lookup(
     subclass_depth=1,
     max_node_degree=None,
     min_information_content=None,
+    log_level=None,
 ):
     """Take an arbitrary Translator query graph and return all matching paths.
 
@@ -40,15 +41,23 @@ def lookup(
             exceeding this value during path traversal.
         min_information_content: If set, filter out nodes whose
             information_content attribute is below this value.
+        log_level: If set, temporarily adjust the gandalf logger to this level
+            (e.g. ``"DEBUG"``) for the duration of the query.
 
     Returns:
-        TRAPI response dict with message containing results, knowledge_graph, etc.
+        TRAPI response dict with message containing results, knowledge_graph,
+        and a ``logs`` list of TRAPI LogEntry dicts.
     """
     t_start = time.perf_counter()
 
-    # Collect TRAPI-spec log entries during query execution
+    # Collect TRAPI-spec log entries during query execution.
+    # Temporarily adjust the logger level if requested so that the collector
+    # captures entries at the desired verbosity.
     log_collector = TRAPILogCollector()
     gandalf_logger = logging.getLogger("gandalf")
+    prev_level = gandalf_logger.level
+    if log_level is not None:
+        gandalf_logger.setLevel(log_level)
     gandalf_logger.addHandler(log_collector)
 
     # Start GC monitoring to track collection events
@@ -78,6 +87,7 @@ def lookup(
         return response
     finally:
         gandalf_logger.removeHandler(log_collector)
+        gandalf_logger.setLevel(prev_level)
         gc_monitor.stop()
         if gc_was_enabled_at_start:
             gc.enable()

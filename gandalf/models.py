@@ -283,6 +283,13 @@ class AsyncTRAPIQuery(BaseModel):
     set_interpretation: Optional[str] = Field(
         None, description="Set interpretation mode (only 'BATCH' is supported)"
     )
+    log_level: Optional[Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]] = (
+        Field(
+            None,
+            description="Set logging level for this request "
+            "(e.g. 'DEBUG' to see detailed query processing)",
+        )
+    )
 
     model_config = ConfigDict(
         extra="allow",
