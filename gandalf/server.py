@@ -36,7 +36,9 @@ from gandalf.models import (
 from gandalf.config import settings
 from gandalf.openapi import construct_open_api_schema
 
-configure_logging(getattr(logging, settings.log_level, logging.INFO), fmt=settings.log_format)
+configure_logging(
+    getattr(logging, settings.log_level, logging.INFO), fmt=settings.log_format
+)
 logger = logging.getLogger(__name__)
 
 GRAPH = None
@@ -92,9 +94,7 @@ class _TokenBucket:
         return False
 
 
-_rate_limiter = (
-    _TokenBucket(settings.rate_limit) if settings.rate_limit > 0 else None
-)
+_rate_limiter = _TokenBucket(settings.rate_limit) if settings.rate_limit > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +138,11 @@ def load_graph(path: str, format: str = "auto") -> CSRGraph:
 async def lifespan(app: FastAPI):
     """Handle graph and BMT loading on startup."""
     global GRAPH, BMT
-    logger.info("Loading graph from %s (format=%s)...", settings.graph_path, settings.graph_format)
+    logger.info(
+        "Loading graph from %s (format=%s)...",
+        settings.graph_path,
+        settings.graph_format,
+    )
     GRAPH = load_graph(settings.graph_path, settings.graph_format)
     logger.info("Initializing Biolink Model Toolkit...")
     BMT = Toolkit()
@@ -202,7 +206,10 @@ async def request_middleware(request: Request, call_next):
     # Request size limit (skip for GET/HEAD/OPTIONS)
     if request.method in ("POST", "PUT", "PATCH"):
         content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > settings.max_request_size_mb * 1024 * 1024:
+        if (
+            content_length
+            and int(content_length) > settings.max_request_size_mb * 1024 * 1024
+        ):
             return JSONResponse(
                 status_code=413,
                 content={
