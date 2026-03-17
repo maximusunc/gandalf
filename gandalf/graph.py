@@ -277,6 +277,10 @@ class CSRGraph:
         # Edge IDs from the original data — set later by loader or load_mmap
         self.edge_ids = None
 
+        # Graph Metadata - set later by loader or load_mmap
+        self.meta_kg = None
+        self.graph_metadata = None
+
         # Build both forward and reverse CSR structures
         logger.debug("Building forward CSR...")
         self._build_forward_csr(edges, edge_predicates, edge_properties)
