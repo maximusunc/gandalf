@@ -113,30 +113,30 @@ class GandalfUser(HttpUser):
 
     # -- lightweight / read-only endpoints ----------------------------------
 
-    @task(2)
+    @task(0)
     def health_check(self):
         self.client.get("/health")
 
-    @task(2)
+    @task(0)
     def metadata(self):
         self.client.get("/metadata")
 
-    @task(1)
+    @task(0)
     def meta_knowledge_graph(self):
         self.client.get("/meta_knowledge_graph")
 
-    @task(1)
+    @task(0)
     def simple_spec(self):
         self.client.get("/simple_spec")
 
     # -- node / edge lookups ------------------------------------------------
 
-    @task(3)
+    @task(0)
     def node_lookup(self):
         curie = random.choice(SAMPLE_CURIES)
         self.client.get(f"/node/{curie}", name="/node/[curie]")
 
-    @task(3)
+    @task(0)
     def edges_lookup(self):
         curie = random.choice(SAMPLE_CURIES)
         params = {}
@@ -151,7 +151,7 @@ class GandalfUser(HttpUser):
             params["count_only"] = "true"
         self.client.get(f"/edges/{curie}", params=params, name="/edges/[curie]")
 
-    @task(2)
+    @task(0)
     def edge_summary(self):
         curie = random.choice(SAMPLE_CURIES)
         self.client.get(f"/edge_summary/{curie}", name="/edge_summary/[curie]")
@@ -166,7 +166,7 @@ class GandalfUser(HttpUser):
         body = _onehop_query([subject], [obj_cat], [pred])
         self.client.post("/query", json=body, name="/query [1-hop]")
 
-    @task(3)
+    @task(5)
     def query_twohop(self):
         subject = random.choice(DRUG_CURIES)
         body = _twohop_query(
@@ -178,7 +178,7 @@ class GandalfUser(HttpUser):
         )
         self.client.post("/query", json=body, name="/query [2-hop]")
 
-    @task(2)
+    @task(5)
     def query_onehop_with_qualifiers(self):
         subject = random.choice(DRUG_CURIES)
         body = {
