@@ -33,20 +33,10 @@ from gandalf.models import (
     TRAPIResponse,
     WorkflowStep,
 )
+from gandalf.config import settings
+from gandalf.openapi import construct_open_api_schema
 
-# ---------------------------------------------------------------------------
-# Configuration via environment variables
-# ---------------------------------------------------------------------------
-
-GRAPH_PATH = os.environ.get("GANDALF_GRAPH_PATH", "../02_26_2026/gandalf_mmap")
-GRAPH_FORMAT = os.environ.get("GANDALF_GRAPH_FORMAT", "auto")  # "auto" or "mmap"
-LOG_LEVEL = os.environ.get("GANDALF_LOG_LEVEL", "INFO").upper()
-LOG_FORMAT = os.environ.get("GANDALF_LOG_FORMAT", "text")  # "text" or "json"
-CORS_ORIGINS = os.environ.get("GANDALF_CORS_ORIGINS", "*")
-MAX_REQUEST_SIZE_MB = int(os.environ.get("GANDALF_MAX_REQUEST_SIZE_MB", "10"))
-RATE_LIMIT_PER_MINUTE = int(os.environ.get("GANDALF_RATE_LIMIT", "0"))
-
-configure_logging(getattr(logging, LOG_LEVEL, logging.INFO), fmt=LOG_FORMAT)
+configure_logging(getattr(logging, settings.log_level, logging.INFO), fmt=settings.log_format)
 logger = logging.getLogger(__name__)
 
 GRAPH = None
@@ -103,7 +93,7 @@ class _TokenBucket:
 
 
 _rate_limiter = (
-    _TokenBucket(RATE_LIMIT_PER_MINUTE) if RATE_LIMIT_PER_MINUTE > 0 else None
+    _TokenBucket(settings.rate_limit) if settings.rate_limit > 0 else None
 )
 
 
@@ -148,8 +138,8 @@ def load_graph(path: str, format: str = "auto") -> CSRGraph:
 async def lifespan(app: FastAPI):
     """Handle graph and BMT loading on startup."""
     global GRAPH, BMT
-    logger.info("Loading graph from %s (format=%s)...", GRAPH_PATH, GRAPH_FORMAT)
-    GRAPH = load_graph(GRAPH_PATH, GRAPH_FORMAT)
+    logger.info("Loading graph from %s (format=%s)...", settings.graph_path, settings.graph_format)
+    GRAPH = load_graph(settings.graph_path, settings.graph_format)
     logger.info("Initializing Biolink Model Toolkit...")
     BMT = Toolkit()
 
@@ -183,7 +173,7 @@ APP = FastAPI(
 )
 
 # Parse CORS origins from env var (comma-separated)
-_cors_origins = [o.strip() for o in CORS_ORIGINS.split(",")]
+_cors_origins = [o.strip() for o in settings.cors_origins.split(",")]
 APP.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -192,7 +182,7 @@ APP.add_middleware(
     allow_headers=["*"],
 )
 
-STATIC_DIR = Path(__file__).parent.parent / "static"
+STATIC_DIR = Path(__file__).parent / "static"
 if STATIC_DIR.exists():
     APP.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -212,11 +202,11 @@ async def request_middleware(request: Request, call_next):
     # Request size limit (skip for GET/HEAD/OPTIONS)
     if request.method in ("POST", "PUT", "PATCH"):
         content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > MAX_REQUEST_SIZE_MB * 1024 * 1024:
+        if content_length and int(content_length) > settings.max_request_size_mb * 1024 * 1024:
             return JSONResponse(
                 status_code=413,
                 content={
-                    "detail": f"Request body too large (max {MAX_REQUEST_SIZE_MB}MB)"
+                    "detail": f"Request body too large (max {settings.max_request_size_mb}MB)"
                 },
             )
 
@@ -285,7 +275,7 @@ async def custom_swagger_ui_html(req: Request) -> HTMLResponse:
     """Customize Swagger UI."""
     root_path = req.scope.get("root_path", "").rstrip("/")
     openapi_url = root_path + APP.openapi_url
-    swagger_favicon_url = root_path + "/static/favicon.png"
+    swagger_favicon_url = root_path + "/static/gandalf.png"
     return get_swagger_ui_html(
         openapi_url=openapi_url,
         title=APP.title + " - Swagger UI",
@@ -440,3 +430,9 @@ def async_query(
     background_tasks.add_task(_async_lookup, callback, raw)
 
     return {"status": "accepted", "callback": callback}
+
+
+APP.openapi_schema = construct_open_api_schema(
+    APP,
+    infores="infores:shepherd",
+)

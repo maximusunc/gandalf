@@ -114,10 +114,6 @@ class GandalfUser(HttpUser):
     # -- lightweight / read-only endpoints ----------------------------------
 
     @task(0)
-    def health_check(self):
-        self.client.get("/health")
-
-    @task(0)
     def metadata(self):
         self.client.get("/metadata")
 
@@ -135,7 +131,7 @@ class GandalfUser(HttpUser):
         body = _onehop_query([subject], [obj_cat], [pred])
         self.client.post("/query", json=body, name="/query [1-hop]")
 
-    @task(5)
+    @task(0)
     def query_twohop(self):
         subject = random.choice(DRUG_CURIES)
         body = _twohop_query(
@@ -147,7 +143,7 @@ class GandalfUser(HttpUser):
         )
         self.client.post("/query", json=body, name="/query [2-hop]")
 
-    @task(5)
+    @task(0)
     def query_onehop_with_qualifiers(self):
         subject = random.choice(DRUG_CURIES)
         body = {
