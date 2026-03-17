@@ -855,35 +855,33 @@ class CSRGraph:
         triple_counts, _ = self._scan_edge_triples(node_categories)
 
         # -- Node attributes: collect unique (attribute_type_id, attribute_source,
-        #    original_attribute_name) per category --
-        # cat -> {(type_id, source) -> set of original_attribute_names}
-        cat_attr_map = {}
+        #    original_attribute_name) tuples per category.
+        #    Each unique original_attribute_name gets its own descriptor entry.
+        # cat -> set of (type_id, source, orig_name)
+        cat_attr_set = {}
         for node_idx in range(self.num_nodes):
             props = self.node_properties.get(node_idx, {})
             cat = node_categories[node_idx]
-            if cat not in cat_attr_map:
-                cat_attr_map[cat] = {}
+            if cat not in cat_attr_set:
+                cat_attr_set[cat] = set()
             for attr in props.get("attributes", []):
                 type_id = attr.get("attribute_type_id", "biolink:Attribute")
                 source = attr.get("attribute_source", None)
                 orig_name = attr.get("original_attribute_name")
-                group_key = (type_id, source)
-                if group_key not in cat_attr_map[cat]:
-                    cat_attr_map[cat][group_key] = set()
                 if orig_name:
-                    cat_attr_map[cat][group_key].add(orig_name)
+                    cat_attr_set[cat].add((type_id, source, orig_name))
 
         meta_nodes = {}
         for cat, prefixes in category_prefixes.items():
             attrs = []
-            for (type_id, source), orig_names in sorted(
-                cat_attr_map.get(cat, {}).items()
+            for type_id, source, orig_name in sorted(
+                cat_attr_set.get(cat, set())
             ):
                 attrs.append(
                     {
                         "attribute_type_id": type_id,
                         "attribute_source": source,
-                        "original_attribute_names": sorted(orig_names),
+                        "original_attribute_names": [orig_name],
                         "constraint_use": False,
                         "constraint_name": None,
                     }
@@ -894,8 +892,8 @@ class CSRGraph:
             }
 
         # -- Edge attributes: full scan of LMDB + hot-path qualifiers --
-        # triple_key -> {(type_id, source) -> set of original_attribute_names}
-        triple_attr_map = {key: {} for key in triple_counts}
+        # triple_key -> set of (type_id, source, orig_name)
+        triple_attr_set = {key: set() for key in triple_counts}
         # triple_key -> set of qualifier_type_ids
         triple_qual_map = {key: set() for key in triple_counts}
 
@@ -937,11 +935,10 @@ class CSRGraph:
                         type_id = attr.get("attribute_type_id", "biolink:Attribute")
                         source = attr.get("attribute_source", None)
                         orig_name = attr.get("original_attribute_name")
-                        group_key = (type_id, source)
-                        if group_key not in triple_attr_map[triple_key]:
-                            triple_attr_map[triple_key][group_key] = set()
                         if orig_name:
-                            triple_attr_map[triple_key][group_key].add(orig_name)
+                            triple_attr_set[triple_key].add(
+                                (type_id, source, orig_name)
+                            )
 
         del edge_to_triple
 
@@ -949,14 +946,14 @@ class CSRGraph:
         for subj_cat, pred, obj_cat in sorted(triple_counts):
             triple_key = (subj_cat, pred, obj_cat)
             attrs = []
-            for (type_id, source), orig_names in sorted(
-                triple_attr_map.get(triple_key, {}).items()
+            for type_id, source, orig_name in sorted(
+                triple_attr_set.get(triple_key, set())
             ):
                 attrs.append(
                     {
                         "attribute_type_id": type_id,
                         "attribute_source": source,
-                        "original_attribute_names": sorted(orig_names),
+                        "original_attribute_names": [orig_name],
                         "constraint_use": False,
                         "constraint_name": None,
                     }
