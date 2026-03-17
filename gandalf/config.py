@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     # Configuration via environment variables
     # ---------------------------------------------------------------------------
 
-    graph_path: str = "../03_13_2026/gandalf_mmap"
+    graph_path: str = "/data/graph"
     graph_format: str = "auto"  # "auto" or "mmap"
     log_level: str = "INFO"
     log_format: str = "text"  # "text" or "json"
