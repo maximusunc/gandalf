@@ -132,6 +132,9 @@ def load_graph(path: str, format: str = "auto") -> CSRGraph:
 
 _SKIP_PRELOAD = os.getenv("GANDALF_SKIP_PRELOAD", "").lower() in ("1", "true", "yes")
 
+GRAPH: Optional[CSRGraph] = None
+BMT: Optional[Toolkit] = None
+
 if not _SKIP_PRELOAD:
     logger.info(
         "Loading graph from %s (format=%s)...",
@@ -151,9 +154,6 @@ if not _SKIP_PRELOAD:
     # the (now-small) unfrozen query-time object set.
     gc.set_threshold(50_000, 50, 50)
     logger.info("Graph and BMT loaded at module level (PID=%d).", os.getpid())
-else:
-    GRAPH = None
-    BMT = None
 
 
 # ---------------------------------------------------------------------------
