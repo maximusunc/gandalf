@@ -34,6 +34,7 @@ from gandalf.models import (
     WorkflowStep,
 )
 from gandalf.config import settings
+from gandalf.heartbeat import start_heartbeat
 from gandalf.openapi import construct_open_api_schema
 
 configure_logging(
@@ -163,10 +164,15 @@ if not _SKIP_PRELOAD:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Worker lifecycle — only handles shutdown cleanup."""
+    """Worker lifecycle — handles heartbeat and shutdown cleanup."""
     logger.info("Worker started (PID=%d).", os.getpid())
+    heartbeat_stop = None
+    if settings.automat_host:
+        heartbeat_stop = start_heartbeat(settings)
     yield
     logger.info("Shutting down — releasing resources...")
+    if heartbeat_stop is not None:
+        heartbeat_stop.set()
     if (
         GRAPH is not None
         and hasattr(GRAPH, "lmdb_store")
