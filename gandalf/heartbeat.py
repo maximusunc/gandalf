@@ -28,7 +28,7 @@ def start_heartbeat(settings: Settings) -> threading.Event:
     automat_url = f"{settings.automat_host}/heartbeat"
     payload = {
         "host": settings.service_address,
-        "tag": "GANDALF",
+        "tag": settings.plater_title,
         "port": settings.web_port,
     }
 

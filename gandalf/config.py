@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     heart_rate: int = 30  # seconds between heartbeats
     service_address: str = ""  # reachable address of this Gandalf instance
     web_port: int = 8080  # port Gandalf is serving on
+    plater_title: str = ""
 
     otel_enabled: bool = True
     otel_service_name: str = "gandalf"
