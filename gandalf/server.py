@@ -211,10 +211,12 @@ if settings.otel_enabled:
     from opentelemetry import trace
     from opentelemetry.sdk.resources import SERVICE_NAME, Resource
     from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
     _otel_resource = Resource(attributes={SERVICE_NAME: settings.otel_service_name})
+
+    _otel_exporter: SpanExporter
 
     if settings.otel_use_console_exporter:
         from opentelemetry.sdk.trace.export import ConsoleSpanExporter
