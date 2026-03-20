@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 def _load_npy(path: Path, mmap_mode: Literal["r+", "r", "w+", "c"] = "r") -> np.ndarray:
     """Load a .npy file, optionally copying into RAM instead of memory-mapping."""
-    arr = np.load(path, mmap_mode=mmap_mode)
+    arr: np.ndarray = np.load(path, mmap_mode=mmap_mode)
     if settings.load_mmaps_into_memory:
         arr = np.array(arr)
     return arr
