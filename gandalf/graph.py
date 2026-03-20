@@ -1,33 +1,26 @@
 """Main Gandalf CSR Graph class."""
 
 import json
-import os
+import logging
 import pickle
 import shutil
 import time
 from pathlib import Path
 from typing import Literal, Optional, Union
 
-import logging
-
 import msgpack
 import numpy as np
 
+from gandalf.config import settings
 from gandalf.lmdb_store import LMDBPropertyStore
 
 logger = logging.getLogger(__name__)
 
-_LOAD_MMAPS_INTO_MEMORY = os.getenv("GANDALF_LOAD_MMAPS_INTO_MEMORY", "").lower() in (
-    "1",
-    "true",
-    "yes",
-)
 
-
-def _load_npy(path: Path, mmap_mode: str) -> np.ndarray:
+def _load_npy(path: Path, mmap_mode: Literal["r+", "r", "w+", "c"] = "r") -> np.ndarray:
     """Load a .npy file, optionally copying into RAM instead of memory-mapping."""
     arr = np.load(path, mmap_mode=mmap_mode)
-    if _LOAD_MMAPS_INTO_MEMORY:
+    if settings.load_mmaps_into_memory:
         arr = np.array(arr)
     return arr
 
@@ -1140,23 +1133,31 @@ class CSRGraph:
             "Loading graph from %s (mmap_mode=%s, in_memory=%s)...",
             directory,
             mmap_mode,
-            _LOAD_MMAPS_INTO_MEMORY,
+            settings.load_mmaps_into_memory,
         )
         t0 = time.perf_counter()
 
         graph = CSRGraph.__new__(CSRGraph)
 
         # Load NumPy arrays (memory-mapped or copied into RAM)
-        graph.fwd_targets = _load_npy(directory / "fwd_targets.npy", mmap_mode=mmap_mode)
+        graph.fwd_targets = _load_npy(
+            directory / "fwd_targets.npy", mmap_mode=mmap_mode
+        )
         graph.fwd_predicates = _load_npy(
             directory / "fwd_predicates.npy", mmap_mode=mmap_mode
         )
-        graph.fwd_offsets = _load_npy(directory / "fwd_offsets.npy", mmap_mode=mmap_mode)
-        graph.rev_sources = _load_npy(directory / "rev_sources.npy", mmap_mode=mmap_mode)
+        graph.fwd_offsets = _load_npy(
+            directory / "fwd_offsets.npy", mmap_mode=mmap_mode
+        )
+        graph.rev_sources = _load_npy(
+            directory / "rev_sources.npy", mmap_mode=mmap_mode
+        )
         graph.rev_predicates = _load_npy(
             directory / "rev_predicates.npy", mmap_mode=mmap_mode
         )
-        graph.rev_offsets = _load_npy(directory / "rev_offsets.npy", mmap_mode=mmap_mode)
+        graph.rev_offsets = _load_npy(
+            directory / "rev_offsets.npy", mmap_mode=mmap_mode
+        )
         rev_to_fwd_path = directory / "rev_to_fwd.npy"
         if rev_to_fwd_path.exists():
             graph.rev_to_fwd = _load_npy(rev_to_fwd_path, mmap_mode=mmap_mode)
