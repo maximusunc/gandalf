@@ -1,15 +1,21 @@
 """Path reconstruction from edge results using join operations."""
 
+import csv
 import logging
 import os
 import time
 from collections import defaultdict
+from datetime import datetime
 
 import numpy as np
 
 from gandalf.search.path_arrays import PathArrays
 
 logger = logging.getLogger(__name__)
+
+# When set, write a debug TSV of all reconstructed paths.
+# Set to a file path to write there, or "1"/"true" for an auto-named file.
+DEBUG_PATHS_TSV = os.environ.get("GANDALF_DEBUG_PATHS_TSV", "")
 
 
 # When path count exceeds this threshold, skip edge attribute enrichment
@@ -287,7 +293,7 @@ def reconstruct_paths(
     col_to_qnode = {v: k for k, v in qnode_to_col.items()}
     col_to_qedge = {v: k for k, v in qedge_to_col.items()}
 
-    return PathArrays(
+    path_arrays = PathArrays(
         paths_nodes=paths_nodes,
         paths_preds=paths_preds,
         paths_via_inverse=paths_via_inverse,
@@ -303,6 +309,152 @@ def reconstruct_paths(
         num_edges=num_edges,
         lightweight=lightweight,
     )
+
+    if DEBUG_PATHS_TSV:
+        _dump_debug_tsv(path_arrays, query_graph, join_order)
+
+    return path_arrays
+
+
+def _dump_debug_tsv(path_arrays, query_graph, join_order):
+    """Write all reconstructed paths to a TSV file for debugging.
+
+    Each row is one path.  Columns are dynamically generated based on the
+    number of hops so this works for arbitrary-length queries.
+
+    Column layout (interleaved nodes and edges in path order):
+        path_index,
+        n0_qnode, n0_curie, n0_name, n0_category,
+        e0_qedge, e0_predicate, e0_via_inverse,
+        n1_qnode, n1_curie, n1_name, n1_category,
+        e1_qedge, e1_predicate, e1_via_inverse,
+        ...
+        nN_qnode, nN_curie, nN_name, nN_category
+    """
+    # Determine output path
+    tsv_path = DEBUG_PATHS_TSV
+    if tsv_path.lower() in ("1", "true", "yes"):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tsv_path = f"debug_paths_{ts}.tsv"
+
+    pa = path_arrays
+    num_paths = len(pa)
+
+    if num_paths == 0:
+        logger.debug("  Debug TSV: no paths to write")
+        return
+
+    if num_paths > 1_000_000:
+        logger.warning(
+            "  Debug TSV: writing %s paths — file may be very large", f"{num_paths:,}"
+        )
+
+    # Build ordered sequence of (node_qid, edge_qid) pairs along the path.
+    # Walk edges in join_order, tracking which nodes we've visited, to produce
+    # a linear node-edge-node-edge-...-node sequence.
+    ordered_nodes = []  # qnode ids in path order
+    ordered_edges = []  # qedge ids in path order (between consecutive nodes)
+
+    visited_nodes = set()
+    for edge_id in join_order:
+        edge_def = query_graph["edges"][edge_id]
+        subj_qnode = edge_def["subject"]
+        obj_qnode = edge_def["object"]
+
+        if not ordered_nodes:
+            # First edge — add both nodes
+            ordered_nodes.append(subj_qnode)
+            ordered_nodes.append(obj_qnode)
+            visited_nodes.add(subj_qnode)
+            visited_nodes.add(obj_qnode)
+            ordered_edges.append(edge_id)
+        else:
+            subj_in = subj_qnode in visited_nodes
+            obj_in = obj_qnode in visited_nodes
+
+            if subj_in and not obj_in:
+                # Subject already in path; find where it is and insert edge+obj after it
+                insert_pos = ordered_nodes.index(subj_qnode)
+                ordered_nodes.insert(insert_pos + 1, obj_qnode)
+                ordered_edges.insert(insert_pos, edge_id)
+                visited_nodes.add(obj_qnode)
+            elif obj_in and not subj_in:
+                # Object already in path; insert subj+edge before it
+                insert_pos = ordered_nodes.index(obj_qnode)
+                ordered_nodes.insert(insert_pos, subj_qnode)
+                ordered_edges.insert(insert_pos, edge_id)
+                visited_nodes.add(subj_qnode)
+            elif subj_in and obj_in:
+                # Both already in path — insert edge between them
+                si = ordered_nodes.index(subj_qnode)
+                oi = ordered_nodes.index(obj_qnode)
+                edge_insert = min(si, oi)
+                ordered_edges.insert(edge_insert, edge_id)
+            else:
+                # Neither in path (cartesian) — append both
+                ordered_nodes.append(subj_qnode)
+                ordered_nodes.append(obj_qnode)
+                ordered_edges.append(edge_id)
+                visited_nodes.add(subj_qnode)
+                visited_nodes.add(obj_qnode)
+
+    # Build header
+    header = ["path_index"]
+    for i, qnode_id in enumerate(ordered_nodes):
+        prefix = f"n{i}"
+        header.extend(
+            [
+                f"{prefix}_qnode",
+                f"{prefix}_curie",
+                f"{prefix}_name",
+                f"{prefix}_category",
+            ]
+        )
+        if i < len(ordered_edges):
+            eprefix = f"e{i}"
+            header.extend(
+                [f"{eprefix}_qedge", f"{eprefix}_predicate", f"{eprefix}_via_inverse"]
+            )
+
+    try:
+        with open(tsv_path, "w", newline="") as fh:
+            writer = csv.writer(fh, delimiter="\t")
+            writer.writerow(header)
+
+            for path_idx in range(num_paths):
+                row = [path_idx]
+                for i, qnode_id in enumerate(ordered_nodes):
+                    col = pa.qnode_to_col.get(qnode_id)
+                    if col is not None:
+                        node_idx = int(pa.paths_nodes[path_idx, col])
+                        curie = pa.node_id_cache.get(node_idx, "")
+                        props = pa.node_cache.get(node_idx, {})
+                        name = props.get("name", "")
+                        categories = props.get("categories", [])
+                        category = categories[0] if categories else ""
+                    else:
+                        curie = ""
+                        name = ""
+                        category = ""
+                    row.extend([qnode_id, curie, name, category])
+
+                    if i < len(ordered_edges):
+                        edge_id = ordered_edges[i]
+                        ecol = pa.qedge_to_col.get(edge_id)
+                        if ecol is not None:
+                            pred_idx = int(pa.paths_preds[path_idx, ecol])
+                            predicate = pa.idx_to_predicate[pred_idx]
+                            via_inv = bool(pa.paths_via_inverse[path_idx, ecol])
+                        else:
+                            predicate = ""
+                            via_inv = ""
+                        row.extend([edge_id, predicate, via_inv])
+
+                writer.writerow(row)
+
+        logger.info("  Debug TSV: wrote %s paths to %s", f"{num_paths:,}", tsv_path)
+    except OSError as exc:
+        logger.error("  Debug TSV: failed to write %s: %s", tsv_path, exc)
 
 
 def _join_both_in_paths(
