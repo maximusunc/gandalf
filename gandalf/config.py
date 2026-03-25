@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     server_url: str = "http://localhost:6429"
     server_maturity: str = "development"
     server_location: str = "RENCI"
+    # Infores identifiers
+    infores: str = "infores:gandalf"
 
     # Heartbeat (Automat cluster registration)
     automat_host: str = ""  # e.g. "http://automat:8080"; empty = disabled
@@ -24,10 +26,6 @@ class Settings(BaseSettings):
     service_address: str = ""  # reachable address of this Gandalf instance
     web_port: int = 8080  # port Gandalf is serving on
     plater_title: str = ""
-
-    # Infores identifiers
-    infores_gandalf: str = "infores:gandalf"
-    infores_shepherd: str = "infores:shepherd"
 
     otel_enabled: bool = True
     otel_service_name: str = "gandalf"

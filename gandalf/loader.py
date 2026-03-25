@@ -91,7 +91,7 @@ def _extract_sources(data):
 
     # Prepend gandalf as aggregator_knowledge_source
     gandalf_source = {
-        "resource_id": settings.infores_gandalf,
+        "resource_id": settings.infores,
         "resource_role": "aggregator_knowledge_source",
         "upstream_resource_ids": top_ids,
     }

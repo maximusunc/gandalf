@@ -441,7 +441,7 @@ def _build_response(
             "node_bindings": {},
             "analyses": [
                 {
-                    "resource_id": settings.infores_gandalf,
+                    "resource_id": settings.infores,
                     "edge_bindings": {},
                 }
             ],
@@ -679,7 +679,7 @@ def _build_response(
                                 ],
                                 "sources": [
                                     {
-                                        "resource_id": settings.infores_gandalf,
+                                        "resource_id": settings.infores,
                                         "resource_role": "primary_knowledge_source",
                                     }
                                 ],
