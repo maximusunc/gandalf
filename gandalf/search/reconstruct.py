@@ -32,7 +32,8 @@ MAX_PATH_LIMIT = int(os.environ.get("GANDALF_MAX_PATH_LIMIT", "0"))
 
 
 def reconstruct_paths(
-    graph, query_graph, edge_results, edge_order, edge_inverse_preds=None
+    graph, query_graph, edge_results, edge_order, edge_inverse_preds=None,
+    dehydrated=None,
 ):
     """Reconstruct complete paths by iteratively joining edge results.
 
@@ -255,15 +256,26 @@ def reconstruct_paths(
     if num_paths == 0:
         return None
 
-    # Check if we exceed the large result threshold
-    lightweight = num_paths > LARGE_RESULT_PATH_THRESHOLD
+    # Determine lightweight (dehydrated) mode: explicit request takes
+    # precedence, otherwise fall back to the automatic path-count threshold.
+    if dehydrated is not None:
+        lightweight = dehydrated
+    else:
+        lightweight = num_paths > LARGE_RESULT_PATH_THRESHOLD
 
     if lightweight:
-        logger.debug(
-            "  %s paths (lightweight mode: >%s paths, skipping edge attributes)...",
-            f"{num_paths:,}",
-            f"{LARGE_RESULT_PATH_THRESHOLD:,}",
-        )
+        if dehydrated:
+            logger.debug(
+                "  %s paths (lightweight mode: dehydrated response requested, "
+                "skipping edge attributes)...",
+                f"{num_paths:,}",
+            )
+        else:
+            logger.debug(
+                "  %s paths (lightweight mode: >%s paths, skipping edge attributes)...",
+                f"{num_paths:,}",
+                f"{LARGE_RESULT_PATH_THRESHOLD:,}",
+            )
     else:
         logger.debug("  %s paths", f"{num_paths:,}")
 

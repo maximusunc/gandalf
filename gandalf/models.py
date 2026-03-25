@@ -236,6 +236,12 @@ class TRAPIQuery(BaseModel):
             "(e.g. 'DEBUG' to see serialization timings)",
         )
     )
+    dehydrated: Optional[bool] = Field(
+        None,
+        description="Return a dehydrated response (skip edge attribute enrichment). "
+        "Automatically enabled when path count exceeds the large result threshold "
+        "(overridden by query parameter if provided)",
+    )
 
     model_config = ConfigDict(
         extra="allow",

@@ -397,6 +397,10 @@ def sync_lookup(
     subclass: Optional[bool] = Query(
         None, description="Enable biolink subclass inference"
     ),
+    dehydrated: Optional[bool] = Query(
+        None,
+        description="Return a dehydrated response (skip edge attribute enrichment)",
+    ),
 ):
     """Execute a TRAPI query against the knowledge graph.
 
@@ -411,6 +415,9 @@ def sync_lookup(
     # Query params take precedence, fall back to request body
     sc = subclass if subclass is not None else raw.get("subclass", True)
     subclass_depth = raw.get("subclass_depth", 1)
+    dehydrated_param = (
+        dehydrated if dehydrated is not None else raw.get("dehydrated")
+    )
 
     return lookup(
         GRAPH,
@@ -419,6 +426,7 @@ def sync_lookup(
         subclass=sc,
         subclass_depth=subclass_depth,
         log_level=log_level,
+        dehydrated=dehydrated_param,
     )
 
 
@@ -432,6 +440,7 @@ def _async_lookup(callback_url: str, query: dict):
     subclass = query.get("subclass", True)
     subclass_depth = query.get("subclass_depth", 1)
     log_level = query.pop("log_level", None)
+    dehydrated = query.get("dehydrated")
     response = lookup(
         GRAPH,
         query,
@@ -439,6 +448,7 @@ def _async_lookup(callback_url: str, query: dict):
         subclass=subclass,
         subclass_depth=subclass_depth,
         log_level=log_level,
+        dehydrated=dehydrated,
     )
 
     try:
