@@ -494,5 +494,4 @@ def async_query(
 
 APP.openapi_schema = construct_open_api_schema(
     APP,
-    infores="infores:shepherd",
 )

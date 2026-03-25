@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     server_url: str = "http://localhost:6429"
     server_maturity: str = "development"
     server_location: str = "RENCI"
+    # Infores identifiers
+    infores: str = "infores:gandalf"
 
     # Heartbeat (Automat cluster registration)
     automat_host: str = ""  # e.g. "http://automat:8080"; empty = disabled

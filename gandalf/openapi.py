@@ -6,7 +6,7 @@ import yaml
 from gandalf.config import settings
 
 
-def construct_open_api_schema(app, description=None, infores=None, subpath=""):
+def construct_open_api_schema(app, description=None, subpath=""):
     """
     This creates the Open api schema object
 
@@ -37,8 +37,7 @@ def construct_open_api_schema(app, description=None, infores=None, subpath=""):
     if x_translator_extension:
         # if x_translator_team is defined amends schema with x_translator extension
         open_api_schema["info"]["x-translator"] = x_translator_extension
-        if infores is not None:
-            open_api_schema["info"]["x-translator"]["infores"] = infores
+        open_api_schema["info"]["x-translator"]["infores"] = settings.infores
 
     if x_trapi_extension:
         # if x_translator_team is defined amends schema with x_translator extension
