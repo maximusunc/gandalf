@@ -415,9 +415,7 @@ def sync_lookup(
     # Query params take precedence, fall back to request body
     sc = subclass if subclass is not None else raw.get("subclass", True)
     subclass_depth = raw.get("subclass_depth", 1)
-    dehydrated_param = (
-        dehydrated if dehydrated is not None else raw.get("dehydrated")
-    )
+    dehydrated_param = dehydrated if dehydrated is not None else raw.get("dehydrated")
 
     return lookup(
         GRAPH,

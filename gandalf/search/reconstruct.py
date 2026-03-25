@@ -32,7 +32,11 @@ MAX_PATH_LIMIT = int(os.environ.get("GANDALF_MAX_PATH_LIMIT", "0"))
 
 
 def reconstruct_paths(
-    graph, query_graph, edge_results, edge_order, edge_inverse_preds=None,
+    graph,
+    query_graph,
+    edge_results,
+    edge_order,
+    edge_inverse_preds=None,
     dehydrated=None,
 ):
     """Reconstruct complete paths by iteratively joining edge results.
