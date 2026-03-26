@@ -29,6 +29,7 @@ def lookup(
     max_node_degree=None,
     min_information_content=None,
     log_level=None,
+    dehydrated=None,
 ):
     """Take an arbitrary Translator query graph and return all matching paths.
 
@@ -44,6 +45,11 @@ def lookup(
             information_content attribute is below this value.
         log_level: If set, temporarily adjust the gandalf logger to this level
             (e.g. ``"DEBUG"``) for the duration of the query.
+        dehydrated: If True, force a dehydrated (lightweight) response that
+            skips edge attribute enrichment regardless of result size.
+            If False, force full enrichment.  If None (default), automatically
+            enable lightweight mode when path count exceeds the large result
+            threshold.
 
     Returns:
         TRAPI response dict with message containing results, knowledge_graph,
@@ -83,6 +89,7 @@ def lookup(
             gc_monitor,
             max_node_degree=max_node_degree,
             min_information_content=min_information_content,
+            dehydrated=dehydrated,
         )
         response["logs"] = log_collector.get_logs()
         return response
@@ -104,6 +111,7 @@ def _lookup_inner(
     gc_monitor,
     max_node_degree=None,
     min_information_content=None,
+    dehydrated=None,
 ):
     """Inner implementation of lookup with all the core logic."""
     logger.info("Starting lookup.")
@@ -295,6 +303,7 @@ def _lookup_inner(
         edge_results,
         original_edges,
         edge_inverse_preds=edge_inverse_preds,
+        dehydrated=dehydrated,
     )
 
     num_paths = len(path_data) if path_data is not None else 0
