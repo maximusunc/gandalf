@@ -83,15 +83,20 @@ def _extract_sources(data):
             }
         ]
 
-        if "aggregator_knowledge_source" in data and len(data["aggregator_knowledge_source"]) > 0:
+        if (
+            "aggregator_knowledge_source" in data
+            and len(data["aggregator_knowledge_source"]) > 0
+        ):
             data["aggregator_knowledge_source"].reverse()
             previous_source = data["primary_knowledge_source"]
             for aggregator_source in data["aggregator_knowledge_source"]:
-                sources.append({
-                    "resource_id": aggregator_source,
-                    "resource_role": "aggregator_knowledge_source",
-                    "upstream_resource_ids": [previous_source],
-                })
+                sources.append(
+                    {
+                        "resource_id": aggregator_source,
+                        "resource_role": "aggregator_knowledge_source",
+                        "upstream_resource_ids": [previous_source],
+                    }
+                )
                 previous_source = aggregator_source
     else:
         # new translatorkg format
