@@ -869,7 +869,7 @@ class CSRGraph:
 
         return triple_counts, triple_examples
 
-    def build_meta_kg(self):
+    def build_meta_kg(self, node_categories, category_prefixes, triple_counts):
         """Build the TRAPI MetaKnowledgeGraph with full attribute metadata.
 
         Scans all nodes and edges to produce:
@@ -880,12 +880,8 @@ class CSRGraph:
         This is the expensive step (full LMDB scan for edge attributes).
         The result is stored as self.meta_kg and can be persisted as meta_kg.json.
         """
-        logger.debug("Building meta knowledge graph...")
+        logger.info("Building meta knowledge graph...")
         t0 = time.perf_counter()
-
-        node_categories = self._build_node_categories()
-        category_prefixes = self._build_category_prefixes(node_categories)
-        triple_counts, _ = self._scan_edge_triples(node_categories)
 
         # -- Node attributes: collect unique (attribute_type_id, attribute_source,
         #    original_attribute_name) tuples per category.
@@ -1044,10 +1040,11 @@ class CSRGraph:
 
         # Build meta_kg if not already loaded from disk
         if not hasattr(self, "meta_kg") or self.meta_kg is None:
-            self.build_meta_kg()
+            self.build_meta_kg(node_categories, category_prefixes, triple_counts)
 
         # Build SRI testing data if not already loaded from disk
         if not hasattr(self, "sri_testing_data") or self.sri_testing_data is None:
+            logger.info("Building sri testing data...")
             self.sri_testing_data = {
                 "edges": [
                     {
@@ -1062,7 +1059,7 @@ class CSRGraph:
             }
 
         t1 = time.perf_counter()
-        logger.debug(
+        logger.info(
             "  Metadata built in %.2fs: " "%s unique triples, " "%s categories",
             t1 - t0,
             len(triple_counts),
@@ -1402,7 +1399,7 @@ class CSRGraph:
         if meta_kg_path.exists():
             with open(meta_kg_path, "r", encoding="utf-8") as f:
                 graph.meta_kg = json.load(f)
-            logger.debug("  Loaded meta_kg from %s", meta_kg_path)
+            logger.info("  Loaded meta_kg from %s", meta_kg_path)
         else:
             graph.meta_kg = None  # will be built by build_metadata()
 
@@ -1411,7 +1408,7 @@ class CSRGraph:
         if sri_testing_path.exists():
             with open(sri_testing_path, "r", encoding="utf-8") as f:
                 graph.sri_testing_data = json.load(f)
-            logger.debug("  Loaded sri_testing_data from %s", sri_testing_path)
+            logger.info("  Loaded sri_testing_data from %s", sri_testing_path)
         else:
             graph.sri_testing_data = None  # will be built by build_metadata()
 
@@ -1419,7 +1416,7 @@ class CSRGraph:
         if metadata_path.exists():
             with open(metadata_path, "r", encoding="utf-8") as f:
                 graph.graph_metadata = json.load(f)
-            logger.debug("  Loaded metadata from %s", metadata_path)
+            logger.info("  Loaded metadata from %s", metadata_path)
         else:
             graph.graph_metadata = None
 
