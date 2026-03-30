@@ -2,33 +2,31 @@
 
 import csv
 import logging
-import os
 import time
 from collections import defaultdict
 from datetime import datetime
 
 import numpy as np
 
+from gandalf.config import settings
 from gandalf.search.path_arrays import PathArrays
 
 logger = logging.getLogger(__name__)
 
 # When set, write a debug TSV of all reconstructed paths.
 # Set to a file path to write there, or "1"/"true" for an auto-named file.
-DEBUG_PATHS_TSV = os.environ.get("GANDALF_DEBUG_PATHS_TSV", "")
+DEBUG_PATHS_TSV = settings.debug_paths_tsv
 
 
 # When path count exceeds this threshold, skip edge attribute enrichment
 # (sources, qualifiers, attributes from LMDB) and only include
 # predicates. This avoids expensive per-edge property lookups on large result sets.
-LARGE_RESULT_PATH_THRESHOLD = int(
-    os.environ.get("GANDALF_LARGE_RESULT_THRESHOLD", "50000")
-)
+LARGE_RESULT_PATH_THRESHOLD = settings.large_result_threshold
 
 # Maximum number of intermediate paths allowed during join operations.
 # When exceeded, paths are truncated to this limit and a warning is printed.
 # Set to 0 to disable the limit.
-MAX_PATH_LIMIT = int(os.environ.get("GANDALF_MAX_PATH_LIMIT", "0"))
+MAX_PATH_LIMIT = settings.max_path_limit
 
 
 def _get_most_specific_category(categories, bmt):

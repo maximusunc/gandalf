@@ -193,6 +193,16 @@ The server is configured via environment variables (prefixed with `GANDALF_`):
 | `GANDALF_CORS_ORIGINS` | `*` | Comma-separated list of allowed CORS origins |
 | `GANDALF_MAX_REQUEST_SIZE_MB` | `10` | Maximum request body size in MB |
 | `GANDALF_RATE_LIMIT` | `0` | Max requests per minute per client IP (0 = disabled) |
+| `GANDALF_SKIP_PRELOAD` | `false` | Skip module-level graph loading |
+| `GANDALF_WORKERS` | `2` | Gunicorn worker count |
+
+### Search Tuning
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GANDALF_LARGE_RESULT_THRESHOLD` | `50000` | Path count threshold for auto-dehydrated responses |
+| `GANDALF_MAX_PATH_LIMIT` | `0` | Max intermediate paths during joins (0 = unlimited) |
+| `GANDALF_DEBUG_PATHS_TSV` | _(empty)_ | File path to write debug TSV of reconstructed paths |
 
 ### Server Identity
 

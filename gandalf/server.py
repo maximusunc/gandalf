@@ -131,7 +131,7 @@ def load_graph(path: str, format: str = "auto") -> CSRGraph:
 # so every forked worker shares graph RAM via Copy-on-Write).
 # ---------------------------------------------------------------------------
 
-_SKIP_PRELOAD = os.getenv("GANDALF_SKIP_PRELOAD", "").lower() in ("1", "true", "yes")
+_SKIP_PRELOAD = settings.skip_preload
 
 GRAPH: Optional[CSRGraph] = None
 BMT: Optional[Toolkit] = None

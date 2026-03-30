@@ -33,8 +33,20 @@ class Settings(BaseSettings):
     jaeger_host: str = "http://jaeger"
     jaeger_port: int = 4317
 
+    # Module-level graph preloading (server.py)
+    skip_preload: bool = False
+
+    # Gunicorn worker count
+    workers: int = 2
+
+    # Path reconstruction tunables (search/reconstruct.py)
+    debug_paths_tsv: str = ""
+    large_result_threshold: int = 50000
+    max_path_limit: int = 0
+
     model_config = SettingsConfigDict(
         env_file=".env",
+        env_prefix="gandalf_",
         extra="allow",
     )
 
