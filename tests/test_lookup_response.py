@@ -325,9 +325,10 @@ class TestDehydratedNodeProperties:
 
         assert len(kg_nodes) > 0
         for node_id, node in kg_nodes.items():
-            assert set(node.keys()) == {"name", "categories"}, (
-                f"Node {node_id} has unexpected keys: {set(node.keys())}"
-            )
+            assert set(node.keys()) == {
+                "name",
+                "categories",
+            }, f"Node {node_id} has unexpected keys: {set(node.keys())}"
 
     def test_dehydrated_categories_trimmed_to_most_specific(self, graph, bmt):
         """In dehydrated mode, categories should be trimmed to the most specific."""
