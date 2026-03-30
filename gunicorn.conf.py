@@ -1,13 +1,13 @@
 """Gunicorn configuration for GANDALF."""
 
-import os
+from gandalf.config import settings
 
 # Bind to all interfaces on port 6429
 bind = "0.0.0.0:6429"
 
 # Worker count — keep low due to large graph memory footprint.
 # COW sharing is most effective with fewer workers.
-workers = int(os.getenv("GANDALF_WORKERS", "2"))
+workers = settings.workers
 
 # Use Uvicorn's ASGI worker for FastAPI compatibility
 worker_class = "uvicorn.workers.UvicornWorker"
@@ -27,4 +27,4 @@ accesslog = "-"
 
 # Forward all logs to stderr
 errorlog = "-"
-loglevel = os.getenv("GANDALF_GUNICORN_LOG_LEVEL", "info")
+loglevel = settings.log_level.lower()
