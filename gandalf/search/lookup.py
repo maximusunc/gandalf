@@ -254,6 +254,7 @@ def _lookup_inner(
                 attribute_constraints=edge_attribute_constraints,
                 start_node_constraints=start_node_constraints,
                 end_node_constraints=end_node_constraints,
+                dehydrated=bool(dehydrated),
             )
 
         # Store results for this edge
